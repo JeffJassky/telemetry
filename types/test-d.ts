@@ -1,115 +1,152 @@
 /**
  * Compile-only exercise of the public declarations. Never executed — `tsc
- * --noEmit` failing here means the .d.ts files drifted from the JS.
+ * --noEmit` failing here means the .d.ts files drifted from the source.
  *
  * Hand-written types rot within a day. On featureboard this file immediately
  * caught that `types/` was missing FOUR features added the same afternoon.
  * Every exported symbol must appear below. See standards/traps.md #9.
  */
+import { z } from 'zod';
 import type {
-  HttpError,
+  Checkpoint,
+  CreateTelemetryConfig,
+  DimSource,
+  EmitInput,
+  EntityRef,
+  EventSpec,
+  ForgetResult,
   Logger,
-  PackageUser,
-  PurgeSummary,
-  ResolveUser,
-  StorageAdapter,
-  UiOptions,
-  UserAdapter,
-  createTelemetryConfig,
-  TelemetryInstance,
+  Registry,
+  RollupSpec,
+  Scoped,
+  Telemetry,
+  TelemetryCounters,
+  TelemetryKind,
 } from './index.js';
-import type {
-  ClientOptions,
-  ItemResponse,
-  ListResponse,
-  MeResponse,
-  RequestFn,
-  TelemetryAdminClient,
-  TelemetryClient,
-} from './client.js';
+import {
+  boundedMeta,
+  createTelemetry,
+  defineRegistry,
+  newId,
+  plain,
+  traceKeep,
+  truncate,
+  validateRegistry,
+  INDEX_BUDGET,
+  RETENTION_DAYS,
+  SAMPLE_RATE,
+  SCHEMA_VERSION,
+} from './index.js';
 
-declare const pkg: TelemetryInstance;
-declare const client: TelemetryClient;
-declare const adminClient: TelemetryAdminClient;
+// ── the registry keeps literal shapes through defineRegistry ──
+const registry = defineRegistry({
+  'user.signed_up': {
+    kind: 'event',
+    origin: 'server',
+    subjects: ['user', 'org'],
+    attrs: z.object({ source: z.string().max(64), plan: z.enum(['free', 'pro']) }),
+    indexedAttrs: ['source'],
+    rollups: [
+      { by: ['subject'], subjects: ['user'], actors: ['user', 'system'], capture: ['attr:source'] },
+      { as: 'activity', by: ['subject'], subjects: ['user'], bucket: 'day', retentionDays: 730 },
+    ],
+    description: 'Account created',
+  },
+  'llm.completion': {
+    kind: 'span',
+    origin: 'server',
+    subjects: ['org'],
+    attrs: z.object({ gen_ai_request_model: z.string(), feature: z.string() }),
+    metrics: z.object({ tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number() }),
+    data: boundedMeta(),
+    indexedMetrics: ['cost_usd'],
+    retentionDays: 400,
+    rollups: [{ as: 'llm_cost', by: ['attr:gen_ai_request_model', 'attr:feature'], bucket: 'day', sum: ['cost_usd'] }],
+    description: 'Single model call',
+  },
+});
 
-// The adapter contract: both forms must typecheck.
-const withFn: createTelemetryConfig = {
-  resolveUser: () => ({ id: 'abc', email: 'a@b.c', displayName: null, isAdmin: false }),
-};
-const withAdapter: createTelemetryConfig = {
-  userAdapter: { resolveUser: () => null },
-};
+declare const mongooseish: CreateTelemetryConfig['connection'];
 
-// Signed-out is expressible — required for anything with a public path.
-const anon: createTelemetryConfig = { resolveUser: () => null };
+const t = createTelemetry({ registry, connection: mongooseish, pepper: 'p' });
 
-// Caps and the optional analytics peer.
-const tuned: createTelemetryConfig = {
-  listLimit: 50,
-  adminListLimit: 100,
-  track: (event) => void event,
-  logger: {} satisfies Logger,
-};
+// ── emit is typed against the registry ──
+async function writes() {
+  await t.emit('user.signed_up', {
+    tenantId: 'acc_9',
+    subjects: [{ type: 'user', id: 'u_1' }, { type: 'org', id: 'o_9' }],
+    actor: 'user:u_1',
+    attrs: { source: 'ads', plan: 'pro' },
+  });
 
-// Model overrides — the traps #2 escape hatch.
-const named: createTelemetryConfig = { modelName: 'CustomTelemetryEvent', collection: 'custom', userRef: 'Account' };
+  await t.emit('llm.completion', {
+    tenantId: 'acc_9',
+    subjects: [{ type: 'org', id: 'o_9' }],
+    traceId: 'tr_1', spanId: 's_1', durationMs: 1900,
+    attrs: { gen_ai_request_model: 'claude-opus-5', feature: 'chat' },
+    metrics: { tokens_in: 1, tokens_out: 1, cost_usd: 0.04 },
+  });
 
-// UI options, including the sign-in redirect.
-const ui: UiOptions = {
-  mountPath: '/telemetry',
-  apiBase: '/api/telemetry',
-  loginUrl: '/login',
-  returnParam: 'next',
-  title: 'Telemetry',
-};
-const uiRouter = pkg.ui(ui);
-const adminRouter = pkg.adminUi({ mountPath: '/admin/telemetry' });
-const routes = pkg.routes;
-const adminRoutes = pkg.adminRoutes;
+  // @ts-expect-error — unknown event name is a compile error, not a silent drop
+  await t.emit('user.typo', { tenantId: 'acc_9' });
 
-// Purge returns a summary, and takes a string or an ObjectId.
-async function purge(): Promise<PurgeSummary> {
-  return pkg.purgeUser('507f1f77bcf86cd799439011');
+  await t.emit('user.signed_up', {
+    tenantId: 'acc_9',
+    // @ts-expect-error — attrs are typed per event; `plan: 'gold'` is not in the enum
+    attrs: { source: 'ads', plan: 'gold' },
+  });
 }
 
-// Indexes are the host's to build — traps #3.
-async function boot() {
-  await pkg.model.createIndexes();
+// ── the rest of the surface ──
+async function reads() {
+  const s: Scoped = t.scoped('acc_9');
+  s.find({ subjectKeys: 'user:u_1' });
+  s.aggregate([{ $match: { kind: 'span' } }]);
+  s.rollups({ as: 'llm_cost' });
+  s.rollupAggregate([{ $group: { _id: '$dims' } }]);
+
+  const gone: ForgetResult = await t.forget('acc_9', 'user:u_1');
+  void (gone.deleted + gone.redacted + gone.rollups + gone.aliases);
+
+  const cp: Checkpoint = t.checkpoint('mailery-bridge');
+  const mark: Date | null = await cp.get();
+  await cp.advance(mark ?? new Date());
+
+  await t.syncIndexes();
+  await t.flush();
+
+  const c: TelemetryCounters = t.counters;
+  void (c.rejected + c.defaulted + c.sampled + c.capped + c.rollupSkipped);
+
+  t.models.telemetry.find();
+  t.models.byKind.usage.countDocuments();
+  t.models.rollups.aggregate([]);
+  t.models.checkpoints.findOne();
+  t.collections.rejects().countDocuments();
+  t.collections.aliases().deleteMany({});
 }
 
-// Client surface.
-async function exercise() {
-  const { user }: MeResponse = await client.me();
-  const isStaff: boolean = user.isAdmin;
-  const name: string | null = user.displayName;
+// ── helpers keep their contracts ──
+const id: string = newId();
+const kept: boolean = traceKeep('tr_00ff', 0.5);
+const day: Date | undefined = truncate(new Date(), 'day');
+const obj: unknown = plain(new Map());
+validateRegistry(registry);
+const budget: number = INDEX_BUDGET;
+const spanDays: number | null = RETENTION_DAYS.span;
+const rate: number = SAMPLE_RATE.usage;
+const v: number = SCHEMA_VERSION;
 
-  const page: ListResponse = await client.list({ limit: 10 });
-  const cap: number = page.limit;
-
-  const one: ItemResponse = await client.get('abc');
-  const total: number = (await adminClient.summary()).total;
-  const raw = await client.call('GET', '/me');
-}
-
-// Custom transport is typed.
-const transport: RequestFn = async (method, url, body) => ({ ok: true });
-const opts: ClientOptions = { baseUrl: '/x', request: transport, onUnauthenticated: () => {} };
-
-// A user accepts a string or ObjectId id; the adapter is a plain function.
-const u: PackageUser = { id: 'abc', email: 'a@b.c' };
-const r: ResolveUser = () => u;
-const a: UserAdapter = { resolveUser: r };
-
-// Storage, for packages that copy the adapter in. Delete with the adapter.
-declare const storage: StorageAdapter;
-async function bytes() {
-  await storage.put('k', Buffer.from('v'), { contentType: 'text/plain' });
-  const got: Buffer = await storage.get('k');
-  const url: string = await storage.signUrl('k', { expiresIn: 60 });
-  await storage.delete('k');
-}
-
-// Errors carry a status and a stable code.
-declare const err: HttpError;
-const status: number = err.status;
-const code: string = err.code;
+// ── shapes are exported and usable standalone ──
+const dim: DimSource = 'attr:source';
+const roll: RollupSpec = { by: [dim], bucket: 'week', actors: ['user'] };
+const spec: EventSpec = { kind: 'event', origin: 'any', subjects: [], description: 'x' };
+const reg: Registry = { 'a.b': spec };
+const ref: EntityRef = 'user:u_1';
+const kind: TelemetryKind = 'usage';
+const log: Logger = { info() {}, warn() {}, error() {} };
+declare const generic: Telemetry;
+const input: EmitInput<typeof registry, 'user.signed_up'> = {
+  tenantId: 'a',
+  attrs: { source: 's', plan: 'free' },
+};

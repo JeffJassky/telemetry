@@ -66,7 +66,11 @@ export const REGISTRY = defineRegistry({
    band.
 4. Admin exclusion (`{ actorRole: { $ne: 'admin' } }`) maps to the `actor` ref
    convention (`admin:u_9`, `system:cron`) — a standard query-layer toggle
-   ("exclude non-customer actors"), not per-callsite discipline.
+   ("exclude non-customer actors"), not per-callsite discipline. *Stage 4
+   amendment:* the toggle only protects raw reads; rollup families aggregate at
+   emit time, so they declare `RollupSpec.actors` (allowlist of actor types —
+   milestones say `['user', 'system']`) and the aggregate plane enforces it
+   before recording. Discovered porting maxed verify [5].
 5. **The one real friction, resolved:** maxed deliberately refuses per-event
    meta schemas ("ceremony"); schema v2 refuses undeclared `data` (erasure
    guarantee). The bridge is `boundedMeta()` — an exported zod helper encoding

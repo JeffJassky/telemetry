@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['test/**/*.test.js'],
+    include: ['test/**/*.test.{js,ts}'],
     exclude: ['docs/**', 'node_modules/**', 'dist/**'],
     environment: 'node',
     testTimeout: 30000,
@@ -15,8 +15,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html'],
-      include: ['src/**/*.js'],
-      exclude: ['src/**/index.js', 'src/ui/**'],
+      include: ['src/**/*.{js,ts}'],
+      exclude: ['src/**/index.{js,ts}', 'src/ui/**'],
     },
   },
 });

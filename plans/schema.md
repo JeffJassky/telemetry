@@ -419,6 +419,16 @@ export interface RollupSpec {
   by: readonly DimSource[]
   /** when `by` includes `subject`, restrict to these subject types */
   subjects?: readonly string[]
+  /**
+   * Actor TYPE allowlist — a record whose `actor` has a type not listed here
+   * skips this rollup; the raw row is unaffected. Absent = all actors; a record
+   * with no actor always passes. This is how "admin support browsing never moves
+   * a customer aggregate" (maxed verify [5]) is declared rather than disciplined:
+   * milestone families say `actors: ['user', 'system']` and an `admin:u_9` actor
+   * stays out of the funnel while its row still shows in the explorer.
+   * (Added Stage 4: the query-layer toggle cannot protect pre-aggregated families.)
+   */
+  actors?: readonly string[]
   /** time bucket (UTC). Omit for a lifetime rollup — that is the classic milestone.
    *  `hour` is for incident-grade dashboards; anything finer is the wrong store. */
   bucket?: 'hour' | 'day' | 'week' | 'month'
@@ -695,8 +705,10 @@ export const telemetryCounters = { rejected: 0, defaulted: 0, sampled: 0, capped
 @index({ tenantId: 1, kind: 1, name: 1, occurredAt: -1 })
 @index({ traceId: 1, occurredAt: 1 }, { partialFilterExpression: { traceId: { $exists: true } } })
 // erasure completeness — usually a tiny array, so cheap to maintain
+// `$ne: []` is not a legal partialFilterExpression operator — `.0 $exists` is the
+// supported way to say "array non-empty" (found at Stage 4 implementation)
 @index({ tenantId: 1, otherPrincipals: 1 },
-  { partialFilterExpression: { otherPrincipals: { $exists: true, $ne: [] } } })
+  { partialFilterExpression: { 'otherPrincipals.0': { $exists: true } } })
 // partial: usage rows have no expiresAt and must not be indexed as null
 @index({ expiresAt: 1 },
   { expireAfterSeconds: 0, partialFilterExpression: { expiresAt: { $exists: true } } })
@@ -1348,9 +1360,11 @@ export async function emit<N extends TelemetryName>(name: N, doc: {
   d.save({ validateBeforeSave: false }).catch(onFail)    // fire-and-forget, but never silent
 }
 
-/** tenant scope is not optional — force every read through here */
+/** tenant scope is not optional — force every read through here.
+ *  The pin spreads LAST: `{ tenantId, ...q }` would let a caller-supplied
+ *  tenantId override the scope (found at Stage 4 implementation). */
 export const scoped = (tenantId: string) => ({
-  find: (q: object = {}) => TelemetryModel.find({ tenantId, ...q }),
+  find: (q: object = {}) => TelemetryModel.find({ ...q, tenantId }),
   aggregate: (stages: object[]) => TelemetryModel.aggregate([{ $match: { tenantId } }, ...stages]),
 })
 ```

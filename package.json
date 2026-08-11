@@ -83,5 +83,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "uuidv7": "^1.2.1",
+    "zod": "^4.4.3"
   }
 }

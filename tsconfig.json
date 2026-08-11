@@ -1,7 +1,8 @@
 {
-  "// ": "Type-checks the hand-written declarations only. The package source is",
-  "//  ": "plain JS; this exists so the .d.ts files can't silently rot away from",
-  "//   ": "it. types/test-d.ts is the thing that actually exercises them.",
+  "// ": "Checks the TS source AND the hand-written public declarations. The",
+  "//  ": "published contract is types/*.d.ts (never generated — house-style);",
+  "//   ": "types/test-d.ts is the thing that actually exercises it. tsup does",
+  "//    ": "the emitting, so noEmit here.",
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
@@ -14,5 +15,6 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["types/**/*.d.ts", "types/test-d.ts"]
+  "include": ["src/server/**/*.ts", "src/client/**/*.ts", "types/**/*.d.ts", "types/test-d.ts"],
+  "exclude": ["src/ui/**"]
 }

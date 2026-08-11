@@ -16,8 +16,8 @@ import { defineConfig } from 'tsup';
 // See standards/traps.md #7.
 export default defineConfig({
   entry: {
-    index: 'src/server/index.js',
-    client: 'src/client/index.js',
+    index: 'src/server/index.ts',
+    client: 'src/client/index.ts',
   },
   format: ['esm', 'cjs'],
   sourcemap: true,
