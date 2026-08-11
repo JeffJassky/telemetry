@@ -182,12 +182,11 @@ Two arrays are derived on write. Neither is authored by hand.
 > array — Mongo matches across elements, so `user:u_1` would match a row where that
 > id belongs to a different type. The flattened string sidesteps it entirely.
 
-> **Verify the multikey sort with `explain()` before relying on it.** The claim
-> that one index serves every subject type rests on
-> `{tenantId, subjectKeys, occurredAt}` supporting a sort on `occurredAt` given an
-> equality bound on the multikey field. That should hold, but multikey sort rules
-> are subtle enough that it deserves a test, not an assumption — if it doesn't,
-> this index strategy needs rethinking rather than patching.
+> **Verified with `explain()` 2026-08-10** (mongod 8.2.6): equality on tenant +
+> multikey subject serves the `occurredAt` sort with no blocking SORT stage —
+> desc, asc reverse-scan, with a time range, and under `$all` — at 1:1
+> keys-to-docs examined, and multikey dedup returns each row exactly once.
+> The one-index claim stands; see §9.
 
 ### 2.6 Sampling belongs to the trace
 
@@ -1782,9 +1781,12 @@ emit() ──┬─→ Mongo        (system of record: error + state + usage + r
 
 ## 9. Open items
 
-- [ ] **Verify the multikey compound sort** with `explain()` — see §2.5. If
-      `{tenantId, subjectKeys, occurredAt}` can't serve the sort, the one-index
-      claim needs rethinking, not patching.
+- [x] **Verify the multikey compound sort** with `explain()` — verified
+      2026-08-10 against mongod 8.2.6 (mongodb-memory-server): equality
+      subject + desc sort, + time range, ascending reverse scan, and `$all`
+      two-subject all plan as `LIMIT<-FETCH<-IXSCAN` with **no blocking SORT**
+      and 1:1 keys-to-docs examined; multikey dedup returns each row once.
+      The one-index claim in §2.5 holds.
 - [x] **The ingest surface** — now specified in instrumentation.md: key model
       and trust modes (§2), batch wire protocol with client-generated `_id`s
       (§3), handler pipeline and host adapters (§4). Still open *there*:
