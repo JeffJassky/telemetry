@@ -332,18 +332,22 @@ One published package, subpath exports, exactly the template's shape:
 
 ## 10. Open items
 
-- [ ] **Key management surface** — create/revoke/rotate is currently "insert a
-      document." Fine for one operator; needs a CLI subcommand before a second.
-- [ ] **Secret comparison** — `sk_` verification must be constant-time against
-      `secretHash`; pick scrypt params once and version them in the hash string.
-- [ ] **Consent UX** — the web adapter gates on a `consent` callback; what the
-      host shows users is host business, but the default must be *off* for
-      EU-mode until the callback says yes.
-- [ ] **IP handling** — truncate-or-drop at the ingest boundary before anything
-      is stored (schema §9's requirement, enforced here).
-- [ ] **Offline queue caps** — disk queues (CLI, Electron) need a max size and
-      an age cap, or a machine that is offline for a month replays a month of
-      stale telemetry into today's buckets.
+- [ ] **Key management surface** — `createKey()` mints (t.createKey / exported
+      helper, Stage 4); revoke/rotate is still "set revokedAt." Needs a CLI
+      subcommand before a second operator.
+- [x] **Secret comparison** — done Stage 4: scrypt (N=16384, r=8, p=1, len 32),
+      version prefix `scrypt1$` in the hash string, `timingSafeEqual` compare.
+- [ ] **Consent UX** — Stage 4 ships the mechanism: DNT/GPC are hard signals
+      the host cannot override, and `consent()` gates sending (opted-out
+      clients drop instead of hoard). The EU default-*off* posture remains a
+      host decision to document.
+- [x] **IP handling** — enforced by construction: the envelope has no IP field
+      and the ingest handler never reads `req.ip`, so there is nothing to
+      truncate. Any future IP-derived feature must re-open this item.
+- [x] **Offline queue caps** — Stage 4: every queue is a drop-oldest ring
+      (`maxQueueSize`), and the CLI's next-run replay drops records older than
+      `maxQueueAgeMs` (default 7d) so an offline month never lands in today's
+      buckets.
 - [ ] **Stitching job** — consumes `telemetry_aliases` (§5); bounded batches,
       rewrites raw + rollup keys, marks aliases consumed. Design in schema §9,
       input defined here, implementation still unwritten.

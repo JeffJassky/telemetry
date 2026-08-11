@@ -29,10 +29,35 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
-    "./client": {
-      "types": "./types/client.d.ts",
-      "import": "./dist/client.js",
-      "require": "./dist/client.cjs"
+    "./core": {
+      "types": "./types/core.d.ts",
+      "import": "./dist/core.js",
+      "require": "./dist/core.cjs"
+    },
+    "./web": {
+      "types": "./types/web.d.ts",
+      "import": "./dist/web.js",
+      "require": "./dist/web.cjs"
+    },
+    "./react": {
+      "types": "./types/react.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    },
+    "./vue": {
+      "types": "./types/vue.d.ts",
+      "import": "./dist/vue.js",
+      "require": "./dist/vue.cjs"
+    },
+    "./electron": {
+      "types": "./types/electron.d.ts",
+      "import": "./dist/electron.js",
+      "require": "./dist/electron.cjs"
+    },
+    "./cli": {
+      "types": "./types/cli.d.ts",
+      "import": "./dist/cli.js",
+      "require": "./dist/cli.cjs"
     },
     "./package.json": "./package.json"
   },
@@ -63,11 +88,20 @@
   },
   "peerDependencies": {
     "express": "^4.18.0 || ^5.0.0",
-    "mongoose": "^7.0.0 || ^8.0.0 || ^9.0.0"
+    "mongoose": "^7.0.0 || ^8.0.0 || ^9.0.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "vue": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": { "optional": true },
+    "mongoose": { "optional": true },
+    "react": { "optional": true },
+    "vue": { "optional": true }
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^22.7.0",
+    "@types/react": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
     "express": "^5.2.1",
     "mongodb-memory-server": "^11.1.0",

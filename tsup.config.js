@@ -17,7 +17,12 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   entry: {
     index: 'src/server/index.ts',
-    client: 'src/client/index.ts',
+    core: 'src/client/core.ts',
+    web: 'src/client/web.ts',
+    react: 'src/client/react.ts',
+    vue: 'src/client/vue.ts',
+    electron: 'src/client/electron.ts',
+    cli: 'src/client/cli.ts',
   },
   format: ['esm', 'cjs'],
   sourcemap: true,

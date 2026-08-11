@@ -139,6 +139,15 @@ export function paperRegistry() {
       rollups: [{ as: 'dim_probe', by: ['attr:group'] }],
       description: 'Optional-dim probe — a missing dim must skip, never null-bucket',
     },
+    'app.ping': {
+      kind: 'event', origin: 'client', subjects: [],
+      attrs: z.object({ n: z.string().optional() }),
+      description: 'Subject-free client event — the wire suite\'s generic probe',
+    },
+    'ui.mode': {
+      kind: 'state', origin: 'client', subjects: [],
+      description: 'Client-assertable state — exists to prove the key allowlist works',
+    },
   });
 }
 

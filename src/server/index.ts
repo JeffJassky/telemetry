@@ -7,6 +7,7 @@ import { buildCheckpointModel, createCheckpointFactory } from './checkpoint.js';
 import { createEmitter, type EmitInput } from './emit.js';
 import { createForget } from './forget.js';
 import { createSyncIndexes } from './indexes.js';
+import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
 
 export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
 export type { Registry, EventSpec, RollupSpec, DimSource } from './registry.js';
@@ -21,6 +22,10 @@ export { truncate, resolveDim } from './rollups.js';
 export type { ForgetResult } from './forget.js';
 export type { Checkpoint } from './checkpoint.js';
 export type { EmitInput } from './emit.js';
+export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
+export type { CreateKeyInput, ParsedKey } from './keys.js';
+export { createIngest } from './ingest.js';
+export type { ContextAdapter, CreateIngestOptions, IngestContext } from './ingest.js';
 
 export interface CreateTelemetryConfig {
   /** the host-owned event registry — see defineRegistry() */
@@ -69,6 +74,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   });
   const RollupModel = buildRollupModel(conn, `${modelName}Rollup`, `${collection}_rollups`);
   const CheckpointModel = buildCheckpointModel(conn, `${modelName}Checkpoint`, `${collection}_checkpoints`);
+  const KeyModel = buildKeyModel(conn, `${modelName}Key`, `${collection}_keys`);
 
   const rejects = () => conn.db!.collection(`${collection}_rejects`);
   const aliases = () => conn.db!.collection(`${collection}_aliases`);
@@ -102,7 +108,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   const syncIndexes = createSyncIndexes({
     registry,
     TelemetryModel,
-    models: [TelemetryModel, ...Object.values(byKind), RollupModel, CheckpointModel],
+    models: [TelemetryModel, ...Object.values(byKind), RollupModel, CheckpointModel, KeyModel],
     rejects: rejects as () => Collection,
   });
 
@@ -138,8 +144,19 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     },
     /** drop/default/cap counts — surface on /metrics so drops are never silent */
     counters,
+    /** the registry, exposed for the router factories — hosts should import their own */
+    registry,
+    logger,
+    /** mint an ingest key; the full key string is returned once, never again */
+    createKey: (input: CreateKeyInput) => createKey(KeyModel, input),
     /** the models, exposed for hosts and the router factories */
-    models: { telemetry: TelemetryModel, byKind, rollups: RollupModel, checkpoints: CheckpointModel },
+    models: {
+      telemetry: TelemetryModel,
+      byKind,
+      rollups: RollupModel,
+      checkpoints: CheckpointModel,
+      keys: KeyModel,
+    },
     /** side collections (rejects/aliases live outside mongoose models) */
     collections: { rejects, aliases },
   };

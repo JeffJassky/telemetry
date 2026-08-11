@@ -239,11 +239,17 @@ export interface Telemetry<R extends Registry = Registry> {
   flush(): Promise<void>;
   /** drop/default/cap counts — surface on /metrics so drops are never silent */
   counters: TelemetryCounters;
+  /** the registry this instance validates against */
+  registry: R;
+  logger: Logger;
+  /** mint an ingest key against this instance's key collection */
+  createKey(input: CreateKeyInput): Promise<{ key: string; id: string }>;
   models: {
     telemetry: Model<any>;
     byKind: Record<TelemetryKind, Model<any>>;
     rollups: Model<any>;
     checkpoints: Model<any>;
+    keys: Model<any>;
   };
   collections: {
     rejects(): Collection;
@@ -254,3 +260,67 @@ export interface Telemetry<R extends Registry = Registry> {
 export declare function createTelemetry<const R extends Registry>(
   config: CreateTelemetryConfig<R>,
 ): Telemetry<R>;
+
+// ── keys (instrumentation §2) ───────────────────────────────────────────────
+
+export type KeyKind = 'publishable' | 'secret';
+/** fixed: the key carries tenantId · session: the host resolves it · claimed: the payload asserts it (sk_ only) */
+export type TenantMode = 'fixed' | 'session' | 'claimed';
+
+export interface ParsedKey {
+  kind: KeyKind;
+  label: string;
+  id: string;
+  secret?: string;
+}
+export declare function parseKeyString(raw: string | undefined): ParsedKey | null;
+/** versioned scrypt — a param change bumps the prefix, old hashes keep verifying */
+export declare function hashSecret(secret: string): string;
+/** constant-time comparison */
+export declare function verifySecret(secret: string, stored: string | undefined): boolean;
+
+export interface CreateKeyInput {
+  kind: KeyKind;
+  tenantMode: TenantMode;
+  tenantId?: string;
+  service: string;
+  env: string;
+  label?: string;
+  origins?: string[];
+  allowedKinds?: string[];
+  allowedNames?: string[];
+  maxPerMinute?: number;
+}
+
+/** Mint a key. The full string is returned ONCE — only the secret's hash is stored. */
+export declare function createKey(
+  KeyModel: Model<any>,
+  input: CreateKeyInput,
+): Promise<{ key: string; id: string }>;
+
+// ── ingest (instrumentation §3–4) ───────────────────────────────────────────
+
+export interface IngestContext {
+  tenantId: string;
+  subjects?: Array<SubjectInput>;
+  actor?: string;
+}
+
+export interface ContextAdapter {
+  /** INBOUND: who is making this request? Only consulted for tenantMode=session. */
+  resolveContext(req: unknown): IngestContext | null | Promise<IngestContext | null>;
+}
+
+export interface CreateIngestOptions {
+  telemetry: Telemetry<any>;
+  contextAdapter?: ContextAdapter;
+  maxRecords?: number;
+  bodyLimit?: string;
+  keyCacheMs?: number;
+}
+
+/**
+ * The wire endpoint — an express Router the host mounts. Batch-only,
+ * insert-gated rollups, pk_ never 4xxes, sk_ gets honest errors.
+ */
+export declare function createIngest(opts: CreateIngestOptions): import('express').Router;

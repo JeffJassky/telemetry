@@ -137,6 +137,67 @@ const spanDays: number | null = RETENTION_DAYS.span;
 const rate: number = SAMPLE_RATE.usage;
 const v: number = SCHEMA_VERSION;
 
+// ── keys + ingest surface ──
+import type {
+  ContextAdapter,
+  CreateIngestOptions,
+  CreateKeyInput,
+  IngestContext,
+  KeyKind,
+  ParsedKey,
+  TenantMode,
+} from './index.js';
+import { createIngest, createKey, hashSecret, parseKeyString, verifySecret } from './index.js';
+
+async function keys() {
+  const minted = await t.createKey({
+    kind: 'publishable',
+    tenantMode: 'fixed',
+    tenantId: 'acc_9',
+    service: 'web',
+    env: 'prod',
+    origins: ['https://app.example.com'],
+  });
+  const full: string = minted.key;
+  const parsed: ParsedKey | null = parseKeyString(full);
+  const kk: KeyKind = parsed!.kind;
+  const tm: TenantMode = 'claimed';
+  const ok: boolean = verifySecret('s', hashSecret('s'));
+  await createKey(t.models.keys, { kind: 'secret', tenantMode: 'claimed', service: 'api', env: 'prod' } satisfies CreateKeyInput);
+  void kk, tm, ok;
+}
+
+const adapter: ContextAdapter = {
+  resolveContext: () => ({ tenantId: 'acc_9', subjects: [{ type: 'user', id: 'u_1' }], actor: 'user:u_1' } satisfies IngestContext),
+};
+const ingestOpts: CreateIngestOptions = { telemetry: t, contextAdapter: adapter, maxRecords: 50 };
+const ingestRouter = createIngest(ingestOpts);
+
+// ── client core (types/core.d.ts) ──
+import type { TelemetryClient as CoreClient, Transport, WireRecord } from './core.js';
+import { createClient as createCoreClient } from './core.js';
+
+const transport: Transport = async () => ({ ok: true });
+const c: CoreClient<typeof registry> = createCoreClient<typeof registry>({
+  key: 'pk_live_tk_000000000000000000000000',
+  url: 'https://app.example.com/telemetry/ingest',
+  release: 'app@1.0.0',
+  transport,
+});
+c.track('user.signed_up', { attrs: { source: 'ads', plan: 'pro' } });
+// @ts-expect-error — typo'd names are compile errors in clients too
+c.track('user.typo');
+c.identify({ user: 'u_1', org: 'o_9' });
+c.captureError(new Error('x'), { handled: false });
+const span = c.startSpan('pdf.render');
+span.end({ metrics: { bytes: 100 } });
+c.state('account.lifecycle', { key: 'lifecycle', to: 'active' });
+const rec: WireRecord = { _id: 'x'.repeat(16), name: 'a', occurredAt: new Date().toISOString() };
+async function drain() {
+  await c.flush();
+  await c.shutdown();
+}
+
 // ── shapes are exported and usable standalone ──
 const dim: DimSource = 'attr:source';
 const roll: RollupSpec = { by: [dim], bucket: 'week', actors: ['user'] };
