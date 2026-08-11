@@ -1,0 +1,48 @@
+/*
+ * Scoped to the package's own root element. The SPA is served at its own mount
+ * path inside the host's domain, so it never shares a document with host CSS —
+ * but the root scope keeps that true even if a host embeds the bundle directly.
+ */
+.telemetry {
+  --fg: #111827;
+  --bg: #ffffff;
+  --muted: #6b7280;
+  --border: #e5e7eb;
+  --accent: #2563eb;
+
+  color: var(--fg);
+  background: var(--bg);
+  font: 400 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 24px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .telemetry {
+    --fg: #e5e7eb;
+    --bg: #0b0f19;
+    --muted: #9ca3af;
+    --border: #1f2937;
+    --accent: #60a5fa;
+  }
+}
+
+.telemetry h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+.telemetry ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.telemetry li {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 0;
+}
+
+.telemetry [role="alert"] {
+  color: #b91c1c;
+}

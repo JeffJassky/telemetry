@@ -1,0 +1,18 @@
+{
+  "// ": "Type-checks the hand-written declarations only. The package source is",
+  "//  ": "plain JS; this exists so the .d.ts files can't silently rot away from",
+  "//   ": "it. types/test-d.ts is the thing that actually exercises them.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": ["types/**/*.d.ts", "types/test-d.ts"]
+}
