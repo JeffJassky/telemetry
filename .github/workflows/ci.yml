@@ -44,7 +44,6 @@ jobs:
       - run: npm test
 
       # import.meta.url cannot be expressed in CJS by esbuild; tsup shims it.
-      # When the SPA router returns (stage 4b task 4), point this back at a
-      # defaultSpaDir-style call so the shim is exercised — traps #7.
+      # defaultSpaDir() exercises the shim — verify after every tsup bump (traps #7).
       - name: CJS entry actually loads
-        run: node -e "const p=require('./dist/index.cjs'); if (typeof p.createTelemetry !== 'function') process.exit(1)"
+        run: node -e "const p=require('./dist/index.cjs'); if (typeof p.defaultSpaDir() !== 'string') process.exit(1)"

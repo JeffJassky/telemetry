@@ -201,6 +201,7 @@ export interface ForgetResult {
   redacted: number;
   rollups: number;
   aliases: number;
+  views: number;
 }
 
 export interface Scoped {
@@ -324,3 +325,120 @@ export interface CreateIngestOptions {
  * insert-gated rollups, pk_ never 4xxes, sk_ gets honest errors.
  */
 export declare function createIngest(opts: CreateIngestOptions): import('express').Router;
+
+// ── dashboard (dashboards §2–§8) ────────────────────────────────────────────
+
+export interface QueryLimits {
+  records: number;
+  series: number;
+  rollups: number;
+  trace: number;
+  journey: number;
+}
+export declare const DEFAULT_LIMITS: QueryLimits;
+
+export interface TimeRange {
+  from: Date;
+  to: Date;
+}
+
+export interface RecordFilter {
+  kind?: string;
+  name?: string;
+  severity?: string;
+  env?: string;
+  service?: string;
+  release?: string;
+  subject?: string;
+  traceId?: string;
+  attrs?: Record<string, string>;
+  metrics?: Record<string, { gte?: number; lte?: number }>;
+  /** the customer toggle: exclude these actor TYPES ('admin', 'system') */
+  excludeActorTypes?: string[];
+}
+
+/** the five read primitives — everything the UI renders comes through these */
+export interface Queries {
+  records(tenantId: string, range: TimeRange, filter?: RecordFilter, opts?: { limit?: number; cursor?: string }):
+    Promise<{ items: any[]; nextCursor: string | null; dataSource: 'raw' }>;
+  series(tenantId: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' }):
+    Promise<{ buckets: Array<{ at: Date; value: number }>; dataSource: 'raw' }>;
+  distribution(tenantId: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string }):
+    Promise<Record<string, unknown> & { n: number; dataSource: 'raw' }>;
+  rollups(tenantId: string, params: { as: string; dims?: string; subjectType?: string; range?: TimeRange; sort?: 'count' | 'lastAt' | 'firstAt' | 'bucketAt'; limit?: number }):
+    Promise<{ rows: any[]; bucketed: boolean; dataSource: 'rollups' }>;
+  trace(tenantId: string, traceId: string): Promise<{ items: any[]; dataSource: 'raw' }>;
+  journey(tenantId: string, subjectRef: string, range: TimeRange, opts?: { limit?: number }):
+    Promise<{ records: any[]; milestones: any[]; dataSource: 'raw+rollups' }>;
+}
+
+export declare function createQueries(ctx: {
+  TelemetryModel: Model<any>;
+  RollupModel: Model<any>;
+  registry: Registry;
+  limits?: Partial<QueryLimits>;
+  onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  slowMs?: number;
+}): Queries;
+
+export interface ViewSpec {
+  name: string;
+  icon?: string;
+  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system';
+  query: {
+    range?: string;
+    filters?: Record<string, unknown>;
+    groupBy?: string;
+    sort?: string;
+    display?: 'table' | 'series' | 'breakdown' | 'stream';
+  };
+}
+
+export interface ResolvedView extends ViewSpec {
+  origin: 'derived' | 'configured' | 'saved';
+  id?: string;
+  ownerRef?: string;
+  shared?: boolean;
+}
+
+/** derived views — generated from the registry, zero config */
+export declare function deriveViews(registry: Registry): ResolvedView[];
+
+export interface Viewer {
+  tenantId: string;
+  /** 'admin' unlocks System writes (key revoke) */
+  role: string;
+  /** owns saved views, e.g. 'user:u_1' */
+  viewerRef?: string;
+}
+
+export interface ViewerAdapter {
+  /** INBOUND: who may look? The dashboard refuses to construct without this. */
+  resolveViewer(req: unknown): Viewer | null | Promise<Viewer | null>;
+}
+
+export interface SubjectAdapter {
+  /** pretty labels for subject refs; absent refs render raw */
+  describe(refs: string[]): Promise<Record<string, { label: string; href?: string }>>;
+}
+
+export interface CreateDashboardOptions {
+  telemetry: Telemetry<any>;
+  viewerAdapter: ViewerAdapter;
+  subjectAdapter?: SubjectAdapter;
+  /** configured views — versioned in host code */
+  views?: ViewSpec[];
+  queryLimits?: Partial<QueryLimits>;
+  onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  /** where the browser sees this router mounted — MUST match (traps #8) */
+  mountPath?: string;
+  apiBase?: string;
+  title?: string;
+  spaDir?: string;
+}
+
+/** /api/* (five primitives, views, system) + the built SPA with hashed assets */
+export declare function createDashboard(opts: CreateDashboardOptions): import('express').Router;
+
+/** the bundled SPA directory — resolves dist/ui in builds and source runs */
+export declare function defaultSpaDir(): string;

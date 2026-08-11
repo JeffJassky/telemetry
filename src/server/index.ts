@@ -26,6 +26,14 @@ export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKe
 export type { CreateKeyInput, ParsedKey } from './keys.js';
 export { createIngest } from './ingest.js';
 export type { ContextAdapter, CreateIngestOptions, IngestContext } from './ingest.js';
+export { createDashboard, defaultSpaDir } from './dashboard.js';
+export type {
+  CreateDashboardOptions, SubjectAdapter, Viewer, ViewerAdapter,
+} from './dashboard.js';
+export { createQueries, DEFAULT_LIMITS } from './query.js';
+export type { Queries, QueryLimits, RecordFilter, TimeRange } from './query.js';
+export { deriveViews } from './views.js';
+export type { ResolvedView, ViewSpec } from './views.js';
 
 export interface CreateTelemetryConfig {
   /** the host-owned event registry — see defineRegistry() */
@@ -78,6 +86,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
 
   const rejects = () => conn.db!.collection(`${collection}_rejects`);
   const aliases = () => conn.db!.collection(`${collection}_aliases`);
+  const views = () => conn.db!.collection(`${collection}_views`);
 
   // fire-and-forget writes are tracked so flush() can await stragglers —
   // tests and SIGTERM handlers both need "everything emitted is queryable"
@@ -94,6 +103,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     RollupModel,
     rejects: rejects as () => Collection,
     aliases: aliases as () => Collection,
+    views: views as () => Collection,
     pepper: () => {
       const p = config.pepper ?? process.env.TELEMETRY_PEPPER;
       if (!p) {

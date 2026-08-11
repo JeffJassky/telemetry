@@ -1,23 +1,91 @@
 import React from 'react';
+import { createApi } from './api.js';
+import { Sidebar, Topbar } from './shell.jsx';
+import { Errors, Events, Journeys, Overview, System, Traces, Usage } from './pages.jsx';
+import { parseHash } from './util.js';
 
 /**
- * Placeholder shell. The real dashboard — query primitives, ViewSpec
- * quick-selects, kind pages, mailery design tokens — lands with stage 4b
- * task 4 (plans/dashboards.md). This exists so `build:ui` stays green while
- * the server core ships first.
- *
- * Worth preserving when replacing: build every client from the injected
- * `config` (never a hardcoded base), and carry the full current URL — hash
- * route included — into any login redirect. See standards/adapters.md.
+ * The dashboard shell (dashboards §3): sidebar (pages + view quick-select),
+ * topbar (range/name/env + save-view + theme), and one page under it. Every
+ * screen state is a shareable URL — the hash IS the view.
  */
+
+const PAGES = {
+  overview: Overview,
+  errors: Errors,
+  traces: Traces,
+  events: Events,
+  journeys: Journeys,
+  usage: Usage,
+  system: System,
+};
+
+function useHashRoute() {
+  const [route, setRoute] = React.useState(parseHash);
+  React.useEffect(() => {
+    const on = () => setRoute(parseHash());
+    window.addEventListener('hashchange', on);
+    return () => window.removeEventListener('hashchange', on);
+  }, []);
+  return route;
+}
+
 export default function App({ config }) {
+  const api = React.useMemo(() => createApi(config), [config]);
+  const route = useHashRoute();
+  const [registry, setRegistry] = React.useState(null);
+  const [views, setViews] = React.useState([]);
+  const [error, setError] = React.useState(null);
+  const [theme, setTheme] = React.useState(() => localStorage.getItem('telemetry_theme') ?? 'light');
+
+  React.useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('telemetry_theme', theme);
+  }, [theme]);
+
+  React.useEffect(() => {
+    api.registry().then((r) => setRegistry(r.registry), setError);
+    api.views().then((v) => setViews(v.views), () => {});
+  }, [api]);
+
+  const saveView = async () => {
+    const name = window.prompt('View name — it will appear in the sidebar:');
+    if (!name) return;
+    const shared = window.confirm('Share with the whole tenant? (Cancel = private to you)');
+    await api.saveView(
+      { name, page: route.page, query: { range: route.params.range ?? '7d', filters: route.params } },
+      shared,
+    );
+    api.views().then((v) => setViews(v.views), () => {});
+  };
+
+  if (error) {
+    return (
+      <div className="empty" style={{ paddingTop: '20vh' }}>
+        <h3>{error.status === 401 ? 'Sign in required' : 'Dashboard unavailable'}</h3>
+        {String(error.message)}
+      </div>
+    );
+  }
+
+  const Page = PAGES[route.page] ?? Overview;
   return (
-    <main style={{ fontFamily: 'system-ui, sans-serif', padding: '4rem 2rem', textAlign: 'center' }}>
-      <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Telemetry</h1>
-      <p style={{ color: '#78716c', maxWidth: '32rem', margin: '1rem auto' }}>
-        The dashboard ships after the ingest and client layers. API base for
-        this mount: <code>{config?.apiBase ?? '/api/telemetry'}</code>
-      </p>
-    </main>
+    <div className="app">
+      <Sidebar route={route} views={views} title={config.title} />
+      <div className="main">
+        <Topbar
+          route={route}
+          registry={registry}
+          onSaveView={saveView}
+          theme={theme}
+          onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+        />
+        <div className="content">
+          <div className="content-inner">
+            {registry ? <Page api={api} route={route} registry={registry} /> : <div className="empty">Loading…</div>}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

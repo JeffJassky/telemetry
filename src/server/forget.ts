@@ -18,6 +18,7 @@ export interface ForgetCtx {
   RollupModel: Model<any>;
   rejects: () => Collection;
   aliases: () => Collection;
+  views: () => Collection;
   pepper: () => string;
 }
 
@@ -26,6 +27,7 @@ export interface ForgetResult {
   redacted: number;
   rollups: number;
   aliases: number;
+  views: number;
 }
 
 export function createForget(ctx: ForgetCtx) {
@@ -138,6 +140,16 @@ export function createForget(ctx: ForgetCtx) {
       await ctx.aliases().deleteMany({ tenantId, $or: [{ anonRef: ref }, { userRef: ref }] })
     ).deletedCount;
 
-    return { deleted: del.deletedCount ?? 0, redacted: red.modifiedCount ?? 0, rollups, aliases };
+    // 6. saved dashboard views: ownerRef is a person. Private views die with
+    //    them; shared ones stay useful to the tenant, so only the owner link
+    //    is redacted (dashboards §3 — same delete-vs-redact rule as rows).
+    const views =
+      (await ctx.views().deleteMany({ tenantId, ownerRef: ref, shared: { $ne: true } })).deletedCount +
+      (await ctx.views().updateMany(
+        { tenantId, ownerRef: ref, shared: true },
+        { $set: { ownerRef: newRef } },
+      )).modifiedCount;
+
+    return { deleted: del.deletedCount ?? 0, redacted: red.modifiedCount ?? 0, rollups, aliases, views };
   };
 }

@@ -198,6 +198,70 @@ async function drain() {
   await c.shutdown();
 }
 
+// ── dashboard surface ──
+import type {
+  CreateDashboardOptions,
+  Queries,
+  QueryLimits,
+  RecordFilter,
+  ResolvedView,
+  SubjectAdapter,
+  TimeRange,
+  Viewer,
+  ViewerAdapter,
+  ViewSpec,
+} from './index.js';
+import { createDashboard, createQueries, defaultSpaDir, deriveViews, DEFAULT_LIMITS } from './index.js';
+
+const viewer: Viewer = { tenantId: 'acc_9', role: 'admin', viewerRef: 'user:u_1' };
+const viewerAdapter: ViewerAdapter = { resolveViewer: () => viewer };
+const subjectAdapter: SubjectAdapter = {
+  describe: async (refs) => Object.fromEntries(refs.map((r) => [r, { label: r }])),
+};
+const view: ViewSpec = {
+  name: 'Checkout errors',
+  page: 'errors',
+  query: { range: '24h', filters: { severity: 'error' }, display: 'table' },
+};
+const dashOpts: CreateDashboardOptions = {
+  telemetry: t,
+  viewerAdapter,
+  subjectAdapter,
+  views: [view],
+  queryLimits: { records: 100 },
+  onSlowQuery: ({ op, ms }) => void `${op}:${ms}`,
+  mountPath: '/telemetry',
+};
+const dashRouter = createDashboard(dashOpts);
+const spa: string = defaultSpaDir();
+const derived: ResolvedView[] = deriveViews(registry);
+const caps: QueryLimits = DEFAULT_LIMITS;
+
+async function primitives() {
+  const q: Queries = createQueries({
+    TelemetryModel: t.models.telemetry,
+    RollupModel: t.models.rollups,
+    registry,
+  });
+  const range: TimeRange = { from: new Date(0), to: new Date() };
+  const f: RecordFilter = { kind: 'span', excludeActorTypes: ['admin'] };
+  const page = await q.records('acc_9', range, f, { limit: 50 });
+  const next: string | null = page.nextCursor;
+  const ser = await q.series('acc_9', range, f, { measure: 'sum:cost_usd', interval: 'day' });
+  void ser.buckets[0]?.value;
+  await q.distribution('acc_9', range, f);
+  const ro = await q.rollups('acc_9', { as: 'llm_cost', sort: 'bucketAt' });
+  const src: 'rollups' = ro.dataSource;
+  await q.trace('acc_9', 'tr_1');
+  await q.journey('acc_9', 'user:u_1', range);
+}
+
+// forget() now reports views too
+async function forgetViews() {
+  const gone = await t.forget('acc_9', 'user:u_1');
+  const v: number = gone.views;
+}
+
 // ── shapes are exported and usable standalone ──
 const dim: DimSource = 'attr:source';
 const roll: RollupSpec = { by: [dim], bucket: 'week', actors: ['user'] };
