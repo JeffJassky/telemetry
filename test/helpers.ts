@@ -1,25 +1,25 @@
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import { z } from 'zod';
 import { boundedMeta, createTelemetry, defineRegistry } from '../src/server/index.js';
 
-let mongod: MongoMemoryServer;
-
+// The mongod itself is booted once for the whole run by test/global-setup.ts
+// (12 suites booting their own mongod, serialized by singleFork, was paying a
+// boot tax on every file — see that file for why). Each suite just connects
+// mongoose to the shared instance.
 export async function startDb() {
-  mongod = await MongoMemoryServer.create();
-  await mongoose.connect(mongod.getUri(), { dbName: 'telemetry-test' });
+  const uri = process.env.TELEMETRY_TEST_MONGO_URI;
+  if (!uri) throw new Error('TELEMETRY_TEST_MONGO_URI not set — global-setup did not run');
+  await mongoose.connect(uri, { dbName: 'telemetry-test' });
   // Force one real round-trip HERE, in the hook. connect() resolving is not the
   // same as the connection being usable: mongoose buffers operations while it
-  // settles, and across a sequential 10-suite run (each booting its own mongod
-  // on the shared default connection) that buffering landed on whichever test
-  // ran first — a 30s testTimeout failure with nothing to do with the code under
-  // test. The hook has a 60s budget; this is where the wait belongs.
+  // settles, and across a sequential run that buffering landed on whichever
+  // test ran first — a 30s testTimeout failure with nothing to do with the
+  // code under test. The hook has a 60s budget; this is where the wait belongs.
   await mongoose.connection.db!.admin().ping();
 }
 
 export async function stopDb() {
   await mongoose.disconnect();
-  await mongod?.stop();
 }
 
 /**

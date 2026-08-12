@@ -7,6 +7,7 @@ export default defineConfig({
     environment: 'node',
     testTimeout: 30000,
     hookTimeout: 60000,
+    globalSetup: ['./test/global-setup.ts'],
     // mongodb-memory-server downloads and binds a mongod per instance. Running
     // suites in parallel makes startup nondeterministic on CI runners with few
     // cores, and the failures look like flaky tests rather than contention.
