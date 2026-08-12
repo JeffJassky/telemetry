@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Collection, Model } from 'mongoose';
-import { TelemetryKind, RESERVED_TENANT_MESSAGE, isPlatformScope, type EntityRef } from './types.js';
+import {
+  TelemetryKind, PLATFORM_SCOPE, RESERVED_TENANT_MESSAGE, isPlatformScope, type EntityRef,
+} from './types.js';
 
 /**
  * Erasure, actually implemented (schema §4.7). Covers subjects, actor,
@@ -20,6 +22,13 @@ export interface ForgetCtx {
   aliases: () => Collection;
   views: () => Collection;
   pepper: () => string;
+  /**
+   * The host asserting that a subject ref names the same party in every tenant.
+   * The package cannot verify it, so it is declared rather than detected — and
+   * it is what lets step 6 reach platform-scoped saved views. See the comment
+   * there for why the default has to be off.
+   */
+  globalSubjectRefs: () => boolean;
 }
 
 export interface ForgetResult {
@@ -148,10 +157,25 @@ export function createForget(ctx: ForgetCtx) {
     // 6. saved dashboard views: ownerRef is a person. Private views die with
     //    them; shared ones stay useful to the tenant, so only the owner link
     //    is redacted (dashboards §3 — same delete-vs-redact rule as rows).
+    //
+    //    A person who used the cross-tenant dashboard owns views stored under
+    //    PLATFORM_SCOPE, which is not a tenant — so a tenant-scoped forget()
+    //    misses them and erasure is incomplete. Reaching them is only SAFE when
+    //    a ref names one party globally; if ids are per-tenant, 'user:u_1' is a
+    //    different person in each and one tenant's erasure would delete
+    //    another's views. The package cannot tell which world it is in, so the
+    //    host declares it and the default is the conservative one.
+    //
+    //    Note the asymmetry with the guard at the top: that refuses '*' as the
+    //    ERASURE SCOPE (unbounded rewrite of every tenant's rows). This reaches
+    //    '*' rows owned by one named person. Bounded by the ref, not the tenant.
+    const viewScope = ctx.globalSubjectRefs()
+      ? { $in: [tenantId, PLATFORM_SCOPE] }
+      : tenantId;
     const views =
-      (await ctx.views().deleteMany({ tenantId, ownerRef: ref, shared: { $ne: true } })).deletedCount +
+      (await ctx.views().deleteMany({ tenantId: viewScope, ownerRef: ref, shared: { $ne: true } })).deletedCount +
       (await ctx.views().updateMany(
-        { tenantId, ownerRef: ref, shared: true },
+        { tenantId: viewScope, ownerRef: ref, shared: true },
         { $set: { ownerRef: newRef } },
       )).modifiedCount;
 

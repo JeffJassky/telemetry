@@ -33,7 +33,8 @@ export function Sidebar({ route, views, title, platform }) {
       href={toHash(v.page, { range: v.query.range ?? '7d', ...flatten(v.query.filters), display: v.query.display })}
       title={v.name}
     >
-      <span className="icon">{v.origin === 'saved' ? '★' : v.origin === 'configured' ? '◆' : '·'}</span>
+      {/* a view's own icon wins; without one the origin badge says where it came from */}
+      <span className="icon">{v.icon || (v.origin === 'saved' ? '★' : v.origin === 'configured' ? '◆' : '·')}</span>
       {v.name}
     </a>
   );

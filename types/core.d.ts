@@ -110,6 +110,15 @@ export interface TelemetryClient<R extends Registry = Registry> {
   setActor(ref: string | undefined): void;
   flush(): Promise<void>;
   shutdown(): Promise<void>;
+  /**
+   * INTERNAL — not a public contract. The platform adapters (`/web`,
+   * `/electron`, `/cli`) reach in here to drain and refill the one real queue,
+   * so the member exists on every shipped client and pretending otherwise made
+   * this declaration false. Its shape is unstable and may change in any
+   * release: it is typed opaquely on purpose, so reading a field off it is a
+   * deliberate cast rather than an accident. Do not use it.
+   */
+  readonly _internal: unknown;
 }
 
 export declare function createClient<R extends Registry = Registry>(

@@ -250,6 +250,13 @@ function TracesList({ api, route, registry }) {
       <FilterBar route={route} registry={registry} />
       <div className="card chart-card">
         <div className="card-title" style={{ marginBottom: 8 }}>Duration distribution</div>
+        {/* never a silent cap: if the scan hit the ceiling, the chart says so */}
+        {q.data.dist.truncated && (
+          <div className="card-sub" style={{ marginBottom: 8, color: 'var(--amber)' }}>
+            scan truncated at the query cap — these percentiles cover the first{' '}
+            {fmtNumber(q.data.dist.n)} spans in range, not all of them
+          </div>
+        )}
         <DistributionChart {...q.data.dist} />
       </div>
       <div className="card card-pad-0">

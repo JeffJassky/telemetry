@@ -237,6 +237,59 @@ describe('emit — the two planes', () => {
     await t.flush();
   });
 
+  it('a durable emit awaits its ROLLUPS too — the aggregate is readable with no flush()', async () => {
+    // `written` used to mean the row and only the row: rollups were ctx.track()
+    // on every path, so a host that awaited a durable emit and then read the
+    // aggregate could legitimately get a stale one — the race durable exists to
+    // remove, one plane over.
+    const t = buildTelemetry();
+    const r = await t.emit('llm.completion', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      traceId: 'tr_2222abcd', spanId: 's1', durationMs: 7,
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { gen_ai_system: 'anthropic', gen_ai_request_model: 'm', feature: 'chat' },
+      metrics: { tokens_in: 3, tokens_out: 4, cost_usd: 0.25 },
+      durable: true,
+    });
+    expect(r.outcome).toBe('written');
+    // deliberately NO flush() — 'written' now covers both planes
+    const roll = await t.models.rollups.findOne({ as: 'llm_cost' }).lean() as any;
+    expect(roll).toBeTruthy();
+    expect(roll.sums.cost_usd).toBeCloseTo(0.25);
+    await t.flush();
+  });
+
+  it('usage is durable by kind, so its SPEND rollup is on disk the instant emit returns — money first', async () => {
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    const r = await t.emit('billing.ai_tokens', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { gen_ai_request_model: 'm', feature: 'chat' }, metrics: { cost_usd: 0.42 },
+      usage: { meter: 'ai_tokens', quantity: 100, unit: 'token', idempotencyKey: 'tr_9:s_1', billedTo: 'org:o' },
+    });
+    expect(r.outcome).toBe('written');
+    // no flush: an invoice read that has to guess whether the aggregate landed
+    // is the bug, and usage is the case where it costs actual money
+    const spend = await t.models.rollups.findOne({ as: 'spend' }).lean() as any;
+    expect(spend.count).toBe(1);
+    expect(spend.sums.cost_usd).toBeCloseTo(0.42);
+    await t.flush();
+  });
+
+  it('the NON-durable path stays fire-and-forget — its rollup is a promise until flush()', async () => {
+    // the other half of the contract: awaiting aggregates on every path would
+    // put a Mongo round trip on the hot path of a page view
+    const t = buildTelemetry();
+    const r = await t.emit('report.shared', {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u_ff' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+    });
+    expect(r.outcome).toBe('queued');
+    await t.flush();
+    expect(await t.models.rollups.countDocuments({ as: 'report.shared' })).toBe(1);
+  });
+
   it('EventSpec.durable makes it the default for every caller of that name', async () => {
     const t = buildTelemetry();
     const r = await t.emit('ledger.charge', {

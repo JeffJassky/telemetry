@@ -18,10 +18,14 @@ import { newId } from './types.js';
  * the router's delete/ownership lookup, which must stay literal for the same
  * reason (a platform admin's `role: 'admin'` is admin OF the platform scope).
  *
- * Stated bound: forget(tenantId, ref) is tenant-scoped and '*' is not a tenant,
- * so a person's PLATFORM-scoped saved views are not erased by a forget() call
- * against their home tenant. Widening forget() to reach '*' rows would give a
- * tenant-scoped call cross-tenant write reach, which is the trade we refused.
+ * Erasure across that boundary is opt-in. forget(tenantId, ref) is
+ * tenant-scoped and '*' is not a tenant, so a person's PLATFORM-scoped views
+ * are missed by default — set `globalSubjectRefs` on createTelemetry() and
+ * forget() reaches them too. The flag is the host asserting that a ref names
+ * one party globally; without that, `user:u_1` is a different person in every
+ * tenant and one tenant's erasure would delete another's views. Bounded by the
+ * named ref either way — never by the tenant, which is the escape hatch this
+ * namespace exists to deny.
  */
 
 export interface ViewSpec {

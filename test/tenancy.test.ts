@@ -114,6 +114,25 @@ describe('tenancy — the platform scope and the reserved token', () => {
       expect(journey.body.records.length).toBe(2); // signed_up + first_viewed, hers only
     });
 
+    it('nor the System page\'s quarantine — rejects hold RAW payloads', async () => {
+      const t = buildTelemetry();
+      // an unregistered name quarantines the whole record, verbatim
+      await t.emit('nope.not_a_thing', { tenantId: 'tn_a', attrs: { secret: 'a-side' } });
+      await t.emit('nope.not_a_thing', { tenantId: 'tn_b', attrs: { secret: 'b-side' } });
+      await t.flush();
+
+      const { app, state } = buildApp(t, TENANT_VIEWER);
+      const mine = (await request(app).get('/telemetry/api/system')).body.quarantine;
+      expect(mine).toHaveLength(1);
+      expect(mine[0].raw.tenantId).toBe('tn_a');
+      // the payload is the point: this route bypasses the query primitives, so
+      // it needs its own scoping or it is a leak that no primitive test catches
+      expect(JSON.stringify(mine)).not.toContain('b-side');
+
+      state.viewer = PLATFORM_VIEWER;
+      expect((await request(app).get('/telemetry/api/system')).body.quarantine).toHaveLength(2);
+    });
+
     it('a viewer cannot widen its own scope through the query string', async () => {
       const t = await seedBoth();
       const { app } = buildApp(t, TENANT_VIEWER);
@@ -319,6 +338,68 @@ describe('tenancy — the platform scope and the reserved token', () => {
       expect((await request(app).delete(`/telemetry/api/views/${platformView.body.id}`)).body.removed).toBe(1);
       state.viewer = TENANT_VIEWER;
       expect((await request(app).delete(`/telemetry/api/views/${tenantView.body.id}`)).body.removed).toBe(1);
+    });
+  });
+
+  describe('erasing a person who used the cross-tenant dashboard', () => {
+    /** saves one private and one shared view as `owner`, in `scope` */
+    const seedViews = async (t: any, scope: string, owner: string) => {
+      const { app, state } = buildApp(t, { tenantId: scope, role: 'admin', viewerRef: owner });
+      state.viewer = { tenantId: scope, role: 'admin', viewerRef: owner };
+      await request(app).post('/telemetry/api/views')
+        .send({ spec: { name: `${owner}-private-in-${scope}`, page: 'events', query: {} } });
+      await request(app).post('/telemetry/api/views')
+        .send({ spec: { name: `${owner}-shared-in-${scope}`, page: 'events', query: {} }, shared: true });
+      return t.models.telemetry.db.collection(
+        `${t.models.telemetry.collection.collectionName}_views`,
+      );
+    };
+
+    it('by default, forget() leaves the platform-scoped ones — the stated bound', async () => {
+      const t = buildTelemetry();
+      const views = await seedViews(t, PLATFORM_SCOPE, 'user:u_ops');
+      await seedViews(t, 'tn_a', 'user:u_ops');
+
+      const gone = await t.forget('tn_a', 'user:u_ops');
+      expect(gone.views).toBe(2); // the home tenant's pair only
+
+      // still there, still owned by them — incomplete erasure, on purpose,
+      // because the package cannot know that 'user:u_ops' is one person
+      expect(await views.countDocuments({ tenantId: PLATFORM_SCOPE, ownerRef: 'user:u_ops' })).toBe(2);
+    });
+
+    it('globalSubjectRefs reaches them — the host asserting a ref is one party everywhere', async () => {
+      const t = buildTelemetry({ globalSubjectRefs: true });
+      const views = await seedViews(t, PLATFORM_SCOPE, 'user:u_ops');
+      await seedViews(t, 'tn_a', 'user:u_ops');
+
+      const gone = await t.forget('tn_a', 'user:u_ops');
+      expect(gone.views).toBe(4); // both scopes, both pairs
+
+      // private ones deleted outright; shared ones survive with the owner link
+      // rekeyed — the same delete-vs-redact rule the rows follow
+      expect(await views.countDocuments({ ownerRef: 'user:u_ops' })).toBe(0);
+      const survivors = await views.find({ tenantId: PLATFORM_SCOPE }).toArray();
+      expect(survivors).toHaveLength(1);
+      expect(survivors[0]!.spec.name).toBe('user:u_ops-shared-in-*');
+      expect(survivors[0]!.ownerRef).toMatch(/^user:redacted_/);
+    });
+
+    it('it is bounded by the REF, never by the tenant — another owner\'s views are untouched', async () => {
+      const t = buildTelemetry({ globalSubjectRefs: true });
+      const views = await seedViews(t, PLATFORM_SCOPE, 'user:u_ops');
+      await seedViews(t, PLATFORM_SCOPE, 'user:u_other');
+
+      await t.forget('tn_a', 'user:u_ops');
+
+      // the flag widens WHICH SCOPES are searched, not whose views match. A
+      // second platform user is a bystander, not collateral.
+      expect(await views.countDocuments({ ownerRef: 'user:u_other' })).toBe(2);
+    });
+
+    it('still refuses \'*\' as the erasure SCOPE — widening reach is not widening blast radius', async () => {
+      const t = buildTelemetry({ globalSubjectRefs: true });
+      await expect(t.forget(PLATFORM_SCOPE, 'user:u_ops')).rejects.toThrow(/reserved/);
     });
   });
 

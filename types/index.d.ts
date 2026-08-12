@@ -3,10 +3,42 @@ import type { z } from 'zod';
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
 
-export type TelemetryKind = 'event' | 'error' | 'span' | 'state' | 'usage';
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
-export type Env = 'prod' | 'staging' | 'dev';
-export type Origin = 'server' | 'client';
+/**
+ * The vocabulary ships as `const` objects, so each name is a VALUE as well as a
+ * type: `TelemetryKind.Usage` in an expression, `TelemetryKind` in a type
+ * position. Declaring only the union would deny a value the package exports —
+ * working code that fails `tsc`.
+ */
+export declare const TelemetryKind: {
+  readonly Event: 'event';
+  readonly Error: 'error';
+  readonly Span: 'span';
+  readonly State: 'state';
+  readonly Usage: 'usage';
+};
+export type TelemetryKind = (typeof TelemetryKind)[keyof typeof TelemetryKind];
+
+export declare const LogLevel: {
+  readonly Debug: 'debug';
+  readonly Info: 'info';
+  readonly Warn: 'warn';
+  readonly Error: 'error';
+  readonly Fatal: 'fatal';
+};
+export type LogLevel = (typeof LogLevel)[keyof typeof LogLevel];
+
+export declare const Env: {
+  readonly Prod: 'prod';
+  readonly Staging: 'staging';
+  readonly Dev: 'dev';
+};
+export type Env = (typeof Env)[keyof typeof Env];
+
+export declare const Origin: {
+  readonly Server: 'server';
+  readonly Client: 'client';
+};
+export type Origin = (typeof Origin)[keyof typeof Origin];
 
 /** `type:id` — 'user:u_1', 'org:o_9', 'system:cron' */
 export type EntityRef = `${string}:${string}`;
@@ -47,6 +79,14 @@ export declare function traceKeep(traceId: string | undefined, rate: number): bo
 export declare function plain(v: unknown): unknown;
 
 export declare function truncate(d: Date, bucket?: 'hour' | 'day' | 'week' | 'month'): Date | undefined;
+
+/**
+ * Read one dimension source off a record — the same resolution rollups and
+ * emit()'s burst cap use, exported so a host can key its own derived state the
+ * way the package keys its aggregates. `'subject'` is handled by fan-out, not
+ * here, so it resolves to `undefined`.
+ */
+export declare function resolveDim(src: DimSource, doc: any): unknown;
 
 export interface Logger {
   info(...args: unknown[]): void;
@@ -92,7 +132,11 @@ export interface EventSpec {
   /** attrs are STRING values — use z.string()/z.enum()/z.coerce.* */
   attrs?: z.ZodObject<any>;
   metrics?: z.ZodObject<any>;
-  /** `data` is UNSTORED unless declared. Closes the erasure hole. */
+  /**
+   * `data` is UNSTORED unless declared. Closes the erasure hole. Declare an
+   * OBJECT schema or `boundedMeta()` — `EmitInput.data` is an object, so a
+   * scalar schema is expressible here and unreachable through emit().
+   */
   data?: z.ZodType<any>;
   indexedAttrs?: readonly string[];
   indexedMetrics?: readonly string[];
@@ -238,7 +282,13 @@ export interface EmitResult {
   /** the record _id — usable for correlation even when the row was not stored */
   id: string;
   /**
-   * written  — durably in Mongo, awaited
+   * written  — BOTH planes are on disk and awaited: the row, and its rollups.
+   *            Readable immediately, with no flush(). One meaning, on every
+   *            path that returns it — durable specs, kind=usage, and
+   *            insert-gated dedupeKey writes alike.
+   *            A rollup that FAILS is quarantined and counted rather than
+   *            thrown, as on every other path — awaiting an aggregate must not
+   *            turn its failure into a report that the row does not exist.
    * queued   — validated and aggregated; the save is in flight, t.flush() awaits it
    * deduped  — dedupeKey already present: nothing written, nothing aggregated
    * sampled  — evidence plane declined; aggregates were still updated
@@ -274,7 +324,8 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
   registry: R;
   /** a mongoose Connection, or the mongoose module itself */
   connection: Connection | Mongoose;
-  /** base collection; siblings derive: `<collection>_rollups`, `_rejects`, `_aliases`, `_checkpoints` */
+  /** base collection; six siblings derive: `<collection>_rollups`, `_rejects`,
+   *  `_aliases`, `_checkpoints`, `_keys`, `_views` */
   collection?: string;
   /** set when two instances share one connection — traps #2 */
   modelName?: string;
@@ -284,6 +335,14 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
   platforms?: readonly string[];
   /** override BODY_MAX_CHARS for this instance */
   bodyMax?: number;
+  /**
+   * Declares that a subject ref (`type:id`) names the same party in EVERY
+   * tenant. Only effect today: forget() also erases the person's
+   * platform-scoped saved views, which a tenant-scoped call otherwise misses.
+   * Leave it off when ids are minted per tenant — there, `user:u_1` is a
+   * different person in each, and one tenant's erasure would reach another's.
+   */
+  globalSubjectRefs?: boolean;
   logger?: Logger;
 }
 
@@ -293,7 +352,8 @@ export interface Telemetry<R extends Registry = Registry> {
   /**
    * Erasure: delete sole-party rows, redact shared ones, rekey rollups, drop
    * aliases. Tenant-scoped — rejects PLATFORM_SCOPE, so a platform-wide erasure
-   * is N calls that each name their tenant.
+   * is N calls that each name their tenant. Reaches the person's
+   * platform-scoped saved views only when `globalSubjectRefs` is set.
    */
   forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>;
   /**
@@ -335,9 +395,20 @@ export declare function createTelemetry<const R extends Registry>(
 
 // ── keys (instrumentation §2) ───────────────────────────────────────────────
 
-export type KeyKind = 'publishable' | 'secret';
+/** `const` + type twin, like the vocabulary above — `KeyKind.Secret` is a value */
+export declare const KeyKind: {
+  readonly Publishable: 'publishable';
+  readonly Secret: 'secret';
+};
+export type KeyKind = (typeof KeyKind)[keyof typeof KeyKind];
+
 /** fixed: the key carries tenantId · session: the host resolves it · claimed: the payload asserts it (sk_ only) */
-export type TenantMode = 'fixed' | 'session' | 'claimed';
+export declare const TenantMode: {
+  readonly Fixed: 'fixed';
+  readonly Session: 'session';
+  readonly Claimed: 'claimed';
+};
+export type TenantMode = (typeof TenantMode)[keyof typeof TenantMode];
 
 export interface ParsedKey {
   kind: KeyKind;
@@ -405,6 +476,8 @@ export interface QueryLimits {
   rollups: number;
   trace: number;
   journey: number;
+  /** raw docs distribution will scan before it reports an undercount */
+  distribution: number;
   /** rollup docs distinctCount will scan before it reports an undercount */
   distinct: number;
   /** subjects in one funnel cohort */
@@ -557,8 +630,14 @@ export interface Queries {
     Promise<{ items: any[]; nextCursor: string | null; dataSource: 'raw' }>;
   series(scope: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' }):
     Promise<{ buckets: Array<{ at: Date; value: number }>; dataSource: 'raw' }>;
+  /**
+   * The sample is complete — nothing is sampled away between the match and the
+   * math — but `$percentile` is `method: 'approximate'` and the scan stops at
+   * `limits.distribution`. `truncated` says when that ceiling was reached; the
+   * percentile keys are absent on an empty match, `truncated` never is.
+   */
   distribution(scope: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string }):
-    Promise<Record<string, unknown> & { n: number; dataSource: 'raw' }>;
+    Promise<Record<string, unknown> & { n: number; truncated: boolean; dataSource: 'raw' }>;
   /**
    * `dims` accepts several values as an `$in` — one read for N subjects instead
    * of N reads. `on` picks the field `range` filters (default: bucketAt when
@@ -591,7 +670,12 @@ export declare function createQueries(ctx: {
   registry: Registry;
   limits?: Partial<QueryLimits>;
   onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  /** threshold onSlowQuery fires above, ms. Default 500. */
   slowMs?: number;
+  /** in-process result cache TTL, ms. Default 600_000 — ten minutes. */
+  cacheTtlMs?: number;
+  /** cached entries kept before the oldest is evicted. Default 60. */
+  cacheSize?: number;
 }): Queries;
 
 export interface ViewSpec {
@@ -659,6 +743,12 @@ export interface CreateDashboardOptions {
   views?: ViewSpec[];
   queryLimits?: Partial<QueryLimits>;
   onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  /** threshold onSlowQuery fires above, ms. Default 500. Forwarded to createQueries. */
+  slowMs?: number;
+  /** in-process query cache TTL, ms. Default 600_000. Forwarded to createQueries. */
+  cacheTtlMs?: number;
+  /** cached query results kept before eviction. Default 60. Forwarded to createQueries. */
+  cacheSize?: number;
   /** where the browser sees this router mounted — MUST match (traps #8) */
   mountPath?: string;
   apiBase?: string;

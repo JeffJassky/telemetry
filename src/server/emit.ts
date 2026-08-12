@@ -56,7 +56,13 @@ export interface EmitResult {
   /** the record _id — usable for correlation even when the row was not stored */
   id: string;
   /**
-   * written  — durably in Mongo, awaited
+   * written  — BOTH planes are on disk and awaited: the row, and its rollups.
+   *            Readable immediately, with no flush(). One meaning, on every
+   *            path that returns it — durable specs, kind=usage, and
+   *            insert-gated dedupeKey writes alike.
+   *            A rollup that FAILS is quarantined and counted rather than
+   *            thrown, as on every other path — awaiting an aggregate must not
+   *            turn its failure into a report that the row does not exist.
    * queued   — validated and aggregated; the save is in flight, t.flush() awaits it
    * deduped  — dedupeKey already present: nothing written, nothing aggregated
    * sampled  — evidence plane declined; aggregates were still updated
@@ -177,11 +183,23 @@ export function createEmitter(ctx: EmitCtx) {
       return { id, outcome: 'rejected' };
     }
 
-    const rollup = () => {
-      for (const r of spec.rollups ?? []) {
-        ctx.track(recordRollup(RollupModel, d, name, r, counters).catch(onFail));
-      }
-    };
+    /**
+     * Fire the aggregate plane and HAND BACK the writes, so a `durable` emit can
+     * await them (below). Still tracked either way — t.flush() drains them for
+     * everyone else.
+     *
+     * A rollup failure stays a quarantine-and-count, never a throw, on every
+     * path including durable: the row is already on disk by then, and turning a
+     * failed aggregate into an exception would tell the caller nothing was
+     * written when something was. Drops are reported through counters and the
+     * rejects collection, as everywhere else.
+     */
+    const rollup = (): Promise<unknown>[] =>
+      (spec.rollups ?? []).map((r) => {
+        const p = recordRollup(RollupModel, d, name, r, counters).catch(onFail);
+        ctx.track(p);
+        return p;
+      });
 
     // hook already ran; skip the re-validate on save
     const saveOpts = {
@@ -207,12 +225,22 @@ export function createEmitter(ctx: EmitCtx) {
         if (durable) throw e; // money, and anything else the caller chose to await
         return { id, outcome: 'rejected' };
       }
-      rollup();
+      // Aggregates awaited too, and NOT only when `durable` — because this
+      // branch returns 'written', and that outcome has to mean one thing. A
+      // gated write whose rollups were still in flight would be 'written' with
+      // a weaker guarantee than the durable path's 'written', which is the
+      // exact ambiguity Promise<void> had before EmitResult replaced it.
+      //
+      // The cost is one round trip per rollup family on a write that already
+      // awaited its insert, and kind=usage — unconditionally durable, and the
+      // case that matters most, since usage rollups are money — was paying it
+      // regardless. Callers who do not want to wait have `queued`.
+      await Promise.all(rollup());
       return { id, outcome: 'written' };
     }
 
     // ── aggregate plane: unconditional ──
-    rollup();
+    const aggregates = rollup();
 
     // ── evidence plane: sampling verdict, then burst cap ──
     if (!forced && !traceKeep(doc.traceId as string | undefined, baseRate)) {
@@ -234,6 +262,11 @@ export function createEmitter(ctx: EmitCtx) {
     // Declared durable: await the row and rethrow, so a host whose cost ledger
     // is a span can await THIS write instead of t.flush(), which drains every
     // in-flight write globally and serializes a busy worker.
+    //
+    // The ROLLUPS are awaited here too. `durable` exists to remove the race
+    // between "the emit resolved" and "the data is readable", and a host that
+    // awaited the row and then read the aggregate could otherwise legitimately
+    // see a stale one — the same race, one plane over.
     if (durable) {
       try {
         await d.save(saveOpts);
@@ -241,6 +274,7 @@ export function createEmitter(ctx: EmitCtx) {
         await onFail(e);
         throw e;
       }
+      await Promise.all(aggregates);
       return { id, outcome: 'written' };
     }
 

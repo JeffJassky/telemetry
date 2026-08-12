@@ -5,42 +5,63 @@
  * Hand-written types rot within a day. On featureboard this file immediately
  * caught that `types/` was missing FOUR features added the same afternoon.
  * Every exported symbol must appear below. See standards/traps.md #9.
+ *
+ * THE RULE THAT MATTERS: a value export must be exercised AS A VALUE — read a
+ * property off it, call it, assign it to a typed binding. Naming a symbol in an
+ * `import type` proves only that some declaration exists; it says nothing about
+ * whether the declaration is a const the package ships or a bare type alias.
+ * That gap is exactly how `TelemetryKind`, `LogLevel`, `Env`, `Origin`,
+ * `KeyKind` and `TenantMode` shipped as runtime objects in `src/` and type-only
+ * unions in `types/` — a host writing `TelemetryKind.Usage` got working code
+ * that failed `tsc`, and this file compiled clean the whole time. Every entry
+ * point's export list is walked below; if a symbol is exported and not here, it
+ * is drift waiting to happen.
  */
 import { z } from 'zod';
 import type {
+  AttrsOf,
   Checkpoint,
   ClientContext,
   CreateTelemetryConfig,
   DimSource,
+  EmitBase,
   EmitInput,
   EmitResult,
   EntityRef,
   EventSpec,
   ForgetResult,
   Logger,
+  MetricsOf,
   Registry,
   RollupSpec,
   Scoped,
+  SubjectInput,
   Telemetry,
   TelemetryCounters,
-  TelemetryKind,
 } from './index.js';
+// VALUE imports — the vocabulary ships as `const` objects, so importing these
+// with `import type` would have hidden the very drift this file exists to catch
 import {
   boundedMeta,
   createTelemetry,
   defineRegistry,
   newId,
   plain,
+  resolveDim,
   traceKeep,
   truncate,
   validateRegistry,
   isPlatformScope,
   BODY_MAX_CHARS,
+  Env,
   INDEX_BUDGET,
+  LogLevel,
+  Origin,
   PLATFORM_SCOPE,
   RETENTION_DAYS,
   SAMPLE_RATE,
   SCHEMA_VERSION,
+  TelemetryKind,
 } from './index.js';
 
 // ── the registry keeps literal shapes through defineRegistry ──
@@ -86,6 +107,7 @@ const t = createTelemetry({
   pepper: 'p',
   platforms: ['watchos'], // EXTENDS the builtins; 'web' still validates
   bodyMax: 4096,
+  globalSubjectRefs: true, // refs name one party in every tenant — forget() reaches '*' views
 });
 
 // ── emit is typed against the registry ──
@@ -177,6 +199,10 @@ const id: string = newId();
 const kept: boolean = traceKeep('tr_00ff', 0.5);
 const day: Date | undefined = truncate(new Date(), 'day');
 const obj: unknown = plain(new Map());
+/** the rollup dimension resolver, exported so burst keys and host state agree */
+const resolved: unknown = resolveDim('attr:source', { attrs: new Map([['source', 'ads']]) });
+const noSubjectDim: unknown = resolveDim('subject', {});
+void resolved, noSubjectDim;
 validateRegistry(registry);
 const budget: number = INDEX_BUDGET;
 const bodyCap: number = BODY_MAX_CHARS;
@@ -184,17 +210,78 @@ const spanDays: number | null = RETENTION_DAYS.span;
 const rate: number = SAMPLE_RATE.usage;
 const v: number = SCHEMA_VERSION;
 
+// ── the vocabulary, in BOTH positions ──
+// Each of these ships as a `const` object AND a type. A host writing
+// `TelemetryKind.Usage` must compile; so must `const k: TelemetryKind`. Reading
+// the member off the object is what proves the value exists — an `import type`
+// of the same name proves nothing, which is how these six drifted.
+const usageKind: TelemetryKind = TelemetryKind.Usage;
+const everyKind: TelemetryKind[] = [
+  TelemetryKind.Event, TelemetryKind.Error, TelemetryKind.Span,
+  TelemetryKind.State, TelemetryKind.Usage,
+];
+const fatal: LogLevel = LogLevel.Fatal;
+const everyLevel: LogLevel[] = [LogLevel.Debug, LogLevel.Info, LogLevel.Warn, LogLevel.Error, LogLevel.Fatal];
+const prod: Env = Env.Prod;
+const everyEnv: Env[] = [Env.Prod, Env.Staging, Env.Dev];
+const server: Origin = Origin.Server;
+const everyOrigin: Origin[] = [Origin.Server, Origin.Client];
+// the literal form keeps working — the const is an addition, never a narrowing
+const literalKind: TelemetryKind = 'span';
+const literalLevel: LogLevel = 'warn';
+const literalEnv: Env = 'dev';
+const literalOrigin: Origin = 'client';
+// and the objects index the Records the package exports
+const kindRetention: number | null = RETENTION_DAYS[TelemetryKind.Usage];
+const kindRate: number = SAMPLE_RATE[TelemetryKind.Error];
+void usageKind, everyKind, fatal, everyLevel, prod, everyEnv, server, everyOrigin;
+void literalKind, literalLevel, literalEnv, literalOrigin, kindRetention, kindRate;
+
+// the envelope base and its parts, standalone
+const subject: SubjectInput = { type: 'user', id: 'u_1', role: 'sender' };
+const base: EmitBase = {
+  tenantId: 'acc_9',
+  subjects: [subject],
+  actor: 'user:u_1',
+  onBehalfOf: 'system:cron',
+  occurredAt: new Date(),
+  severity: LogLevel.Warn,
+  service: 'api',
+  release: 'app@1.0.0',
+  env: Env.Staging,
+  origin: Origin.Server,
+  traceId: 'tr_1', spanId: 's_1', parentId: 'p_1', durationMs: 12,
+  data: { note: 'x' },
+  body: 'prose',
+  forceKeep: true,
+  dedupeKey: 'stripe:evt_1',
+  durable: true,
+  error: { type: 'TypeError', message: 'x', handled: false, fingerprint: 'fp', frames: [{ fn: 'f', inApp: true }] },
+  state: { key: 'lifecycle', from: 'trial', to: 'active', previousSinceMs: 10 },
+  usage: {
+    meter: 'tokens', quantity: 1, unit: 'token', amount: '0.04', currency: 'USD',
+    idempotencyKey: 'tr_1:s_1', billedTo: 'org:o_9', billable: true,
+    priceVersion: 'v1', reverses: 'rec_1',
+  },
+};
+void base;
+
+// the per-event payload projections the typed emit is built from
+const signupAttrs: AttrsOf<typeof registry, 'user.signed_up'> = { source: 'ads', plan: 'pro' };
+const llmMetrics: MetricsOf<typeof registry, 'llm.completion'> = { tokens_in: 1, tokens_out: 1, cost_usd: 0.04 };
+void signupAttrs, llmMetrics;
+
 // ── keys + ingest surface ──
 import type {
   ContextAdapter,
   CreateIngestOptions,
   CreateKeyInput,
   IngestContext,
-  KeyKind,
   ParsedKey,
-  TenantMode,
 } from './index.js';
-import { createIngest, createKey, hashSecret, parseKeyString, verifySecret } from './index.js';
+import {
+  createIngest, createKey, hashSecret, parseKeyString, verifySecret, KeyKind, TenantMode,
+} from './index.js';
 
 async function keys() {
   const minted = await t.createKey({
@@ -208,10 +295,18 @@ async function keys() {
   const full: string = minted.key;
   const parsed: ParsedKey | null = parseKeyString(full);
   const kk: KeyKind = parsed!.kind;
+  // both positions again — const object AND union, for the two key enums too
+  const publishable: KeyKind = KeyKind.Publishable;
+  const secret: KeyKind = KeyKind.Secret;
   const tm: TenantMode = 'claimed';
+  const modes: TenantMode[] = [TenantMode.Fixed, TenantMode.Session, TenantMode.Claimed];
   const ok: boolean = verifySecret('s', hashSecret('s'));
-  await createKey(t.models.keys, { kind: 'secret', tenantMode: 'claimed', service: 'api', env: 'prod' } satisfies CreateKeyInput);
-  void kk, tm, ok;
+  await createKey(t.models.keys, {
+    kind: KeyKind.Secret, tenantMode: TenantMode.Claimed, service: 'api', env: 'prod',
+    label: 'live', origins: [], allowedKinds: ['usage'], allowedNames: ['llm.completion'],
+    maxPerMinute: 600,
+  } satisfies CreateKeyInput);
+  void kk, publishable, secret, tm, modes, ok;
 }
 
 const adapter: ContextAdapter = {
@@ -221,10 +316,70 @@ const ingestOpts: CreateIngestOptions = { telemetry: t, contextAdapter: adapter,
 const ingestRouter = createIngest(ingestOpts);
 
 // ── client core (types/core.d.ts) ──
-import type { TelemetryClient as CoreClient, Transport, WireRecord } from './core.js';
-import { createClient as createCoreClient } from './core.js';
+import type {
+  ClientContextInput,
+  CreateClientOptions,
+  ClientStorage,
+  DimSource as CoreDimSource,
+  EventSpec as CoreEventSpec,
+  Registry as CoreRegistry,
+  RollupSpec as CoreRollupSpec,
+  Span as CoreSpan,
+  TelemetryClient as CoreClient,
+  TrackOptions,
+  Transport,
+  TransportResult,
+  WireRecord,
+} from './core.js';
+import {
+  createClient as createCoreClient,
+  newId as coreNewId,
+  defineRegistry as coreDefineRegistry,
+  boundedMeta as coreBoundedMeta,
+} from './core.js';
 
-const transport: Transport = async () => ({ ok: true });
+// /core re-exports the isomorphic registry surface so a host's registry module
+// imports from here and stays mongoose-free
+const coreReg: CoreRegistry = coreDefineRegistry({
+  'a.b': {
+    kind: TelemetryKind.Event,
+    origin: Origin.Client,
+    subjects: [],
+    data: coreBoundedMeta(),
+    description: 'x',
+  } satisfies CoreEventSpec,
+});
+const coreRoll: CoreRollupSpec = { by: ['attr:source' satisfies CoreDimSource], bucket: 'day' };
+const coreId: string = coreNewId();
+void coreReg, coreRoll, coreId;
+
+const transport: Transport = async () => ({ ok: true } satisfies TransportResult);
+const storage: ClientStorage = { get: () => null, set: () => {} };
+const ctxInput: ClientContextInput = { platform: 'web', appVersion: '1.0.0', online: true };
+const clientOpts: CreateClientOptions = {
+  key: 'pk_live_tk_000000000000000000000000',
+  url: 'https://app.example.com/telemetry/ingest',
+  release: 'app@1.0.0',
+  flushIntervalMs: 5_000,
+  maxBatchSize: 50,
+  maxQueueSize: 1_000,
+  maxRetries: 5,
+  transport,
+  storage,
+  clientContext: ctxInput,
+  consent: () => true,
+  errorName: 'error.unhandled',
+  onError: () => {},
+};
+const trackOpts: TrackOptions<{ source: string }, { n: number }> = {
+  attrs: { source: 'ads' },
+  metrics: { n: 1 },
+  data: {},
+  occurredAt: new Date(),
+  subjects: [{ type: 'user', id: 'u_1' }],
+  severity: LogLevel.Info,
+};
+void clientOpts, trackOpts;
 const c: CoreClient<typeof registry> = createCoreClient<typeof registry>({
   key: 'pk_live_tk_000000000000000000000000',
   url: 'https://app.example.com/telemetry/ingest',
@@ -236,10 +391,22 @@ c.track('user.signed_up', { attrs: { source: 'ads', plan: 'pro' } });
 c.track('user.typo');
 c.identify({ user: 'u_1', org: 'o_9' });
 c.captureError(new Error('x'), { handled: false });
-const span = c.startSpan('pdf.render');
+const span: CoreSpan = c.startSpan('pdf.render');
+const traced: string = span.traceId;
+const spanned: string = span.spanId;
 span.end({ metrics: { bytes: 100 } });
+void traced, spanned;
 c.state('account.lifecycle', { key: 'lifecycle', to: 'active' });
+c.setActor('user:u_1');
+c.setActor(undefined);
 const rec: WireRecord = { _id: 'x'.repeat(16), name: 'a', occurredAt: new Date().toISOString() };
+// `_internal` exists on every shipped client — the platform adapters use it —
+// so the declaration says so, opaquely. Reading a field off it must be a cast,
+// which is the whole point of typing it `unknown`.
+const internals: unknown = c._internal;
+// @ts-expect-error — opaque on purpose: no member of `_internal` is contract
+void c._internal.queue;
+void internals;
 async function drain() {
   await c.flush();
   await c.shutdown();
@@ -282,6 +449,8 @@ const subjectAdapter: SubjectAdapter = {
 };
 const view: ViewSpec = {
   name: 'Checkout errors',
+  // the sidebar renders this when present and falls back to the origin badge
+  icon: '⚑',
   page: 'errors',
   query: { range: '24h', filters: { severity: 'error' }, display: 'table' },
 };
@@ -292,7 +461,15 @@ const dashOpts: CreateDashboardOptions = {
   views: [view],
   queryLimits: { records: 100 },
   onSlowQuery: ({ op, ms }) => void `${op}:${ms}`,
+  // the threshold the callback fires above, and the query cache — all three
+  // forwarded to createQueries, none of them reachable before
+  slowMs: 250,
+  cacheTtlMs: 30_000,
+  cacheSize: 200,
   mountPath: '/telemetry',
+  apiBase: '/telemetry',
+  title: 'Telemetry',
+  spaDir: '/srv/ui',
 };
 const dashRouter = createDashboard(dashOpts);
 const spa: string = defaultSpaDir();
@@ -304,6 +481,12 @@ async function primitives() {
     TelemetryModel: t.models.telemetry,
     RollupModel: t.models.rollups,
     registry,
+    limits: { records: 100 },
+    onSlowQuery: ({ op, ms, params }) => void `${op}:${ms}:${String(params)}`,
+    slowMs: 250,
+    // the in-process cache is tunable — a ten-minute TTL is a default, not a law
+    cacheTtlMs: 30_000,
+    cacheSize: 200,
   });
   const range: TimeRange = { from: new Date(0), to: new Date() };
   const f: RecordFilter = { kind: 'span', excludeActorTypes: ['admin'] };
@@ -311,7 +494,11 @@ async function primitives() {
   const next: string | null = page.nextCursor;
   const ser = await q.series('acc_9', range, f, { measure: 'sum:cost_usd', interval: 'day' });
   void ser.buckets[0]?.value;
-  await q.distribution('acc_9', range, f);
+  // the sample is complete; the computation is capped, and says so
+  const dist = await q.distribution('acc_9', range, f);
+  const scanCut: boolean = dist.truncated;
+  void scanCut;
+  void caps.distribution;
   const ro = await q.rollups('acc_9', { as: 'llm_cost', sort: 'bucketAt' });
   const src: 'rollups' = ro.dataSource;
   const short: boolean = ro.truncated;
@@ -395,3 +582,106 @@ const input: EmitInput<typeof registry, 'user.signed_up'> = {
   tenantId: 'a',
   attrs: { source: 's', plan: 'free' },
 };
+
+// ── the platform entry points ──
+// Six subpaths, six declaration files, and until now this file compiled none of
+// them. Each entry's FULL export list is exercised below — every re-exported
+// `createClient` under its own alias, every const as a value, every factory
+// called. A subpath whose exports are not walked here is a subpath that can
+// drift without the gate noticing.
+import type * as React from 'react';
+
+import type { TelemetryClient as WebClient, WebTelemetryOptions } from './web.js';
+import { createClient as createWebCoreClient, createWebTelemetry } from './web.js';
+
+import type { TelemetryClient as ReactClient } from './react.js';
+import {
+  createClient as createReactCoreClient,
+  TelemetryProvider,
+  TelemetryErrorBoundary,
+  useTelemetry as useReactTelemetry,
+} from './react.js';
+
+import type { TelemetryClient as VueClient } from './vue.js';
+import {
+  createClient as createVueCoreClient,
+  createTelemetryPlugin,
+  useTelemetry as useVueTelemetry,
+  TELEMETRY_KEY,
+} from './vue.js';
+
+import type { MainTelemetryOptions, TelemetryClient as ElectronClient } from './electron.js';
+import {
+  createClient as createElectronCoreClient,
+  createMainTelemetry,
+  createRendererTelemetry,
+  IPC_CHANNEL,
+} from './electron.js';
+
+import type { CliTelemetryOptions, TelemetryClient as CliClient } from './cli.js';
+import { createClient as createCliCoreClient, createCliTelemetry } from './cli.js';
+
+// every subpath re-exports the core factory — same shape, six import paths
+const reexported: Array<typeof createCoreClient> = [
+  createWebCoreClient, createReactCoreClient, createVueCoreClient,
+  createElectronCoreClient, createCliCoreClient,
+];
+void reexported;
+
+// /web — consent is re-added on top of the Omit, DNT/GPC still win
+const webOpts: WebTelemetryOptions = {
+  key: 'pk_live_tk_000000000000000000000000',
+  url: '/telemetry/ingest',
+  release: 'app@1.0.0',
+  consent: () => true,
+  captureGlobalErrors: true,
+};
+const web: WebClient<typeof registry> = createWebTelemetry<typeof registry>(webOpts);
+web.track('user.signed_up', { attrs: { source: 'ads', plan: 'pro' } });
+
+// /react — the provider, the hook, the boundary
+const plainClient: ReactClient = createReactCoreClient({ key: 'pk_x', url: '/i', transport });
+const providerEl: React.ReactElement = TelemetryProvider({ client: plainClient });
+const boundary = new TelemetryErrorBoundary({
+  client: plainClient,
+  fallback: (e: Error) => e.message,
+});
+const hooked: ReactClient = useReactTelemetry();
+void providerEl, boundary, hooked;
+
+// /vue — the injection key is a value, and the plugin installs onto an app
+const vueClient: VueClient = createVueCoreClient({ key: 'pk_x', url: '/i', transport });
+const key: 'telemetry' = TELEMETRY_KEY;
+const plugin = createTelemetryPlugin(vueClient);
+plugin.install({ config: { errorHandler: () => {} }, provide: () => {} });
+const injected: VueClient = useVueTelemetry(() => vueClient);
+void key, injected;
+
+// /electron — main owns the only real queue, the renderer rides IPC
+const channel: 'telemetry:batch' = IPC_CHANNEL;
+const mainOpts: MainTelemetryOptions = {
+  key: 'sk_live_tk_000000000000000000000000',
+  url: 'https://app.example.com/telemetry/ingest',
+  captureProcessErrors: true,
+  ipcMain: { handle: () => {} },
+};
+const main: ElectronClient = createMainTelemetry(mainOpts);
+const renderer: ElectronClient = createRendererTelemetry(
+  { invoke: async () => ({ ok: true }) },
+  { release: 'app@1.0.0' },
+);
+// key/url/transport are Omitted on the renderer — they never leave main
+// @ts-expect-error — the renderer must not be handed a key
+createRendererTelemetry({ invoke: async () => ({}) }, { key: 'sk_leak' });
+void channel, main, renderer;
+
+// /cli — disk-backed queue, opt-out honoured hard
+const cliOpts: CliTelemetryOptions = {
+  key: 'sk_live_tk_000000000000000000000000',
+  url: 'https://app.example.com/telemetry/ingest',
+  configDir: '~/.config/mytool',
+  argv: ['node', 'mytool', '--no-telemetry'],
+  maxQueueAgeMs: 7 * 864e5,
+};
+const cli: CliClient = createCliTelemetry(cliOpts);
+void cli;

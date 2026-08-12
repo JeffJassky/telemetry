@@ -45,7 +45,8 @@ export interface CreateTelemetryConfig {
   registry: Registry;
   /** a mongoose Connection, or the mongoose module itself (its default connection is used) */
   connection: Connection | { connection: Connection };
-  /** base collection name; siblings derive from it: `<collection>_rollups`, `_rejects`, `_aliases`, `_checkpoints` */
+  /** base collection name; six siblings derive from it: `<collection>_rollups`,
+   *  `_rejects`, `_aliases`, `_checkpoints`, `_keys`, `_views` */
   collection?: string;
   /**
    * Mongoose model name. Set it when two instances share one connection —
@@ -62,6 +63,15 @@ export interface CreateTelemetryConfig {
   platforms?: readonly string[];
   /** override BODY_MAX_CHARS for this instance */
   bodyMax?: number;
+  /**
+   * Declares that a subject ref (`type:id`) names the same party in EVERY
+   * tenant. The package cannot verify that, so it is asserted rather than
+   * detected. Only effect today: forget() also erases the person's
+   * platform-scoped saved views, which a tenant-scoped call otherwise misses.
+   * Leave it off when ids are minted per tenant — there, `user:u_1` is a
+   * different person in each and one tenant's erasure would reach another's.
+   */
+  globalSubjectRefs?: boolean;
   logger?: Logger;
 }
 
@@ -145,6 +155,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
       }
       return p;
     },
+    globalSubjectRefs: () => config.globalSubjectRefs === true,
   });
 
   const syncIndexes = createSyncIndexes({

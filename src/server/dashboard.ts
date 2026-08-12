@@ -57,6 +57,12 @@ export interface CreateDashboardOptions {
   views?: ViewSpec[];
   queryLimits?: Partial<QueryLimits>;
   onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  /** threshold onSlowQuery fires above, ms. Default 500. Forwarded to createQueries. */
+  slowMs?: number;
+  /** in-process query cache TTL, ms. Default 600_000. Forwarded to createQueries. */
+  cacheTtlMs?: number;
+  /** cached query results kept before eviction. Default 60. Forwarded to createQueries. */
+  cacheSize?: number;
   /** where the browser sees this router mounted — MUST match (traps #8) */
   mountPath?: string;
   /** where the SPA calls /api — defaults to mountPath */
@@ -125,6 +131,38 @@ const parseFilter = (q: Record<string, unknown>): RecordFilter => {
   return f;
 };
 
+/** the fields `rollups()` will range-filter on — an allowlist, not a passthrough */
+const ROLLUP_ON = ['firstAt', 'lastAt', 'bucketAt'] as const;
+
+/** the fields `rollups()` will ORDER by — an allowlist for the same reason */
+const ROLLUP_SORT = ['count', 'lastAt', 'firstAt', 'bucketAt'] as const;
+
+/** an `$in` from a URL is still a scan, so the repeated-param form is bounded */
+const MAX_DIMS = 100;
+
+/**
+ * `?dims=user:u_1&dims=user:u_2` — the repeated-param form express already
+ * parses into an array — is the multi-subject read. One value stays a string,
+ * so the single-dim URLs that exist keep working unchanged.
+ *
+ * Validated rather than coerced: more than MAX_DIMS values, or a nested value
+ * where a string belongs (`?dims[0][k]=v` under the extended parser), is a 400
+ * rather than a silently narrowed `$in`. Silently dropping half a cohort is the
+ * failure the array form exists to prevent, so it must not be reintroduced by
+ * the parser that reads it.
+ */
+const parseDims = (v: unknown): string | string[] | undefined => {
+  if (typeof v === 'string') return v || undefined;
+  if (!Array.isArray(v)) return undefined;
+  if (v.length > MAX_DIMS) {
+    throw Object.assign(new Error(`at most ${MAX_DIMS} dims values`), { status: 400 });
+  }
+  if (!v.every((d) => typeof d === 'string' && d)) {
+    throw Object.assign(new Error('dims must be non-empty strings'), { status: 400 });
+  }
+  return v.length ? (v as string[]) : undefined;
+};
+
 /** the registry, projected for the UI — names and shapes, never zod objects */
 function registryProjection(t: Telemetry) {
   return Object.fromEntries(
@@ -177,6 +215,11 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     registry: t.registry,
     limits: opts.queryLimits,
     onSlowQuery: opts.onSlowQuery,
+    // forwarded, not re-defaulted — an onSlowQuery pinned at the 500ms default
+    // is a callback the host cannot aim
+    slowMs: opts.slowMs,
+    cacheTtlMs: opts.cacheTtlMs,
+    cacheSize: opts.cacheSize,
   });
 
   const api = express.Router();
@@ -236,12 +279,28 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     if (typeof req.query.as !== 'string' || !req.query.as) {
       throw Object.assign(new Error('rollup family required'), { status: 400 });
     }
+    // an unrecognised `on` would range-filter on a field that does not exist and
+    // return an empty family — a 400 says so instead
+    const on = req.query.on;
+    if (on !== undefined && !ROLLUP_ON.includes(on as any)) {
+      throw Object.assign(new Error(`on must be one of ${ROLLUP_ON.join(', ')}`), { status: 400 });
+    }
+    // `sort` reaches Mongo's .sort() — an unvalidated passthrough lets a caller
+    // order by an unindexed field and turn a bounded read into a blocking
+    // in-memory sort. Same hole `on` had, same allowlist.
+    const sort = req.query.sort;
+    if (sort !== undefined && !ROLLUP_SORT.includes(sort as any)) {
+      throw Object.assign(new Error(`sort must be one of ${ROLLUP_SORT.join(', ')}`), { status: 400 });
+    }
     return q.rollups(req.viewer!.tenantId, {
       as: req.query.as,
-      dims: typeof req.query.dims === 'string' ? req.query.dims : undefined,
+      dims: parseDims(req.query.dims),
       subjectType: typeof req.query.subjectType === 'string' ? req.query.subjectType : undefined,
+      // cohort selection wants firstAt; the default is still bucketAt when
+      // bucketed, lastAt otherwise — see query.ts
+      on: on as (typeof ROLLUP_ON)[number] | undefined,
       range: req.query.from || req.query.to ? parseRange(req.query) : undefined,
-      sort: (req.query.sort as any) || undefined,
+      sort: sort as (typeof ROLLUP_SORT)[number] | undefined,
       limit: req.query.limit ? Number(req.query.limit) : undefined,
     });
   }));
@@ -354,8 +413,16 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
 
   // ── System — where "never drop silently" becomes visible. Not optional. ──
   api.get('/system', h(async (req) => {
+    // Quarantined rejects hold RAW payloads — subjects, attrs, the lot. An
+    // unfiltered find() here handed every tenant's failed writes to any
+    // authenticated viewer, which is the same leak the query primitives are
+    // scoped to prevent, reached by a route that never went through them.
+    // Scoped like everything else; '*' still sees all, by authorization.
     const quarantine = await t.collections.rejects()
-      .find({}, { sort: { at: -1 }, limit: 50 } as any)
+      .find(
+        isPlatformScope(req.viewer!.tenantId) ? {} : { 'raw.tenantId': req.viewer!.tenantId },
+        { sort: { at: -1 }, limit: 50 } as any,
+      )
       .toArray()
       .catch(() => []);
     const indexes = await t.models.telemetry.collection.indexes().catch(() => []);

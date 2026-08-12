@@ -140,7 +140,99 @@ describe('dashboard', () => {
     expect(res.status).toBe(200);
     expect(res.body.n).toBe(1);
     expect(res.body.p95).toBe(1200);
+    expect(res.body.truncated).toBe(false); // one span, nowhere near the ceiling
     expect(res.body.dataSource).toBe('raw');
+  });
+
+  it('distribution SAYS it hit the scan ceiling — an undercount nobody mentions is the silent cap', async () => {
+    // `$percentile` is method:'approximate' over a bounded scan. The sample is
+    // complete only while the match fits under the ceiling; past it the number
+    // is a lower bound, and this used to be the one capped primitive that did
+    // not report that.
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    for (let i = 0; i < 4; i++) {
+      await t.emit('llm.completion', {
+        tenantId: 'tn', subjects: [{ type: 'org', id: 'o1' }],
+        traceId: `tr_0000abc${i}`, spanId: `s${i}`, durationMs: 100 * (i + 1),
+        occurredAt: at(`2026-07-0${i + 1}T09:00:00Z`),
+        attrs: { gen_ai_system: 'anthropic', gen_ai_request_model: 'opus', feature: 'chat' },
+        metrics: { tokens_in: 10, tokens_out: 5, cost_usd: 0.02 },
+      });
+    }
+    await t.flush();
+
+    const full = await request(buildApp(t).app).get(`/telemetry/api/distribution?${RANGE}&kind=span`);
+    expect(full.body.n).toBe(4);
+    expect(full.body.truncated).toBe(false);
+
+    // same data, a ceiling of two: the scan reads cap+1 and observes the overflow
+    const { app } = buildApp(t, undefined, { queryLimits: { distribution: 2 } });
+    const cut = await request(app).get(`/telemetry/api/distribution?${RANGE}&kind=span`);
+    expect(cut.status).toBe(200);
+    expect(cut.body.truncated).toBe(true);
+    expect(cut.body.n).toBeLessThan(4); // and the response says the count is short
+    expect(cut.body.histogram.length).toBeGreaterThan(0);
+  });
+
+  it('an empty distribution still carries truncated — a key you must check for is a key you infer', async () => {
+    const t = buildTelemetry();
+    const { app } = buildApp(t);
+    const res = await request(app).get(`/telemetry/api/distribution?${RANGE}&kind=span`);
+    expect(res.body.n).toBe(0);
+    expect(res.body.p95).toBeUndefined(); // a p95 of zero is a claim; absence is not
+    expect(res.body.truncated).toBe(false);
+  });
+
+  it('/rollups forwards `on` — firstAt selects the cohort, the default lastAt selects the latest occurrence', async () => {
+    // the read fix that shipped unreachable: `on` existed on the primitive and
+    // the only surface that matters never forwarded it
+    const t = buildTelemetry();
+    const signup = (id: string, iso: string) => t.emit('account.signed_up', {
+      tenantId: 'tn', subjects: [{ type: 'account', id }], occurredAt: at(iso),
+      attrs: { source: 'organic' },
+    });
+    await signup('a0', '2026-07-01T00:00:00Z'); // joined IN the window…
+    await t.flush(); // the second increment must land AFTER the upsert, not race it
+    await signup('a0', '2026-07-20T00:00:00Z'); // …and re-emitted after it
+    await signup('a1', '2026-07-20T00:00:00Z'); // joined after the window
+    await t.flush();
+    const { app } = buildApp(t);
+
+    // the default filters lastAt, so the account that actually joined in the
+    // window is invisible — correct for "who was active", wrong for a cohort
+    const byLast = await request(app).get(`/telemetry/api/rollups?as=account.signed_up&${RANGE}`);
+    expect(byLast.status).toBe(200);
+    expect(byLast.body.rows).toHaveLength(0);
+
+    const byFirst = await request(app).get(`/telemetry/api/rollups?as=account.signed_up&on=firstAt&${RANGE}`);
+    expect(byFirst.body.rows.map((r: any) => r.dims[0])).toEqual(['account:a0']);
+
+    // an unrecognised field would range-filter on something that does not exist
+    // and return an empty family, which reads exactly like "no data"
+    const bad = await request(app).get(`/telemetry/api/rollups?as=account.signed_up&on=createdAt&${RANGE}`);
+    expect(bad.status).toBe(400);
+  });
+
+  it('/rollups reads N subjects in one call via repeated dims params, bounded and typed', async () => {
+    const t = buildTelemetry();
+    await seed(t); // a0…a4 signed up
+    const { app } = buildApp(t);
+    const dim = (id: string) => `dims=${encodeURIComponent(`account:${id}`)}`;
+
+    const many = await request(app).get(`/telemetry/api/rollups?as=account.signed_up&${dim('a0')}&${dim('a2')}`);
+    expect(many.status).toBe(200);
+    expect(many.body.rows.map((r: any) => r.dims[0]).sort()).toEqual(['account:a0', 'account:a2']);
+
+    // one value is still one value — the single-dim URLs that exist keep working
+    const one = await request(app).get(`/telemetry/api/rollups?as=account.signed_up&${dim('a1')}`);
+    expect(one.body.rows.map((r: any) => r.dims[0])).toEqual(['account:a1']);
+
+    // an unbounded $in from a URL is a scan wearing a filter's clothes
+    const tooMany = await request(app).get(
+      `/telemetry/api/rollups?as=account.signed_up&${Array.from({ length: 101 }, (_, i) => dim(`a${i}`)).join('&')}`,
+    );
+    expect(tooMany.status).toBe(400);
   });
 
   it('rollups serves a family with dataSource:rollups; trace joins every kind on one axis', async () => {

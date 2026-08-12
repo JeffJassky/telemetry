@@ -179,11 +179,20 @@ other's (the delete/ownership lookup matches the scope literally too, and a
 platform viewer's `role: 'admin'` is admin *of* the platform scope). Both
 directions fall out of one literal match.
 
-> **Stated bound.** `forget(tenantId, ref)` is tenant-scoped and `'*'` is not a
-> tenant, so a person's platform-scoped saved views are not erased by a
-> `forget()` against their home tenant. Widening `forget()` to reach `'*'` rows
-> would give a tenant-scoped call cross-tenant write reach — the trade we
-> refused. Erase them by their scope, or not at all.
+> **Erasure across the boundary is opt-in.** `forget(tenantId, ref)` is
+> tenant-scoped and `'*'` is not a tenant, so a person's platform-scoped saved
+> views are missed by default. `createTelemetry({ globalSubjectRefs: true })`
+> makes `forget()` reach them.
+>
+> The flag is the host asserting that a ref names one party in every tenant —
+> the package cannot verify it, and where ids are minted per tenant `user:u_1`
+> is a different person in each, so one tenant's erasure would delete another's
+> views. Default off for that reason.
+>
+> Note what is NOT widened: `'*'` is still refused as the erasure *scope*.
+> Reaching `'*'` rows owned by one named person is bounded by the ref; erasing
+> *at* `'*'` would be an unbounded rewrite of every tenant's rows, one typo
+> away. Reach and blast radius are different axes.
 
 Quick-select renders as a sidebar section (mailery's `.sidebar-section`
 pattern): saved + configured on top, derived grouped by kind below — all plain

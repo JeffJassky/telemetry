@@ -8,10 +8,19 @@ import { findFamily, runFunnel, type FunnelParams, type FunnelResult } from './f
  * through these — kind pages never touch Mongo, which is the seam that lets
  * span/event route to a columnar store later without touching a component.
  *
- * Traps §18 is law here: every primitive requires a time range and carries its
- * `$limit` INSIDE the pipeline; the caps are config, the slow-query counter is
- * an adapter. Every response reports `dataSource` (recon #2) so a spliced
- * number can always say which store answered.
+ * Traps §18 is law here, but per primitive rather than blanket. A time range is
+ * REQUIRED by records, series, distribution, journey and distinctCount, and a
+ * cohort window by funnel; `rollups()`'s range is OPTIONAL because a lifetime
+ * family has no time axis to filter on; `trace()` takes NONE — it is pinned by
+ * an indexed traceId and bounded by the trace itself.
+ *
+ * What is universal is the cap: every primitive carries its `$limit` INSIDE the
+ * pipeline rather than applying it to a materialised result, the caps are
+ * config, and the four that can cut an answer short — rollups, distribution,
+ * distinctCount, funnel — report `truncated` rather than undercounting in
+ * silence. The slow-query counter is an adapter. Every response reports
+ * `dataSource` (recon #2) so a spliced number can always say which store
+ * answered.
  *
  * Tenancy: every primitive takes a SCOPE, not a tenant. A scope is a tenantId,
  * or PLATFORM_SCOPE ('*') for a cross-tenant read. `'*'` is only ever reachable
@@ -31,6 +40,8 @@ export interface QueryLimits {
   rollups: number;
   trace: number;
   journey: number;
+  /** raw docs distribution will scan before it reports an undercount */
+  distribution: number;
   /** rollup docs distinctCount will scan before it reports an undercount */
   distinct: number;
   /** subjects in one funnel cohort */
@@ -43,6 +54,7 @@ export const DEFAULT_LIMITS: QueryLimits = {
   rollups: 500,
   trace: 500,
   journey: 500,
+  distribution: 100_000,
   distinct: 100_000,
   funnel: 5_000,
 };
@@ -228,7 +240,19 @@ export function createQueries(ctx: QueryCtx) {
       );
     },
 
-    /** percentiles + histogram off raw — keep-all makes this exact (§5.3). Mongo 7+. */
+    /**
+     * Percentiles + histogram off raw. Keep-all makes the SAMPLE complete —
+     * no sampling stands between the match and the math (§5.3) — but the
+     * computation is not exact and this comment used to claim it was:
+     * `$percentile` runs `method: 'approximate'` (t-digest), and the scan stops
+     * at `limits.distribution`.
+     *
+     * So the ceiling is read as cap+1 and `truncated` reports whether it was
+     * actually reached, the same way rollups/distinctCount/funnel do. A match
+     * wider than the ceiling is an undercount, and an undercount the response
+     * does not mention is the silent cap this package refuses everywhere else.
+     * Mongo 7+.
+     */
     distribution(
       scope: string,
       range: TimeRange,
@@ -244,9 +268,12 @@ export function createQueries(ctx: QueryCtx) {
             ...buildMatch(scope, range, filter),
             [path.slice(1)]: { $exists: true },
           };
+          // one scan ceiling, shared by both pipelines — and cap+1 so the
+          // response can SAY it was truncated instead of quietly undercounting
+          const cap = limits.distribution;
           const [summary] = await ctx.TelemetryModel.aggregate([
             { $match: match },
-            { $limit: 100_000 }, // a hard scan ceiling even here — §18
+            { $limit: cap + 1 },
             {
               $group: {
                 _id: null,
@@ -258,17 +285,21 @@ export function createQueries(ctx: QueryCtx) {
               },
             },
           ] as any[]);
-          if (!summary) return { n: 0, dataSource: 'raw' as const };
+          // `truncated` is always present, empty match included — a caller that
+          // has to check whether the key exists before trusting it is back to
+          // inferring the cap
+          if (!summary) return { n: 0, truncated: false, dataSource: 'raw' as const };
           const [p50, p90, p95, p99] = summary.p;
           const histogram = await ctx.TelemetryModel.aggregate([
             { $match: match },
-            { $limit: 100_000 },
+            { $limit: cap + 1 },
             { $bucketAuto: { groupBy: path, buckets: 20 } },
           ] as any[]);
           return {
             p50, p90, p95, p99,
             min: summary.min, max: summary.max, avg: summary.avg, n: summary.n,
             histogram: histogram.map((h: any) => ({ min: h._id.min, max: h._id.max, n: h.count })),
+            truncated: summary.n > cap,
             dataSource: 'raw' as const,
           };
         }),

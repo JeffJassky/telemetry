@@ -80,8 +80,9 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "check-tracked": "node scripts/check-tracked.mjs",
+    "check-exports": "node scripts/check-exports.mjs",
     "clean": "rm -rf dist coverage",
-    "prepublishOnly": "npm run clean && npm run typecheck && npm run build && npm test",
+    "prepublishOnly": "npm run clean && npm run typecheck && npm run build && npm run check-exports && npm test",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"

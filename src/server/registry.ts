@@ -59,7 +59,14 @@ export interface EventSpec {
   /** attrs values are STRINGS after Mongoose casting — use z.string()/z.enum()/z.coerce.* */
   attrs?: z.ZodObject<any>;
   metrics?: z.ZodObject<any>;
-  /** `data` is UNSTORED unless declared here. Closes the erasure hole. */
+  /**
+   * `data` is UNSTORED unless declared here. Closes the erasure hole.
+   *
+   * Declare an OBJECT schema (or `boundedMeta()`). The type is the looser
+   * `ZodType` so `boundedMeta()`'s transform fits, but `EmitInput.data` is an
+   * object — a scalar schema like `z.string()` is expressible here and
+   * unreachable through emit().
+   */
   data?: z.ZodType<any>;
   /** attrs keys that get a real partial compound index built at boot */
   indexedAttrs?: readonly string[];
