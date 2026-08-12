@@ -33,6 +33,29 @@ export type EntityRef = `${string}:${string}`;
 
 export const UNKNOWN = 'unknown';
 
+/**
+ * The platform read scope. A dashboard `Viewer` whose tenantId is `'*'` reads
+ * ACROSS tenants — a support console, a platform-wide cost page. The package
+ * never decides who is a platform admin; the host's `viewerAdapter` does. All
+ * `'*'` buys is that the escape hatch is expressible and inside the boundary
+ * instead of a host reaching around `scoped()`.
+ *
+ * Which is exactly why it is RESERVED on the write side. A tenant literally
+ * named `'*'` would silently become a cross-tenant read — privilege escalation
+ * via a string — so every path that can mint a tenantId from outside the
+ * package refuses it: emit(), forget(), createKey() in fixed mode, and the
+ * ingest handler once the tenant has resolved (key / session / claimed alike).
+ */
+export const PLATFORM_SCOPE = '*';
+
+/** true when a scope is the cross-tenant platform scope rather than a tenant */
+export const isPlatformScope = (tenantId: unknown): boolean => tenantId === PLATFORM_SCOPE;
+
+/** one wording for the refusal, so the reservation is named wherever it bites */
+export const RESERVED_TENANT_MESSAGE =
+  `telemetry: tenantId "${PLATFORM_SCOPE}" is reserved for the dashboard's cross-tenant ` +
+  'platform scope and may never be written';
+
 /** null = never expires. Sized for small-SaaS volume; per-name override in EventSpec. */
 export const RETENTION_DAYS: Record<TelemetryKind, number | null> = {
   // keep-all + 90d is cheap at this scale, and it makes p95-by-route a raw

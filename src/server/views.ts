@@ -8,6 +8,20 @@ import { newId } from './types.js';
  * ones ship in host code, saved ones live in `<collection>_views`. Name
  * collisions shadow saved → configured → derived, so a user can override a
  * default without editing anything.
+ *
+ * Tenancy: views scope on the LITERAL viewer scope, including PLATFORM_SCOPE.
+ * '*' is an escape hatch for reading telemetry, not a master key to other
+ * people's saved state, so it does NOT fan out here the way it does in the
+ * query primitives. A platform viewer's views live in their own '*' namespace:
+ * invisible to every tenant, and every tenant's views invisible to them. Both
+ * directions fall out of the same literal match — in resolveViews below and in
+ * the router's delete/ownership lookup, which must stay literal for the same
+ * reason (a platform admin's `role: 'admin'` is admin OF the platform scope).
+ *
+ * Stated bound: forget(tenantId, ref) is tenant-scoped and '*' is not a tenant,
+ * so a person's PLATFORM-scoped saved views are not erased by a forget() call
+ * against their home tenant. Widening forget() to reach '*' rows would give a
+ * tenant-scoped call cross-tenant write reach, which is the trade we refused.
  */
 
 export interface ViewSpec {
@@ -91,6 +105,7 @@ export async function resolveViews(opts: {
   ViewModel: Model<any>;
   registry: Registry;
   configured: ViewSpec[];
+  /** the viewer's scope — a tenantId, or PLATFORM_SCOPE. Matched literally. */
   tenantId: string;
   viewerRef?: string;
 }): Promise<ResolvedView[]> {

@@ -1,6 +1,6 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { Schema, type Connection, type Model } from 'mongoose';
-import { TelemetryKind } from './types.js';
+import { TelemetryKind, RESERVED_TENANT_MESSAGE, isPlatformScope } from './types.js';
 
 /**
  * Keys — the key IS the configuration (instrumentation §2). Client init is
@@ -137,6 +137,10 @@ export async function createKey(KeyModel: Model<any>, input: CreateKeyInput): Pr
   if (tenantMode === TenantMode.Fixed && !tenantId) {
     throw new Error('telemetry: tenantMode "fixed" requires tenantId');
   }
+  // A fixed key IS its tenantId — minting one on '*' would hand a wire
+  // credential the dashboard's cross-tenant scope. The other two modes carry no
+  // tenantId to check here; ingest guards them once the tenant has resolved.
+  if (isPlatformScope(tenantId)) throw new Error(RESERVED_TENANT_MESSAGE);
   const allowedKinds =
     input.allowedKinds ??
     (kind === KeyKind.Publishable

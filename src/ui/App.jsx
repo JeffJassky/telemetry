@@ -1,5 +1,6 @@
 import React from 'react';
 import { createApi } from './api.js';
+import { ScopeContext } from './atoms.jsx';
 import { Sidebar, Topbar } from './shell.jsx';
 import { Errors, Events, Journeys, Overview, System, Traces, Usage } from './pages.jsx';
 import { parseHash } from './util.js';
@@ -34,6 +35,8 @@ export default function App({ config }) {
   const api = React.useMemo(() => createApi(config), [config]);
   const route = useHashRoute();
   const [registry, setRegistry] = React.useState(null);
+  // the viewer's scope, straight from /registry — the SPA never guesses it
+  const [scope, setScope] = React.useState({ platform: false, scope: null });
   const [views, setViews] = React.useState([]);
   const [error, setError] = React.useState(null);
   const [theme, setTheme] = React.useState(() => localStorage.getItem('telemetry_theme') ?? 'light');
@@ -44,7 +47,10 @@ export default function App({ config }) {
   }, [theme]);
 
   React.useEffect(() => {
-    api.registry().then((r) => setRegistry(r.registry), setError);
+    api.registry().then((r) => {
+      setRegistry(r.registry);
+      setScope({ platform: !!r.platform, scope: r.scope ?? null });
+    }, setError);
     api.views().then((v) => setViews(v.views), () => {});
   }, [api]);
 
@@ -70,22 +76,25 @@ export default function App({ config }) {
 
   const Page = PAGES[route.page] ?? Overview;
   return (
-    <div className="app">
-      <Sidebar route={route} views={views} title={config.title} />
-      <div className="main">
-        <Topbar
-          route={route}
-          registry={registry}
-          onSaveView={saveView}
-          theme={theme}
-          onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-        />
-        <div className="content">
-          <div className="content-inner">
-            {registry ? <Page api={api} route={route} registry={registry} /> : <div className="empty">Loading…</div>}
+    <ScopeContext.Provider value={scope}>
+      <div className="app">
+        <Sidebar route={route} views={views} title={config.title} platform={scope.platform} />
+        <div className="main">
+          <Topbar
+            route={route}
+            registry={registry}
+            onSaveView={saveView}
+            theme={theme}
+            onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            platform={scope.platform}
+          />
+          <div className="content">
+            <div className="content-inner">
+              {registry ? <Page api={api} route={route} registry={registry} /> : <div className="empty">Loading…</div>}
+            </div>
           </div>
         </div>
       </div>
-    </div>
+    </ScopeContext.Provider>
   );
 }

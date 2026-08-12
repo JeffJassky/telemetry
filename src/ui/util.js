@@ -60,6 +60,19 @@ export function fmtClock(iso) {
   return new Date(iso).toISOString().replace('T', ' ').slice(0, 19);
 }
 
+/** a 0–100 percentage. Display rounds; the API value never does. */
+export function fmtPct(v) {
+  if (v == null) return '—';
+  return `${Math.abs(v) >= 10 ? Math.round(v) : Math.round(v * 10) / 10}%`;
+}
+
+/** fractional days as a human span — under a day reads better in hours */
+export function fmtDays(v) {
+  if (v == null) return '—';
+  if (Math.abs(v) < 1) return `${Math.round(v * 24 * 10) / 10}h`;
+  return `${Math.round(v * 10) / 10}d`;
+}
+
 /** range shorthand → {from,to} ISO pair */
 export function rangeToDates(range) {
   const to = new Date();

@@ -34,8 +34,10 @@ import {
   traceKeep,
   truncate,
   validateRegistry,
+  isPlatformScope,
   BODY_MAX_CHARS,
   INDEX_BUDGET,
+  PLATFORM_SCOPE,
   RETENTION_DAYS,
   SAMPLE_RATE,
   SCHEMA_VERSION,
@@ -141,6 +143,14 @@ async function reads() {
   s.rollups({ as: 'llm_cost' });
   s.rollupAggregate([{ $group: { _id: '$dims' } }]);
 
+  // scoped() takes a tenantId and only a tenantId — PLATFORM_SCOPE is not
+  // special here, it is just a string that matches no row
+  const literal: Scoped = t.scoped(PLATFORM_SCOPE);
+  literal.find();
+  const platform: boolean = isPlatformScope(PLATFORM_SCOPE);
+  const notPlatform: boolean = isPlatformScope('acc_9');
+  void (platform && notPlatform);
+
   const gone: ForgetResult = await t.forget('acc_9', 'user:u_1');
   void (gone.deleted + gone.redacted + gone.rollups + gone.aliases);
 
@@ -237,7 +247,15 @@ async function drain() {
 
 // ── dashboard surface ──
 import type {
+  CohortSubject,
   CreateDashboardOptions,
+  FunnelCohortWindow,
+  FunnelExitResult,
+  FunnelParams,
+  FunnelResult,
+  FunnelSlice,
+  FunnelStageResult,
+  FunnelStageSpec,
   Queries,
   QueryLimits,
   RecordFilter,
@@ -248,10 +266,17 @@ import type {
   ViewerAdapter,
   ViewSpec,
 } from './index.js';
-import { createDashboard, createQueries, defaultSpaDir, deriveViews, DEFAULT_LIMITS } from './index.js';
+import {
+  createDashboard, createQueries, defaultSpaDir, deriveViews, findFamily,
+  median, requireMilestoneFamily, summarizeStages, DEFAULT_LIMITS,
+} from './index.js';
 
 const viewer: Viewer = { tenantId: 'acc_9', role: 'admin', viewerRef: 'user:u_1' };
-const viewerAdapter: ViewerAdapter = { resolveViewer: () => viewer };
+/** the platform viewer — the host authorized it, the package only expresses it */
+const platformViewer: Viewer = { tenantId: PLATFORM_SCOPE, role: 'admin', viewerRef: 'user:u_ops' };
+const viewerAdapter: ViewerAdapter = {
+  resolveViewer: () => (isPlatformScope(viewer.tenantId) ? platformViewer : viewer),
+};
 const subjectAdapter: SubjectAdapter = {
   describe: async (refs) => Object.fromEntries(refs.map((r) => [r, { label: r }])),
 };
@@ -289,9 +314,67 @@ async function primitives() {
   await q.distribution('acc_9', range, f);
   const ro = await q.rollups('acc_9', { as: 'llm_cost', sort: 'bucketAt' });
   const src: 'rollups' = ro.dataSource;
+  const short: boolean = ro.truncated;
+  // the multi-subject read and the explicit cohort field, both new
+  await q.rollups('acc_9', { as: 'user.signed_up', dims: ['user:u_1', 'user:u_2'], on: 'firstAt', range });
   await q.trace('acc_9', 'tr_1');
   await q.journey('acc_9', 'user:u_1', range);
+  void short;
+
+  // ── the two cohort primitives ──
+  const dau = await q.distinctCount('acc_9', { as: 'activity', range, interval: 'day' });
+  const distinct: number = dau.distinct;
+  const grain: 'hour' | 'day' | 'week' | 'month' = dau.interval;
+  const perBucket: number = dau.buckets[0]?.value ?? 0;
+  void (distinct + perBucket), grain, dau.truncated;
+
+  const funnelParams: FunnelParams = {
+    stages: [{ as: 'user.signed_up' }, { as: 'activated', label: 'Activated' }],
+    anchor: 'user.signed_up',
+    // half-open by default; the closed form maxed uses is opt-in and named
+    cohort: { from: range.from, to: range.to, endInclusive: true } satisfies FunnelCohortWindow,
+    exits: [{ as: 'churned' }],
+    subjectType: 'user',
+    interval: 'week',
+    limit: 1_000,
+  };
+  const fun: FunnelResult = await q.funnel('acc_9', funnelParams);
+  const stage: FunnelStageResult = fun.stages[0]!;
+  const pctPrev: number | null = stage.pctOfPrevious;
+  const fromAnchor: number | null = stage.medianDaysFromAnchor;
+  const missed: number = stage.notReached;
+  const stalled: number | null = stage.stalledAt; // null on the terminal stage
+  const exit: FunnelExitResult = fun.exits[0]!;
+  const slice: FunnelSlice | undefined = fun.slices?.[0];
+  void (fun.cohortSubjects + fun.first + exit.subjects + missed);
+  void pctPrev, fromAnchor, stalled, slice?.at, fun.truncated, fun.cohort.anchor, fun.dataSource;
+
+  // every primitive takes the platform scope in the same position a tenantId
+  // goes — that IS the API: one argument, two meanings, no second entry point
+  await q.records(PLATFORM_SCOPE, range, f);
+  await q.series(PLATFORM_SCOPE, range, f);
+  await q.distribution(PLATFORM_SCOPE, range, f);
+  await q.rollups(PLATFORM_SCOPE, { as: 'llm_cost' });
+  await q.trace(PLATFORM_SCOPE, 'tr_1');
+  await q.journey(PLATFORM_SCOPE, 'user:u_1', range);
+  await q.distinctCount(PLATFORM_SCOPE, { as: 'activity', range });
+  await q.funnel(PLATFORM_SCOPE, { stages: [{ as: 'user.signed_up' }], cohort: range });
 }
+
+// ── the funnel math, usable without a database ──
+const mid: number | null = median([3, 3, 4, 5]); // 3.5 — mean of the two middles
+const empty: number | null = median([]); // null, never 0
+const cohortIndex: CohortSubject[] = [
+  { ref: 'user:u_1', anchorAt: new Date(), stages: { signed_up: new Date() }, exits: {} },
+  { ref: 'user:u_2', anchorAt: null, stages: {}, exits: { churned: new Date() } },
+];
+const stageSpec: FunnelStageSpec = { as: 'user.signed_up', key: 'signed_up', label: 'Signed up' };
+const table: FunnelStageResult[] = summarizeStages(cohortIndex, [
+  { order: 1, key: stageSpec.key!, as: stageSpec.as, label: stageSpec.label! },
+]);
+const family = findFamily(registry, 'llm_cost');
+const milestoneSpec: RollupSpec = requireMilestoneFamily(registry, 'user.signed_up', 'funnel()');
+void mid, empty, table[0]?.subjects, family?.spec, family?.name, milestoneSpec.by;
 
 // forget() now reports views too
 async function forgetViews() {

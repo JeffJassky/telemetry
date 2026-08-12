@@ -186,6 +186,13 @@ searchable array (§2.5).
 map, one forgotten filter is a cross-tenant leak. Promoting it makes it wrappable
 in a helper that can't be bypassed.
 
+> A cross-tenant read is a real requirement (support consoles, platform-wide
+> cost) and it has exactly one expression: `'*'` as a dashboard `Viewer`'s scope,
+> authorized by the host's `viewerAdapter` — see dashboards §2.1. `'*'` is
+> therefore a **reserved tenantId**: no write path may mint one, and `scoped()`
+> deliberately does not honour it. "Wrappable in a helper that can't be
+> bypassed" survives because the one bypass is named, gated, and tested.
+
 ### 2.5 Derived identity arrays
 
 Two arrays are derived on write. Neither is authored by hand.
@@ -250,6 +257,11 @@ failure this section exists to prevent — so §4.1 throws on it in dev.
 
 Exactly one id: `tenantId`. It is the shard key, the access-control boundary, and
 the prefix of every index — it cannot be a map entry.
+
+One value is reserved and can never be stored: `'*'`, the dashboard's
+cross-tenant read scope (dashboards §2.1). `emit()`, `forget()`, fixed-mode
+`createKey()`, and the ingest handler all refuse it, because a tenant literally
+named `*` would turn a string into a privilege escalation.
 
 Everything else — user, team, project, workspace, device, session — lives in the
 open `subjects` array. Adding a new subject type is a registry line, not a migration.
@@ -1434,7 +1446,12 @@ export async function emit<N extends TelemetryName>(name: N, doc: {
 
 /** tenant scope is not optional — force every read through here.
  *  The pin spreads LAST: `{ tenantId, ...q }` would let a caller-supplied
- *  tenantId override the scope (found at Stage 4 implementation). */
+ *  tenantId override the scope (found at Stage 4 implementation).
+ *
+ *  Unconditional on purpose: scoped() does NOT understand the '*' platform
+ *  scope, so scoped('*') scopes to the literal string and matches nothing.
+ *  Cross-tenant reads live in the dashboard query layer, behind viewerAdapter,
+ *  where someone has actually been authorized (dashboards §2.1). */
 export const scoped = (tenantId: string) => ({
   find: (q: object = {}) => TelemetryModel.find({ ...q, tenantId }),
   aggregate: (stages: object[]) => TelemetryModel.aggregate([{ $match: { tenantId } }, ...stages]),

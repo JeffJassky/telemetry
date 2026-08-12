@@ -18,6 +18,25 @@ export declare const INDEX_BUDGET: number;
 /** `body` cap in characters (16384). Over it, the value is clipped and marked. */
 export declare const BODY_MAX_CHARS: number;
 
+/**
+ * `'*'` — the dashboard's cross-tenant read scope. Set it as a `Viewer.tenantId`
+ * (from your own `viewerAdapter`, for viewers you have already authorized) and
+ * the query primitives drop the tenant term: a support console, a platform-wide
+ * cost page. Every row shape still carries its `tenantId`, so a cross-tenant
+ * number stays attributable.
+ *
+ * RESERVED on the write side, because a tenant literally named `'*'` would be a
+ * privilege escalation via a string: `emit()` quarantines it, `forget()` and
+ * `createKey()` (fixed mode) throw, and ingest refuses the batch whichever way
+ * the tenant resolved. `scoped()` does NOT honour it — that primitive's
+ * isolation guarantee is unconditional by design, so `scoped('*')` matches the
+ * literal string, which is to say nothing.
+ */
+export declare const PLATFORM_SCOPE: '*';
+
+/** true when a scope is PLATFORM_SCOPE rather than a tenantId */
+export declare function isPlatformScope(tenantId: unknown): boolean;
+
 /** UUIDv7 — sortable, insertion-local. Never substitute crypto.randomUUID (v4). */
 export declare function newId(): string;
 
@@ -271,9 +290,18 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
 export interface Telemetry<R extends Registry = Registry> {
   /** write — the only write. The result says what actually happened to the row. */
   emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<EmitResult>;
-  /** erasure: delete sole-party rows, redact shared ones, rekey rollups, drop aliases */
+  /**
+   * Erasure: delete sole-party rows, redact shared ones, rekey rollups, drop
+   * aliases. Tenant-scoped — rejects PLATFORM_SCOPE, so a platform-wide erasure
+   * is N calls that each name their tenant.
+   */
   forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>;
-  /** tenant scope is not optional — every read goes through here */
+  /**
+   * Tenant scope is not optional — every read goes through here. Unconditional
+   * on purpose: it does not understand PLATFORM_SCOPE, so `scoped('*')` scopes
+   * to the literal '*' and matches nothing. Cross-tenant reads live in the
+   * dashboard query layer, behind `viewerAdapter`.
+   */
   scoped(tenantId: string): Scoped;
   /** pull-importer watermark — advisory; downstream writers must be idempotent */
   checkpoint(key: string): Checkpoint;
@@ -377,6 +405,10 @@ export interface QueryLimits {
   rollups: number;
   trace: number;
   journey: number;
+  /** rollup docs distinctCount will scan before it reports an undercount */
+  distinct: number;
+  /** subjects in one funnel cohort */
+  funnel: number;
 }
 export declare const DEFAULT_LIMITS: QueryLimits;
 
@@ -400,19 +432,157 @@ export interface RecordFilter {
   excludeActorTypes?: string[];
 }
 
-/** the five read primitives — everything the UI renders comes through these */
+// ── cohort math (cohort-math §1) ────────────────────────────────────────────
+
+export interface FunnelStageSpec {
+  /** the lifetime rollup family whose doc marks this stage — `firstAt` IS the timestamp */
+  as: string;
+  /** stable identifier in the response. Default: `as` */
+  key?: string;
+  label?: string;
+  description?: string;
+}
+
+export interface FunnelCohortWindow extends TimeRange {
+  /**
+   * Include `to` itself. Default FALSE — the package is half-open everywhere.
+   * maxed's funnel is closed on both ends, so a host migrating off it sets this.
+   */
+  endInclusive?: boolean;
+}
+
+export interface FunnelParams {
+  stages: readonly FunnelStageSpec[];
+  /** the milestone that assigns cohort membership and anchors time-to-step. Default: `stages[0].as` */
+  anchor?: string;
+  cohort: FunnelCohortWindow;
+  /** exit families — counted, never staged */
+  exits?: readonly FunnelStageSpec[];
+  subjectType?: string;
+  /** also slice the cohort by anchor date. UTC, Monday-start weeks. */
+  interval?: 'day' | 'week' | 'month';
+  limit?: number;
+}
+
+export interface FunnelStageResult {
+  order: number;
+  key: string;
+  as: string;
+  label: string;
+  description?: string;
+  /** subjects with this stage present. NOT monotonic — the funnel is literal, never backfilled. */
+  subjects: number;
+  /** 0–100, unrounded. null when stage 1's count is 0. */
+  pctOfFirst: number | null;
+  /** null on stage 1 and whenever the previous count is 0 — never 0, never Infinity. */
+  pctOfPrevious: number | null;
+  /** fractional days, unrounded. null on an empty sample. */
+  medianDaysFromAnchor: number | null;
+  medianDaysFromPrevious: number | null;
+  /** reached the PREVIOUS stage and not this one. 0 on stage 1. */
+  notReached: number;
+  /** reached this stage and not the NEXT. null on the terminal stage — there is nowhere to stall. */
+  stalledAt: number | null;
+}
+
+export interface FunnelExitResult {
+  key: string;
+  as: string;
+  label: string;
+  subjects: number;
+}
+
+export interface FunnelSlice {
+  /** the truncated anchor date — a UTC bucket start, not a '2026-W31' label */
+  at: Date;
+  subjects: number;
+  stages: FunnelStageResult[];
+}
+
+export interface FunnelResult {
+  cohortSubjects: number;
+  /** |{ s : stage 1 present }| — the pctOfFirst denominator */
+  first: number;
+  stages: FunnelStageResult[];
+  exits: FunnelExitResult[];
+  /** present only when `interval` was asked for; ascending by `at` */
+  slices: FunnelSlice[] | null;
+  /** the cohort read hit its cap — every number is an UNDERCOUNT */
+  truncated: boolean;
+  cohort: { from: Date; to: Date; endInclusive: boolean; anchor: string };
+  dataSource: 'rollups';
+}
+
+/** one subject's assembled milestone index — what summarizeStages reasons over */
+export interface CohortSubject {
+  ref: string;
+  anchorAt: Date | null;
+  /** stage key → first occurrence */
+  stages: Record<string, Date>;
+  exits: Record<string, Date>;
+}
+
+/** Mean of the two middles on even counts. Empty set is null, never 0. No rounding. */
+export declare function median(values: readonly number[]): number | null;
+
+/** the stage table, pure — same input, same output, no Mongo */
+export declare function summarizeStages(
+  subjects: readonly CohortSubject[],
+  stages: readonly { order: number; key: string; as: string; label: string; description?: string }[],
+): FunnelStageResult[];
+
+/** the first declaration of a rollup family — validateRegistry pins the shape, so it speaks for all */
+export declare function findFamily(
+  registry: Registry,
+  as: string,
+): { name: string; spec: RollupSpec } | null;
+
+/** throws unless `as` is a LIFETIME family keyed by exactly one subject dim */
+export declare function requireMilestoneFamily(
+  registry: Registry,
+  as: string,
+  primitive: string,
+): RollupSpec;
+
+/** the six read primitives — everything the UI renders comes through these */
 export interface Queries {
-  records(tenantId: string, range: TimeRange, filter?: RecordFilter, opts?: { limit?: number; cursor?: string }):
+  /**
+   * `scope` is a tenantId, or PLATFORM_SCOPE ('*') for a cross-tenant read.
+   * Under '*' the tenant term is dropped and nothing else changes: the time
+   * range is still mandatory, the caps still apply, and every row still carries
+   * its own `tenantId`. `series` and `distribution` aggregate ACROSS tenants
+   * under '*' — the platform-wide chart, by design.
+   */
+  records(scope: string, range: TimeRange, filter?: RecordFilter, opts?: { limit?: number; cursor?: string }):
     Promise<{ items: any[]; nextCursor: string | null; dataSource: 'raw' }>;
-  series(tenantId: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' }):
+  series(scope: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' }):
     Promise<{ buckets: Array<{ at: Date; value: number }>; dataSource: 'raw' }>;
-  distribution(tenantId: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string }):
+  distribution(scope: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string }):
     Promise<Record<string, unknown> & { n: number; dataSource: 'raw' }>;
-  rollups(tenantId: string, params: { as: string; dims?: string; subjectType?: string; range?: TimeRange; sort?: 'count' | 'lastAt' | 'firstAt' | 'bucketAt'; limit?: number }):
-    Promise<{ rows: any[]; bucketed: boolean; dataSource: 'rollups' }>;
-  trace(tenantId: string, traceId: string): Promise<{ items: any[]; dataSource: 'raw' }>;
-  journey(tenantId: string, subjectRef: string, range: TimeRange, opts?: { limit?: number }):
+  /**
+   * `dims` accepts several values as an `$in` — one read for N subjects instead
+   * of N reads. `on` picks the field `range` filters (default: bucketAt when
+   * bucketed, lastAt otherwise); cohort selection wants `firstAt`. The range is
+   * half-open either way, and `truncated` says when the cap was actually hit.
+   */
+  rollups(scope: string, params: { as: string; dims?: string | string[]; subjectType?: string; on?: 'firstAt' | 'lastAt' | 'bucketAt'; range?: TimeRange; sort?: 'count' | 'lastAt' | 'firstAt' | 'bucketAt'; limit?: number }):
+    Promise<{ rows: any[]; bucketed: boolean; truncated: boolean; dataSource: 'rollups' }>;
+  trace(scope: string, traceId: string): Promise<{ items: any[]; dataSource: 'raw' }>;
+  journey(scope: string, subjectRef: string, range: TimeRange, opts?: { limit?: number }):
     Promise<{ records: any[]; milestones: any[]; dataSource: 'raw+rollups' }>;
+  /**
+   * Distinct subjects per bucket and over the range — DAU/MAU, exact, no sketch.
+   * A family declared `by: ['subject']` with a bucket already writes one doc per
+   * (subject, bucket), so the doc count IS the distinct count.
+   *
+   * THROWS when the named family has no subject dim or no bucket: that is a
+   * registry mistake, and a plausible wrong number is the failure mode this
+   * package exists to prevent.
+   */
+  distinctCount(scope: string, params: { as: string; subjectType?: string; range: TimeRange; interval?: 'hour' | 'day' | 'week' | 'month' }):
+    Promise<{ buckets: Array<{ at: Date; value: number }>; distinct: number; interval: 'hour' | 'day' | 'week' | 'month'; truncated: boolean; dataSource: 'rollups' }>;
+  /** cohort funnel over lifetime milestone families — counts, conversion, median time-to-step */
+  funnel(scope: string, params: FunnelParams): Promise<FunnelResult>;
 }
 
 export declare function createQueries(ctx: {
@@ -448,15 +618,31 @@ export interface ResolvedView extends ViewSpec {
 export declare function deriveViews(registry: Registry): ResolvedView[];
 
 export interface Viewer {
+  /**
+   * The read scope: a tenantId, or PLATFORM_SCOPE (`'*'`) to read across every
+   * tenant — a support console, a platform-wide cost page.
+   *
+   * Returning `'*'` IS the authorization decision, and it is yours: the package
+   * never infers platform admin from a role, a header, or a config flag. It
+   * only makes the escape hatch expressible, so a host that needs a
+   * cross-tenant read declares it here instead of reaching around `scoped()`
+   * with a raw model. `'*'` is reserved on the write side, so no stored row
+   * carries it and no tenant can ever be named it.
+   *
+   * Saved views scope on this string LITERALLY, `'*'` included: a platform
+   * viewer's views are invisible to every tenant and vice versa, and neither
+   * can delete the other's. `'*'` reads telemetry across tenants; it is not a
+   * master key to other people's saved state.
+   */
   tenantId: string;
-  /** 'admin' unlocks System writes (key revoke) */
+  /** 'admin' unlocks System writes (key revoke) — within this scope */
   role: string;
   /** owns saved views, e.g. 'user:u_1' */
   viewerRef?: string;
 }
 
 export interface ViewerAdapter {
-  /** INBOUND: who may look? The dashboard refuses to construct without this. */
+  /** INBOUND: who may look, and how widely? Construction fails without this. */
   resolveViewer(req: unknown): Viewer | null | Promise<Viewer | null>;
 }
 

@@ -10,7 +10,7 @@ import {
 } from './util.js';
 
 /**
- * Pages speak only the five query primitives (dashboards law 2); the atoms
+ * Pages speak only the six query primitives (dashboards law 2); the atoms
  * they compose are kind-blind. One bespoke component per kind, already spent:
  * StackTrace (error, inside RecordDetail), Waterfall (span),
  * TransitionMatrix (state). event and usage prove zero is achievable.
@@ -84,8 +84,15 @@ export function Overview({ api, route, registry }) {
     const issues = issueFamilies.length
       ? await api.rollups({ as: issueFamilies[0], sort: 'lastAt', limit: 8 })
       : null;
+    // DAU/MAU off the first bucketed subject family — exact, not a sketch: such
+    // a family writes one doc per (subject, bucket), so distinct IS the count.
+    // No family declared that way means no tile, rather than a wrong tile.
+    const activity = familiesBy(registry, (r) => r.bucket && r.by.length === 1 && r.by[0] === 'subject')[0];
+    const active = activity
+      ? await api.distinct({ as: activity, ...rangeToDates(p.range ?? '7d') }).catch(() => null)
+      : null;
     const recent = await api.records(filterParams(p, { limit: 12 }));
-    return { errors, events, dist, spend, issues, recent };
+    return { errors, events, dist, spend, issues, recent, active, activity };
   }, [JSON.stringify(p)]);
   const detail = useDetail();
 
@@ -99,6 +106,15 @@ export function Overview({ api, route, registry }) {
         <StatTile label="Errors" value={fmtNumber(sum(q.data.errors))} meta="in range" />
         <StatTile label="Events" value={fmtNumber(sum(q.data.events))} meta="in range" />
         <StatTile label="p95 span" value={q.data.dist.n ? fmtMs(q.data.dist.p95) : '—'} meta={`${fmtNumber(q.data.dist.n ?? 0)} spans`} />
+        {/* the range total, NOT the sum of the buckets — a subject active on
+            five days is one active subject */}
+        <StatTile
+          label="Active subjects"
+          value={q.data.active ? fmtNumber(q.data.active.distinct) : '—'}
+          meta={q.data.active
+            ? `distinct in range · peak ${fmtNumber(Math.max(0, ...q.data.active.buckets.map((b) => b.value)))}/${q.data.active.interval}`
+            : 'no bucketed subject family'}
+        />
         <StatTile label="Spend" value={q.data.spend ? fmtUsd(sum(q.data.spend)) : '—'} meta="usage cost" />
       </div>
       <div className="split split-2">
@@ -141,6 +157,8 @@ function IssueTable({ rows, onRow }) {
     <BreakdownTable
       rows={rows.map((r) => ({
         id: r._id,
+        // carried, not rendered — BreakdownTable shows it only under '*'
+        tenantId: r.tenantId,
         fingerprint: r.dims[0]?.replace(/^.*=/, ''),
         type: r.firstCapture?.['error.type'] ?? '',
         firstRelease: r.firstCapture?.release ?? '',
@@ -416,6 +434,7 @@ function RollupExplorer({ api, route, family, families, registry }) {
         <BreakdownTable
           rows={rows.slice(0, 50).map((r) => ({
             id: r._id,
+            tenantId: r.tenantId,
             dims: r.dims.join(' · '),
             count: r.count,
             ...(Object.fromEntries(sumKeys.map((k) => [k, r.sums?.[k]]))),
@@ -436,31 +455,50 @@ function RollupExplorer({ api, route, family, families, registry }) {
           }}
         />
         {!bucketed && rows.length > 1 && (
-          <FunnelStepsFromFamilies api={api} registry={registry} route={route} />
+          <CohortFunnel api={api} registry={registry} route={route} />
         )}
       </div>
     </div>
   );
 }
 
-/** milestone families in registry order become a funnel for free */
-function FunnelStepsFromFamilies({ api, registry, route }) {
-  const milestoneFamilies = Object.entries(registry ?? {})
-    .flatMap(([name, s]) => (s.rollups ?? [])
-      .filter((r) => !r.bucket && r.by.length === 1 && r.by[0] === 'subject')
-      .map((r) => r.as ?? name));
-  const q = useQuery(async () => {
-    const counts = await Promise.all(
-      milestoneFamilies.map((as) => api.rollups({ as, limit: 1_000 }).then((r) => r.rows.length)),
-    );
-    return milestoneFamilies.map((label, i) => ({ label, count: counts[i] }));
-  }, [JSON.stringify(route.params.range)]);
-  if (q.loading || q.error || !q.data?.length) return null;
+/** milestone families in registry order — the funnel's stage list, for free */
+const milestoneFamilies = (registry) =>
+  familiesBy(registry, (r) => !r.bucket && r.by.length === 1 && r.by[0] === 'subject');
+
+/**
+ * Milestone families in registry order become a cohort funnel for free.
+ *
+ * This used to count `rows.length` per family with `limit: 1_000` — capped, so
+ * a large tenant silently under-reported; cohort-blind, so it answered "who ever
+ * reached this step" rather than "of the people who joined in this window, who
+ * reached it"; and with no time-to-step at all. It is now one `funnel()` call,
+ * and the numbers are the server's (cohort-math G4).
+ */
+function CohortFunnel({ api, registry, route }) {
+  const p = route.params;
+  const families = milestoneFamilies(registry);
+  const q = useQuery(
+    () => (families.length
+      ? api.funnel({ ...rangeToDates(p.range ?? '30d'), stages: families.join(','), interval: 'week' })
+      : Promise.resolve(null)),
+    [JSON.stringify(families), p.range],
+  );
+  if (q.loading || q.error || !q.data) return null;
+  const f = q.data;
   return (
     <>
       <div className="divider" />
-      <div className="card-title" style={{ marginBottom: 8 }}>Milestone funnel — subjects that ever reached each step</div>
-      <FunnelSteps steps={q.data} />
+      <div className="card-title" style={{ marginBottom: 8 }}>
+        Cohort funnel — {fmtNumber(f.cohortSubjects)} subjects anchored on <span className="mono">{f.cohort.anchor}</span>
+      </div>
+      {/* never a silent cap: if the cohort read was cut off, the chart says so */}
+      {f.truncated && (
+        <div className="card-sub" style={{ marginBottom: 8, color: 'var(--amber)' }}>
+          cohort truncated at the query cap — these counts are a lower bound
+        </div>
+      )}
+      <FunnelSteps steps={f.stages} />
     </>
   );
 }

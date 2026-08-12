@@ -1,7 +1,7 @@
 import React from 'react';
 import {
   KIND_COLOR, KIND_PILL, SEVERITY_PILL,
-  fmtClock, fmtMetric, fmtMs, fmtNumber, fmtTime,
+  fmtClock, fmtDays, fmtMetric, fmtMs, fmtNumber, fmtPct, fmtTime,
 } from './util.js';
 
 /**
@@ -10,6 +10,14 @@ import {
  * Charts are hand-rolled SVG (mailery's sparkline lineage) — no chart library
  * until an atom proves it needs one.
  */
+
+/**
+ * The viewer's scope, by context rather than a prop threaded through every
+ * page. Whether rows can mix tenants is a fact about WHO IS LOOKING, not about
+ * any one table's caller — and the atoms stay kind-blind either way, since
+ * `tenantId` is an envelope field like every other column they render.
+ */
+export const ScopeContext = React.createContext({ platform: false, scope: null });
 
 /* 1 ── StatTile */
 export function StatTile({ label, value, delta, meta }) {
@@ -67,12 +75,19 @@ export function TimeSeries({ buckets, height = 160, color = 'var(--accent)', for
 
 /* 3 ── BreakdownTable — the "top N" workhorse */
 export function BreakdownTable({ rows, columns, onRow, empty = 'Nothing to group' }) {
+  const { platform } = React.useContext(ScopeContext);
   if (!rows?.length) return <div className="empty">{empty}</div>;
+  // A cross-tenant row that carries its tenant says so, first column. Rows that
+  // do not (quarantine, keys, client-side groupings) are left alone — the
+  // column appears exactly where it would mean something.
+  const cols = platform && rows.some((r) => r.tenantId != null)
+    ? [{ key: 'tenantId', label: 'tenant', mono: true }, ...columns]
+    : columns;
   return (
     <table className="table">
       <thead>
         <tr>
-          {columns.map((c) => (
+          {cols.map((c) => (
             <th key={c.key} className={c.num ? 'num' : ''}>{c.label ?? c.key}</th>
           ))}
         </tr>
@@ -80,7 +95,7 @@ export function BreakdownTable({ rows, columns, onRow, empty = 'Nothing to group
       <tbody>
         {rows.map((r, i) => (
           <tr key={r.id ?? i} onClick={onRow ? () => onRow(r) : undefined}>
-            {columns.map((c) => (
+            {cols.map((c) => (
               <td key={c.key} className={`${c.num ? 'num' : ''} ${c.mono ? 'mono' : ''}`}>
                 {c.render ? c.render(r) : c.num ? fmtMetric(c.key, r[c.key]) : String(r[c.key] ?? '—')}
               </td>
@@ -142,18 +157,22 @@ function subjectsOf(r) {
 
 /* 5 ── RecordTable — envelope columns + kind extras, cursor-paged by the caller */
 export function RecordTable({ items, onSelect, empty = 'No records in range' }) {
+  // under the platform scope these rows can mix tenants, and a row that cannot
+  // say whose it is is not evidence of anything
+  const { platform } = React.useContext(ScopeContext);
   if (!items?.length) return <div className="empty">{empty}</div>;
   return (
     <table className="table">
       <thead>
         <tr>
-          <th>when</th><th>kind</th><th>name</th><th>subjects</th><th>summary</th>
+          <th>when</th>{platform && <th>tenant</th>}<th>kind</th><th>name</th><th>subjects</th><th>summary</th>
         </tr>
       </thead>
       <tbody>
         {items.map((r) => (
           <tr key={r._id} onClick={() => onSelect?.(r)}>
             <td className="mono" title={fmtClock(r.occurredAt)}>{fmtTime(r.occurredAt)}</td>
+            {platform && <td className="mono f500">{r.tenantId}</td>}
             <td><KindPill kind={r.kind} /></td>
             <td className="f500">{r.name}</td>
             <td className="mono subtle">{subjectsOf(r)}</td>
@@ -191,6 +210,7 @@ export function StackTrace({ frames }) {
 
 /* 6 ── RecordDetail — drawer: envelope, payload, kind panel slot */
 export function RecordDetail({ record, onClose, onTrace, onSubject }) {
+  const { platform } = React.useContext(ScopeContext);
   if (!record) return null;
   const kv = (obj) =>
     Object.entries(obj ?? {}).map(([k, v]) => (
@@ -214,6 +234,7 @@ export function RecordDetail({ record, onClose, onTrace, onSubject }) {
 
         <div className="divider" />
         <dl className="kv">
+          {platform && (<><dt>tenant</dt><dd className="mono">{record.tenantId}</dd></>)}
           <dt>occurred</dt><dd>{fmtClock(record.occurredAt)}</dd>
           <dt>received</dt><dd>{record.receivedAt ? fmtClock(record.receivedAt) : '—'}</dd>
           <dt>service / env</dt><dd>{record.service} · {record.env}</dd>
@@ -291,6 +312,9 @@ export function RecordDetail({ record, onClose, onTrace, onSubject }) {
 
 /* 7 ── StreamList — chronological, kind-iconed; markers interleave */
 export function StreamList({ items, markers = [], onSelect }) {
+  // a subject ref is unique only within a tenant, so a '*' journey can braid
+  // two tenants' 'user:u_1' into one timeline — label each entry
+  const { platform } = React.useContext(ScopeContext);
   const merged = [
     ...items.map((r) => ({ at: r.occurredAt, record: r })),
     ...markers.map((m) => ({ at: m.at, marker: m })),
@@ -305,6 +329,7 @@ export function StreamList({ items, markers = [], onSelect }) {
           <div key={e.record._id} className="stream-item" onClick={() => onSelect?.(e.record)}>
             <span className="stream-time">{fmtClock(e.at).slice(5)}</span>
             <span className="stream-kind status-dot" style={{ background: KIND_COLOR[e.record.kind] }} />
+            {platform && <span className="tag">{e.record.tenantId}</span>}
             <span className="stream-name">{e.record.name}</span>
             <span className="stream-meta">{recordSummary(e.record)}</span>
           </div>
@@ -314,19 +339,36 @@ export function StreamList({ items, markers = [], onSelect }) {
   );
 }
 
-/* 8 ── FunnelSteps */
+/* 8 ── FunnelSteps
+ *
+ * Renders the server's funnel rows verbatim. It does NOT recompute conversion:
+ * `pctOfPrevious` is null when the previous step is empty and may exceed 100%
+ * when a step is skipped, and both facts are load-bearing (cohort-math R3/R4).
+ * The old client-side version rounded the percentage and omitted it rather than
+ * showing null — two quiet disagreements with the number the API now returns.
+ *
+ * `count` is accepted as an alias for `subjects` so a host feeding plain
+ * {label, count} rows still gets bars. */
 export function FunnelSteps({ steps }) {
   if (!steps?.length) return <div className="empty">No funnel data</div>;
-  const max = Math.max(...steps.map((s) => s.count), 1);
+  const n = (s) => s.subjects ?? s.count ?? 0;
+  const max = Math.max(...steps.map(n), 1);
   return (
     <div>
       {steps.map((s, i) => (
-        <div key={s.label} className="funnel-step">
-          <span className="f500">{s.label}</span>
-          <div className="funnel-bar" style={{ width: `${(s.count / max) * 100}%` }} title={String(s.count)} />
+        <div key={s.key ?? s.label ?? i} className="funnel-step">
+          <span className="f500" title={s.description ?? ''}>{s.label ?? s.key}</span>
+          <div className="funnel-bar" style={{ width: `${(n(s) / max) * 100}%` }} title={String(n(s))} />
           <span className="funnel-conv">
-            {fmtNumber(s.count)}
-            {i > 0 && steps[i - 1].count > 0 && ` · ${Math.round((s.count / steps[i - 1].count) * 100)}%`}
+            {fmtNumber(n(s))}
+            {/* null means "undefined", not zero — say so rather than hide the step */}
+            {i > 0 && s.pctOfPrevious != null && ` · ${fmtPct(s.pctOfPrevious)}`}
+            {i > 0 && 'pctOfPrevious' in s && s.pctOfPrevious == null && (
+              <span className="dwell" title="the previous step has no subjects, so conversion is undefined">n/a</span>
+            )}
+            {s.medianDaysFromPrevious != null && (
+              <span className="dwell">{fmtDays(s.medianDaysFromPrevious)} median</span>
+            )}
           </span>
         </div>
       ))}

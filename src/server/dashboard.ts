@@ -4,13 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { INDEX_BUDGET } from './indexes.js';
+import { isPlatformScope } from './types.js';
 import { createQueries, type QueryLimits, type RecordFilter, type TimeRange } from './query.js';
 import { buildViewModel, resolveViews, saveView, type ViewSpec } from './views.js';
 import type { Telemetry } from './index.js';
 
 /**
  * The read surface (dashboards §2–§8): one express router serving /api/* for
- * the five query primitives plus views/system, and the built React SPA with
+ * the six query primitives plus views/system, and the built React SPA with
  * hashed assets and SPA fallback. Never an app, never a server — the host
  * mounts it.
  *
@@ -20,6 +21,18 @@ import type { Telemetry } from './index.js';
  */
 
 export interface Viewer {
+  /**
+   * The read scope: a tenantId, or PLATFORM_SCOPE (`'*'`) for a cross-tenant
+   * read — a support console, a platform-wide cost page.
+   *
+   * `'*'` is an authorization decision, and it is the HOST's to make. The
+   * package never infers platform admin from a role, a header, or a config
+   * flag; it only makes the escape hatch expressible, so that a host needing a
+   * cross-tenant read says so through this adapter instead of reaching around
+   * `scoped()` with a raw model. Return `'*'` only for viewers you have already
+   * authorized. `'*'` is reserved on the write side, so no stored row carries
+   * it and no tenant can ever be named it.
+   */
   tenantId: string;
   /** 'admin' unlocks System writes (key revoke); anything else is read-only there */
   role: string;
@@ -189,10 +202,14 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
       }, next);
     };
 
+  // the SPA's one boot call — it learns its scope here, because a cross-tenant
+  // number that cannot say which tenant it came from is unusable
   api.get('/registry', h(async (req) => ({
     registry: registryProjection(t),
     kinds: ['event', 'error', 'span', 'state', 'usage'],
     role: req.viewer!.role,
+    scope: req.viewer!.tenantId,
+    platform: isPlatformScope(req.viewer!.tenantId),
   })));
 
   api.get('/records', h(async (req) =>
@@ -237,6 +254,56 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     }),
   ));
 
+  /**
+   * A cohort primitive throws when the named family cannot answer the question
+   * asked of it — a registry mistake, which is a 400 with the explanation, not
+   * a 500 that hides it. `status` already set (parseRange's 400) is respected.
+   */
+  const badRequest = async <T>(run: () => Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (e: any) {
+      throw Object.assign(e, { status: e?.status ?? 400 });
+    }
+  };
+
+  // ── the two cohort primitives (cohort-math S6/S8) ──
+  // Stages arrive as a comma-separated family list so a funnel stays a URL —
+  // `?stages=signed_up,activated,converted`. A view is a named URL (dashboards
+  // §11.6); a funnel that needed a POST body could not be one.
+  api.get('/funnel', h(async (req) => {
+    const parseStages = (v: unknown) =>
+      String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean).map((as) => ({ as }));
+    const stages = parseStages(req.query.stages);
+    if (!stages.length) {
+      throw Object.assign(new Error('funnel needs `stages` — a comma-separated list of rollup families'), { status: 400 });
+    }
+    // a registry mistake is the caller's to fix, not a 500 — the validator's
+    // message names the family and the change, so surface it verbatim
+    return badRequest(() => q.funnel(req.viewer!.tenantId, {
+      stages,
+      exits: parseStages(req.query.exits),
+      anchor: typeof req.query.anchor === 'string' ? req.query.anchor : undefined,
+      // the cohort window is the shell's own range, half-open like everything else
+      cohort: { ...parseRange(req.query), endInclusive: req.query.endInclusive === 'true' },
+      subjectType: typeof req.query.subjectType === 'string' ? req.query.subjectType : undefined,
+      interval: (req.query.interval as any) || undefined,
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
+    }));
+  }));
+
+  api.get('/distinct', h(async (req) => {
+    if (typeof req.query.as !== 'string' || !req.query.as) {
+      throw Object.assign(new Error('rollup family required'), { status: 400 });
+    }
+    return badRequest(() => q.distinctCount(req.viewer!.tenantId, {
+      as: req.query.as as string,
+      subjectType: typeof req.query.subjectType === 'string' ? req.query.subjectType : undefined,
+      range: parseRange(req.query),
+      interval: (req.query.interval as any) || undefined,
+    }));
+  }));
+
   api.get('/subjects/describe', h(async (req) => {
     const refs = String(req.query.refs ?? '').split(',').filter(Boolean).slice(0, 100);
     if (!subjectAdapter) return { refs: {} }; // refs render raw — the documented fallback
@@ -269,6 +336,11 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
   }));
 
   api.delete('/views/:id', h(async (req, res) => {
+    // LITERAL scope match, '*' included — see views.ts. The platform scope
+    // reads telemetry across tenants; it does not own other people's saved
+    // views, and `role: 'admin'` below is admin OF this scope. A view outside
+    // the caller's scope reports removed:0 rather than 403: whether that id
+    // exists elsewhere is not this viewer's business either.
     const doc = await ViewModel.findOne({ _id: req.params.id, tenantId: req.viewer!.tenantId }).lean() as any;
     if (!doc) return { removed: 0 };
     const mine = doc.ownerRef && doc.ownerRef === req.viewer!.viewerRef;

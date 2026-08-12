@@ -17,7 +17,7 @@ const PAGES = [
   ['system', 'System', '⚙'],
 ];
 
-export function Sidebar({ route, views, title }) {
+export function Sidebar({ route, views, title, platform }) {
   const grouped = React.useMemo(() => {
     const custom = (views ?? []).filter((v) => v.origin !== 'derived');
     const derived = (views ?? []).filter((v) => v.origin === 'derived');
@@ -71,7 +71,7 @@ export function Sidebar({ route, views, title }) {
       ))}
 
       <div className="sidebar-footer">
-        <span className="dot" /> live
+        <span className="dot" /> {platform ? 'live · all tenants' : 'live'}
       </div>
     </nav>
   );
@@ -82,7 +82,7 @@ function flatten(filters = {}) {
   return filters;
 }
 
-export function Topbar({ route, registry, onSaveView, theme, onTheme }) {
+export function Topbar({ route, registry, onSaveView, theme, onTheme, platform }) {
   const p = route.params;
   const set = (patch) => navigate(route.page, { ...p, ...patch }, route.arg);
   const names = Object.keys(registry ?? {});
@@ -91,6 +91,13 @@ export function Topbar({ route, registry, onSaveView, theme, onTheme }) {
   return (
     <header className="topbar">
       <div className="crumb"><span className="crumb-current" style={{ textTransform: 'capitalize' }}>{route.page}</span></div>
+      {/* every number on this page is summed across tenants — say so, always,
+          and before the reader has interpreted any of them */}
+      {platform && (
+        <span className="pill violet" title="Platform scope — reads span every tenant">
+          <span className="dot" />all tenants
+        </span>
+      )}
       <div className="topbar-spacer" />
 
       <div className="seg">

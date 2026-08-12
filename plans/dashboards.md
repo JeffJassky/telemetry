@@ -18,9 +18,9 @@ over-fit alarm.
 
 ---
 
-## 2. Query layer — five primitives
+## 2. Query layer — six primitives
 
-Everything the UI renders comes through five read functions. Kind pages never
+Everything the UI renders comes through six read functions. Kind pages never
 touch Mongo. This seam is what lets `span`/`event` route to ClickHouse later
 (schema §8) without touching a component.
 
@@ -29,11 +29,41 @@ touch Mongo. This seam is what lets `span`/`event` route to ClickHouse later
 | `records(filter, sort, cursor)` | raw envelope | tables, lists, detail drawers |
 | `series(match, measure, interval)` | raw + `$dateTrunc`/`$group` | time-series at query time |
 | `distribution(match, measure)` | raw + `$percentile` | latency/size histograms (keep-all makes this exact, schema §5.3) |
-| `rollups(as, dims?, range?)` | rollup families | issues, spend, activity, funnels |
+| `rollups(as, dims?, on?, range?)` | rollup families | issues, spend, activity, funnels |
 | `trace(traceId)` / `journey(subjectRef, range)` | correlation indexes | the two join views (§6) |
+| `distinctCount(as, range, interval?)` | bucketed subject families | DAU/WAU/MAU, exact |
+| `funnel(stages, cohort, interval?)` | lifetime milestone families | cohort funnels, conversion, median time-to-step |
 
-All tenant-scoped through `scoped()` — the query layer takes a tenant, never a
-raw filter that could omit one. Exposed two ways, both from the server entry:
+The sixth arrived with the cohort math (cohort-math.md). Two notes that are
+contract, not implementation:
+
+- **`distinctCount` needs no sketch.** A family declared `by: ['subject']` with
+  a bucket already writes exactly one doc per (subject, bucket), so distinct
+  subjects per bucket IS the doc count and distinct-over-a-range is a `$group`
+  on `dims`. Exact, no write-path change, no new storage. It **throws** when the
+  named family has no subject dim or no bucket — that is a registry mistake, and
+  a silently-wrong number is the failure mode this package exists to prevent.
+- **`funnel` ships the math once.** Stage ordering, the cohort window, and the
+  median time-to-step aggregation are what every host rewrites. The funnel is
+  LITERAL (a later stage may exceed an earlier one, and `pctOfPrevious` may
+  exceed 100%); medians average the two middles; `pctOfPrevious` is `null`, never
+  0 or Infinity, when the previous stage is empty. `notReached` (reached k−1, not
+  k) and `stalledAt` (reached k, not k+1) are two quantities with two names,
+  and `stalledAt` is `null` on the terminal stage.
+
+**Interval convention.** Every range in the read layer is half-open
+(`$gte`/`$lt`). The one documented exception is the funnel's cohort window,
+which takes an explicit `endInclusive` (default `false`) because maxed's is
+closed on both ends — and it is translated to a half-open bound inside
+`funnel.ts`, so no `$lte` reaches the rest of the query layer.
+
+**No silent caps.** `rollups`, `distinctCount`, and `funnel` all return
+`truncated: boolean`. A response that was cut off by a cap says so; the caps
+themselves are `QueryLimits` config.
+
+Every primitive takes a **scope** as its first argument, never a raw filter that
+could omit one. A scope is a tenantId — or `'*'` (`PLATFORM_SCOPE`), the
+cross-tenant read. Exposed two ways, both from the server entry:
 
 - **an express sub-router** (`/api/*`) the dashboard SPA calls, and
 - **a headless client** for hosts that want to build embedded views — per
@@ -44,6 +74,47 @@ Access control is a named inbound adapter, same shape as ingest's
 `contextAdapter`: `viewerAdapter.resolveViewer(req) → { tenantId, role } | null`.
 The dashboard refuses to mount without it — an unauthenticated telemetry
 dashboard is a data leak with charts.
+
+### 2.1 The platform scope (decided 2026-08-12)
+
+A host running a support console or a platform-wide cost dashboard needs a
+cross-tenant read. Before this, the only way to get one was to bypass `scoped()`
+and hit the model directly — so the escape hatch existed anyway, it just lived
+outside any boundary the package could reason about. Making it expressible is
+strictly safer than pretending it does not exist.
+
+`Viewer.tenantId === '*'` is that scope. Three rules make it safe:
+
+1. **The package never decides who is a platform admin.** `'*'` reaches the
+   query layer only because the host's own `viewerAdapter` put it on a `Viewer`
+   — an authorization decision that has already been made, by the only party
+   that can make it. No role name, header, or config flag infers it.
+2. **`'*'` is reserved on the write side.** Otherwise a tenant literally named
+   `*` silently becomes a cross-tenant read: privilege escalation via a string.
+   `emit()` quarantines it, `forget()` and fixed-mode `createKey()` throw, and
+   ingest refuses the batch after tenant resolution — covering the claimed,
+   session, and fixed paths in one place, because all three mint a tenantId from
+   outside the package. No stored row can carry `'*'`.
+3. **`scoped()` was deliberately NOT taught about it.** It is the host-facing
+   isolation primitive and its guarantee is worth more unconditional: whatever
+   string goes in, only rows carrying it come out. `scoped('*')` therefore
+   matches the literal `'*'`, which is to say nothing. The escape hatch belongs
+   one layer up, behind the viewer adapter, where an authorization decision
+   actually happened.
+
+Consequences worth stating rather than discovering:
+
+- `records`/`rollups`/`trace`/`journey` return each row's `tenantId`, and the UI
+  renders it as a column under `'*'` — a cross-tenant number that cannot say
+  which tenant it came from is unusable. The shell carries an "all tenants"
+  badge so the scope is read before the numbers are.
+- `series` and `distribution` aggregate **across** tenants under `'*'`: one
+  bucket per interval, every tenant summed into it. That is the platform-wide
+  chart, not a bug. A per-tenant breakdown is a different question — ask it with
+  `rollups()`, or scope to a tenant.
+- A subject ref and a traceId are unique only *within* a tenant, so a `'*'`
+  journey or trace can legitimately braid two tenants together. The per-row
+  `tenantId` is what keeps that readable.
 
 ---
 
@@ -99,6 +170,21 @@ own format, renderer, or storage semantics.
    `{ _id, tenantId, ownerRef, shared, spec, createdAt }`. Private to the
    viewer by default; `shared: true` publishes it to the tenant.
 
+Views scope on the viewer's scope string **literally**, `'*'` included — they do
+NOT fan out under the platform scope the way the query primitives do. `'*'` is
+an escape hatch for reading telemetry, not a master key to other people's saved
+state, so a platform viewer's views live in their own namespace: invisible to
+every tenant, every tenant's invisible to them, and neither can delete the
+other's (the delete/ownership lookup matches the scope literally too, and a
+platform viewer's `role: 'admin'` is admin *of* the platform scope). Both
+directions fall out of one literal match.
+
+> **Stated bound.** `forget(tenantId, ref)` is tenant-scoped and `'*'` is not a
+> tenant, so a person's platform-scoped saved views are not erased by a
+> `forget()` against their home tenant. Widening `forget()` to reach `'*'` rows
+> would give a tenant-scoped call cross-tenant write reach — the trade we
+> refused. Erase them by their scope, or not at all.
+
 Quick-select renders as a sidebar section (mailery's `.sidebar-section`
 pattern): saved + configured on top, derived grouped by kind below — all plain
 links, because a view *is* a URL. Name collisions resolve saved → configured →
@@ -124,7 +210,7 @@ never knows an event name.
 | `RecordTable` | envelope columns + kind extension columns, cursor-paged |
 | `RecordDetail` | drawer: envelope section, payload section, kind panel slot |
 | `StreamList` | chronological timeline, kind-iconed |
-| `FunnelSteps` | ordered steps + conversion between them |
+| `FunnelSteps` | ordered steps + conversion between them — renders `funnel()`'s rows verbatim, including the nulls |
 | `Waterfall` | span tree on a time axis |
 | `TransitionMatrix` | from→to grid with counts + avg dwell |
 
@@ -181,11 +267,11 @@ the registry change itself.
 
 | page | contents |
 |---|---|
-| **Overview** | cross-kind StatTiles (errors today, spend MTD, DAU, p95), recent issues, recent traces |
+| **Overview** | cross-kind StatTiles (errors today, spend MTD, DAU via `distinctCount`, p95), recent issues, recent traces |
 | **Errors** | issue list → issue detail |
 | **Traces** | recent/slow → Waterfall |
 | **Events** | explore: series + breakdown + table |
-| **Journeys** | funnels, retention, activity (RollupExplorer) + subject lookup → Journey view |
+| **Journeys** | cohort funnel (`funnel()`), retention, activity (RollupExplorer) + subject lookup → Journey view |
 | **Usage** | spend tiles, per-meter series, `billedTo` breakdown |
 | **System** | quarantine browser, `telemetryCounters` (rejected/capped/sampled/rollupSkipped/deduped/truncated), index budget vs 64-cap, key list + revoke. This page is where "never drop silently" becomes visible — it is not optional |
 
@@ -255,7 +341,7 @@ Checked against `standards/`:
 ## 11. Laws (anti-over-fit)
 
 1. Atoms are kind-blind — data + specs in, pixels out.
-2. Pages speak only the five query primitives.
+2. Pages speak only the six query primitives.
 3. One bespoke component per kind, budgeted; `event` and `usage` prove zero is
    achievable.
 4. The registry drives filters, charts, and explorers — a new event or rollup

@@ -31,6 +31,8 @@ export function createApi(config) {
     series: (p) => call('/series', p),
     distribution: (p) => call('/distribution', p),
     rollups: (p) => call('/rollups', p),
+    funnel: (p) => call('/funnel', p),
+    distinct: (p) => call('/distinct', p),
     trace: (id) => call(`/trace/${encodeURIComponent(id)}`),
     journey: (ref, p) => call(`/journey/${encodeURIComponent(ref)}`, p),
     views: () => call('/views'),

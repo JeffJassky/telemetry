@@ -13,8 +13,8 @@ export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
 export type { Registry, EventSpec, RollupSpec, DimSource } from './registry.js';
 export {
   TelemetryKind, LogLevel, Env, Origin,
-  BODY_MAX_CHARS, RETENTION_DAYS, SAMPLE_RATE, SCHEMA_VERSION,
-  newId, traceKeep, plain,
+  BODY_MAX_CHARS, PLATFORM_SCOPE, RETENTION_DAYS, SAMPLE_RATE, SCHEMA_VERSION,
+  isPlatformScope, newId, traceKeep, plain,
 } from './types.js';
 export type { TelemetryCounters, Logger, EntityRef } from './types.js';
 export { INDEX_BUDGET } from './indexes.js';
@@ -32,6 +32,11 @@ export type {
 } from './dashboard.js';
 export { createQueries, DEFAULT_LIMITS } from './query.js';
 export type { Queries, QueryLimits, RecordFilter, TimeRange } from './query.js';
+export { median, summarizeStages, findFamily, requireMilestoneFamily } from './funnel.js';
+export type {
+  CohortSubject, FunnelCohortWindow, FunnelExitResult, FunnelParams,
+  FunnelResult, FunnelSlice, FunnelStageResult, FunnelStageSpec,
+} from './funnel.js';
 export { deriveViews } from './views.js';
 export type { ResolvedView, ViewSpec } from './views.js';
 
@@ -158,6 +163,15 @@ export function createTelemetry(config: CreateTelemetryConfig) {
      * Tenant scope is not optional — force every read through here. The five
      * dashboard query primitives (records/series/distribution/rollups/journey)
      * build on these in the read layer.
+     *
+     * scoped() does NOT know about PLATFORM_SCOPE, and the omission is
+     * deliberate. This is the host-facing isolation primitive, and its
+     * guarantee is worth more unconditional: whatever string goes in, only rows
+     * carrying that string come out. `scoped('*')` therefore scopes to the
+     * literal '*' — and since '*' is reserved on the write side, it matches
+     * nothing. The cross-tenant escape hatch lives one layer up, in the query
+     * primitives behind viewerAdapter, where an authorization decision has
+     * actually been made about who is asking.
      */
     scoped(tenantId: string) {
       // the pin spreads LAST — `{ tenantId, ...q }` would let a caller-supplied

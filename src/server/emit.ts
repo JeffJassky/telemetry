@@ -1,6 +1,6 @@
 import type { Model } from 'mongoose';
 import {
-  TelemetryKind, SAMPLE_RATE, newId, traceKeep, plain,
+  TelemetryKind, RESERVED_TENANT_MESSAGE, SAMPLE_RATE, isPlatformScope, newId, traceKeep, plain,
   type TelemetryCounters, type Logger,
 } from './types.js';
 import type { Registry } from './registry.js';
@@ -95,6 +95,14 @@ export function createEmitter(ctx: EmitCtx) {
       );
       return { id, outcome: 'rejected' };
     };
+
+    // '*' is the dashboard's cross-tenant READ scope; a row carrying it would
+    // turn a tenant name into a privilege escalation. Quarantined rather than
+    // thrown for the same reason everything else here is: hosts call emit()
+    // fire-and-forget, and an unhandled rejection on attacker-shaped input is a
+    // way to stop the process. The refusal is loud where it counts — counters,
+    // quarantine, the System page — and nothing is written either way.
+    if (isPlatformScope(doc.tenantId)) return reject(RESERVED_TENANT_MESSAGE);
 
     const spec = registry[name];
     // unregistered names quarantine rather than throw — the caller may be a

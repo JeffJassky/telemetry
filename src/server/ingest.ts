@@ -1,6 +1,6 @@
 import express from 'express';
 import type { NextFunction, Request, Response, Router } from 'express';
-import { TelemetryKind, plain } from './types.js';
+import { TelemetryKind, RESERVED_TENANT_MESSAGE, isPlatformScope, plain } from './types.js';
 import { KeyKind, TenantMode, parseKeyString, verifySecret } from './keys.js';
 import { recordRollup } from './rollups.js';
 import type { Telemetry } from './index.js';
@@ -205,6 +205,20 @@ export function createIngest(opts: CreateIngestOptions): Router {
         ctx = { tenantId: claimed };
       }
       const tenantId = ctx.tenantId;
+
+      // ── the reserved token, checked ONCE, after resolution ──
+      // Deliberately here and not in the `claimed` branch: all three paths mint
+      // a tenantId from outside the package. `claimed` is the payload asserting
+      // one, `session` is a host adapter that could compute one, and `fixed`
+      // reads a key doc that may predate createKey()'s guard. A claim is not a
+      // fact — and '*' is not even a tenant. pk_ never 4xxes (traps §19), so it
+      // drops and counts; sk_ callers are programmers and are told why.
+      if (isPlatformScope(tenantId)) {
+        logger.warn(`[telemetry] ingest refused a batch: ${RESERVED_TENANT_MESSAGE}`);
+        t.counters.rejected += records.length;
+        rejected += records.length;
+        return pk ? respond() : res.status(400).json({ error: 'reserved_tenant' });
+      }
 
       // server computes the skew; client timestamps lie (schema §9 fix)
       const sentAt = body.sentAt ? Date.parse(body.sentAt) : NaN;

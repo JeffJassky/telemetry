@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Collection, Model } from 'mongoose';
-import { TelemetryKind, type EntityRef } from './types.js';
+import { TelemetryKind, RESERVED_TENANT_MESSAGE, isPlatformScope, type EntityRef } from './types.js';
 
 /**
  * Erasure, actually implemented (schema §4.7). Covers subjects, actor,
@@ -37,6 +37,11 @@ export function createForget(ctx: ForgetCtx) {
 
   return async function forget(tenantId: string, ref: EntityRef): Promise<ForgetResult> {
     const { TelemetryModel, RollupModel } = ctx;
+    // No '*' here, and deliberately NOT as "erase across every tenant": erasure
+    // deletes and rewrites rows, so a scope that matched everything would make
+    // one typo unbounded. A platform-wide erasure is N tenant-scoped calls, and
+    // the caller has to name each one. Throws — forget() is always awaited.
+    if (isPlatformScope(tenantId)) throw new Error(RESERVED_TENANT_MESSAGE);
     const [type, rawId] = ref.split(':') as [string, string];
     if (!type || !rawId) throw new Error(`telemetry: forget ref "${ref}" is not "type:id"`);
     const newId = pseudoId(ref);
