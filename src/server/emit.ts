@@ -14,9 +14,12 @@ import { recordRollup, resolveDim } from './rollups.js';
  *   2. Evidence plane — the raw row. Subject to sampling and the burst cap.
  *
  * Sampling and capping are decisions about storing evidence, not about whether
- * the thing happened — so they must never bend an aggregate. Usage is the one
- * inversion: its rollups run AFTER the durable write, because the idempotency
- * dedupe must also gate aggregation (a retried usage row is the same money).
+ * the thing happened — so they must never bend an aggregate. Two inversions
+ * exist, and both are the same rule: when the INSERT is the dedupe, the insert
+ * must gate aggregation too. `kind=usage` (unique idempotencyKey) and any
+ * record carrying a `dedupeKey` therefore save first and roll up after — a
+ * retried usage row is the same money, and a redelivered webhook is the same
+ * event. Idempotency that still lets rollups run twice does not fix the bug.
  */
 
 export interface EmitCtx {
@@ -37,7 +40,30 @@ export interface EmitInput {
   metrics?: Record<string, number>;
   /** keep despite sampling — set automatically for money/errors */
   forceKeep?: boolean;
+  /**
+   * Caller idempotency for event/state/span/error. Trusted SERVER callers only
+   * — the wire path dedupes on the client `_id` instead. Deterministic per
+   * logical occurrence, e.g. `stripe:${event.id}` or `lifecycle:${accountId}:${day}`.
+   */
+  dedupeKey?: string;
+  /** await the write with {w:'majority', j:true} and rethrow — overrides EventSpec.durable */
+  durable?: boolean;
   [k: string]: unknown;
+}
+
+/** What emit() did. `Promise<void>` could not distinguish "written" from "queued". */
+export interface EmitResult {
+  /** the record _id — usable for correlation even when the row was not stored */
+  id: string;
+  /**
+   * written  — durably in Mongo, awaited
+   * queued   — validated and aggregated; the save is in flight, t.flush() awaits it
+   * deduped  — dedupeKey already present: nothing written, nothing aggregated
+   * sampled  — evidence plane declined; aggregates were still updated
+   * capped   — burst cap declined; aggregates were still updated
+   * rejected — unregistered or failed validation; quarantined in the rejects collection
+   */
+  outcome: 'written' | 'queued' | 'deduped' | 'sampled' | 'capped' | 'rejected';
 }
 
 export function createEmitter(ctx: EmitCtx) {
@@ -56,31 +82,54 @@ export function createEmitter(ctx: EmitCtx) {
     return ++b.n <= maxPerMinute;
   };
 
-  return async function emit(name: string, doc: EmitInput): Promise<void> {
-    const spec = registry[name];
-    if (!spec) {
-      // unregistered names quarantine rather than throw — the caller may be a
-      // stale client; the operator finds it in rejects + counters
+  return async function emit(name: string, doc: EmitInput): Promise<EmitResult> {
+    // minted up front so every return path — including the ones that store
+    // nothing — can hand the caller an id to correlate on
+    const id = newId();
+
+    /** quarantine + count, without the document (nothing is hydrated yet) */
+    const reject = (reason: string): EmitResult => {
       counters.rejected++;
       ctx.track(
-        rejects()
-          .insertOne({ at: new Date(), name, reason: 'unregistered event', raw: plain(doc) })
-          .catch(() => {}),
+        rejects().insertOne({ at: new Date(), name, reason, raw: plain(doc) }).catch(() => {}),
       );
-      return;
+      return { id, outcome: 'rejected' };
+    };
+
+    const spec = registry[name];
+    // unregistered names quarantine rather than throw — the caller may be a
+    // stale client; the operator finds it in rejects + counters
+    if (!spec) return reject('unregistered event');
+
+    const dedupeKey = doc.dedupeKey;
+    if (dedupeKey !== undefined && (typeof dedupeKey !== 'string' || !dedupeKey || dedupeKey.length > 200)) {
+      return reject('dedupeKey must be a non-empty string of at most 200 chars');
     }
+
     const kind = spec.kind;
     const baseRate = spec.sampleRate ?? SAMPLE_RATE[kind];
 
-    // a span carrying money or an error must survive, or the usage→span join dangles
+    // A span carrying money or an error must survive, or the usage→span join
+    // dangles. A record with a dedupeKey must survive for a subtler reason: its
+    // AGGREGATION is gated on its own insert (below), so sampling or capping the
+    // evidence away would take the rollup with it — the aggregate would silently
+    // lose the record instead of merely losing the row. dedupeKey therefore
+    // implies forced: never sampled, never burst-capped.
     const forced =
       !!doc.forceKeep ||
       kind === TelemetryKind.Usage ||
       !!doc.error ||
+      dedupeKey != null ||
       (doc.metrics as any)?.cost_usd != null;
 
+    // per-call override beats the spec; usage is durable either way
+    const durable = kind === TelemetryKind.Usage || (doc.durable ?? spec.durable ?? false);
+
     const Model = byKind[kind];
-    const { forceKeep: _drop, ...rest } = doc;
+    // `durable` is a routing instruction, not data — destructured out the same
+    // way forceKeep is, so it never lands on the document. `dedupeKey` is NOT:
+    // it is a stored, indexed field and rides through in `rest`.
+    const { forceKeep: _drop, durable: _durable, ...rest } = doc;
 
     // `...rest` FIRST. Spreading it last would let a caller override `forced`,
     // `sampleRate`, `name`, or `_id` — and a cost-bearing span passed
@@ -91,7 +140,7 @@ export function createEmitter(ctx: EmitCtx) {
       new Map(Object.entries(o ?? {}).map(([k, v]) => [k.replace(/\./g, '_'), v]));
     const payload = {
       ...rest,
-      _id: newId(),
+      _id: id,
       name,
       sampleRate: forced ? 1 : baseRate,
       forced,
@@ -117,7 +166,7 @@ export function createEmitter(ctx: EmitCtx) {
     } catch (e) {
       await onFail(e);
       if (kind === TelemetryKind.Usage) throw e; // caller must know
-      return;
+      return { id, outcome: 'rejected' };
     }
 
     const rollup = () => {
@@ -126,18 +175,32 @@ export function createEmitter(ctx: EmitCtx) {
       }
     };
 
-    // Usage: durable first, rollup after — the idempotency dedupe must gate
-    // aggregation, or a retried usage row counts the same money twice.
-    if (kind === TelemetryKind.Usage) {
+    // hook already ran; skip the re-validate on save
+    const saveOpts = {
+      validateBeforeSave: false,
+      ...(durable ? { writeConcern: { w: 'majority', j: true } } : {}),
+    } as any;
+
+    // ── insert-gated: the write IS the dedupe, so it must precede the rollup ──
+    // Usage (unique idempotencyKey) and any record with a dedupeKey. A
+    // duplicate returns having aggregated NOTHING; that is the entire point.
+    // The save is awaited here whether or not `durable` was asked for — gating
+    // requires it — so the outcome is 'written', never 'queued'; `durable` adds
+    // the write concern and the rethrow on top.
+    if (kind === TelemetryKind.Usage || dedupeKey != null) {
       try {
-        await d.save({ writeConcern: { w: 'majority', j: true } } as any); // durable. money.
-        rollup();
+        await d.save(saveOpts);
       } catch (e: any) {
-        if (isDuplicateKey(e)) return; // dedupe working — no re-count
+        if (isDuplicateKey(e)) {
+          counters.deduped++; // dedupe working — no row, no re-count
+          return { id, outcome: 'deduped' };
+        }
         await onFail(e);
-        throw e;
+        if (durable) throw e; // money, and anything else the caller chose to await
+        return { id, outcome: 'rejected' };
       }
-      return;
+      rollup();
+      return { id, outcome: 'written' };
     }
 
     // ── aggregate plane: unconditional ──
@@ -146,7 +209,7 @@ export function createEmitter(ctx: EmitCtx) {
     // ── evidence plane: sampling verdict, then burst cap ──
     if (!forced && !traceKeep(doc.traceId as string | undefined, baseRate)) {
       counters.sampled++;
-      return;
+      return { id, outcome: 'sampled' };
     }
 
     // Cost-bearing records are exempt from the cap — the usage→span join
@@ -156,13 +219,27 @@ export function createEmitter(ctx: EmitCtx) {
       const v = burst.key ? resolveDim(burst.key, d) : '';
       if (!burstAllow(`${doc.tenantId}|${name}|${v ?? ''}`, burst.maxPerMinute)) {
         counters.capped++;
-        return;
+        return { id, outcome: 'capped' };
       }
     }
 
-    // hook already ran; skip the re-validate on save. Fire-and-forget, but
-    // never silent — failures quarantine, and t.flush() awaits stragglers.
-    ctx.track(d.save({ validateBeforeSave: false }).catch(onFail));
+    // Declared durable: await the row and rethrow, so a host whose cost ledger
+    // is a span can await THIS write instead of t.flush(), which drains every
+    // in-flight write globally and serializes a busy worker.
+    if (durable) {
+      try {
+        await d.save(saveOpts);
+      } catch (e) {
+        await onFail(e);
+        throw e;
+      }
+      return { id, outcome: 'written' };
+    }
+
+    // Fire-and-forget, but never silent — failures quarantine, and t.flush()
+    // awaits stragglers.
+    ctx.track(d.save(saveOpts).catch(onFail));
+    return { id, outcome: 'queued' };
   };
 }
 

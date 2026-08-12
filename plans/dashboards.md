@@ -187,7 +187,7 @@ the registry change itself.
 | **Events** | explore: series + breakdown + table |
 | **Journeys** | funnels, retention, activity (RollupExplorer) + subject lookup → Journey view |
 | **Usage** | spend tiles, per-meter series, `billedTo` breakdown |
-| **System** | quarantine browser, `telemetryCounters` (rejected/capped/sampled/rollupSkipped), index budget vs 64-cap, key list + revoke. This page is where "never drop silently" becomes visible — it is not optional |
+| **System** | quarantine browser, `telemetryCounters` (rejected/capped/sampled/rollupSkipped/deduped/truncated), index budget vs 64-cap, key list + revoke. This page is where "never drop silently" becomes visible — it is not optional |
 
 ---
 

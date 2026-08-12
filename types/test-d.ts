@@ -9,9 +9,11 @@
 import { z } from 'zod';
 import type {
   Checkpoint,
+  ClientContext,
   CreateTelemetryConfig,
   DimSource,
   EmitInput,
+  EmitResult,
   EntityRef,
   EventSpec,
   ForgetResult,
@@ -32,6 +34,7 @@ import {
   traceKeep,
   truncate,
   validateRegistry,
+  BODY_MAX_CHARS,
   INDEX_BUDGET,
   RETENTION_DAYS,
   SAMPLE_RATE,
@@ -61,14 +64,27 @@ const registry = defineRegistry({
     data: boundedMeta(),
     indexedMetrics: ['cost_usd'],
     retentionDays: 400,
-    rollups: [{ as: 'llm_cost', by: ['attr:gen_ai_request_model', 'attr:feature'], bucket: 'day', sum: ['cost_usd'] }],
+    durable: true,
+    rollups: [{
+      as: 'llm_cost',
+      by: ['attr:gen_ai_request_model', 'attr:feature'],
+      bucket: 'day',
+      sum: ['cost_usd'],
+      dimDefault: 'none',
+    }],
     description: 'Single model call',
   },
 });
 
 declare const mongooseish: CreateTelemetryConfig['connection'];
 
-const t = createTelemetry({ registry, connection: mongooseish, pepper: 'p' });
+const t = createTelemetry({
+  registry,
+  connection: mongooseish,
+  pepper: 'p',
+  platforms: ['watchos'], // EXTENDS the builtins; 'web' still validates
+  bodyMax: 4096,
+});
 
 // ── emit is typed against the registry ──
 async function writes() {
@@ -79,13 +95,33 @@ async function writes() {
     attrs: { source: 'ads', plan: 'pro' },
   });
 
-  await t.emit('llm.completion', {
+  // the durability contract is in the return type — 'written' vs 'queued'
+  const queued: EmitResult = await t.emit('llm.completion', {
     tenantId: 'acc_9',
     subjects: [{ type: 'org', id: 'o_9' }],
     traceId: 'tr_1', spanId: 's_1', durationMs: 1900,
     attrs: { gen_ai_request_model: 'claude-opus-5', feature: 'chat' },
     metrics: { tokens_in: 1, tokens_out: 1, cost_usd: 0.04 },
   });
+  const correlationId: string = queued.id;
+  if (queued.outcome === 'deduped') void correlationId;
+
+  // idempotent + awaited, per call
+  const { outcome } = await t.emit('user.signed_up', {
+    tenantId: 'acc_9',
+    subjects: [{ type: 'user', id: 'u_1' }, { type: 'org', id: 'o_9' }],
+    attrs: { source: 'ads', plan: 'pro' },
+    dedupeKey: 'stripe:evt_123',
+    durable: true,
+  });
+  const outcomes: EmitResult['outcome'][] =
+    ['written', 'queued', 'deduped', 'sampled', 'capped', 'rejected'];
+  void outcomes.includes(outcome);
+
+  // the platform union stays open — builtins autocomplete, host additions compile
+  const client: ClientContext = { platform: 'watchos', appVersion: '1.0.0' };
+  const builtin: ClientContext = { platform: 'web', appVersion: '1.0.0' };
+  void client, builtin;
 
   // @ts-expect-error — unknown event name is a compile error, not a silent drop
   await t.emit('user.typo', { tenantId: 'acc_9' });
@@ -116,7 +152,7 @@ async function reads() {
   await t.flush();
 
   const c: TelemetryCounters = t.counters;
-  void (c.rejected + c.defaulted + c.sampled + c.capped + c.rollupSkipped);
+  void (c.rejected + c.defaulted + c.sampled + c.capped + c.rollupSkipped + c.deduped + c.truncated);
 
   t.models.telemetry.find();
   t.models.byKind.usage.countDocuments();
@@ -133,6 +169,7 @@ const day: Date | undefined = truncate(new Date(), 'day');
 const obj: unknown = plain(new Map());
 validateRegistry(registry);
 const budget: number = INDEX_BUDGET;
+const bodyCap: number = BODY_MAX_CHARS;
 const spanDays: number | null = RETENTION_DAYS.span;
 const rate: number = SAMPLE_RATE.usage;
 const v: number = SCHEMA_VERSION;
@@ -264,8 +301,8 @@ async function forgetViews() {
 
 // ── shapes are exported and usable standalone ──
 const dim: DimSource = 'attr:source';
-const roll: RollupSpec = { by: [dim], bucket: 'week', actors: ['user'] };
-const spec: EventSpec = { kind: 'event', origin: 'any', subjects: [], description: 'x' };
+const roll: RollupSpec = { by: [dim], bucket: 'week', actors: ['user'], dimDefault: 'unset' };
+const spec: EventSpec = { kind: 'event', origin: 'any', subjects: [], durable: true, description: 'x' };
 const reg: Registry = { 'a.b': spec };
 const ref: EntityRef = 'user:u_1';
 const kind: TelemetryKind = 'usage';

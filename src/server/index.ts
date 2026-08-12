@@ -1,5 +1,5 @@
 import type { Collection, Connection } from 'mongoose';
-import { newCounters, noopLogger, type EntityRef, type Logger } from './types.js';
+import { RETENTION_DAYS, newCounters, noopLogger, type EntityRef, type Logger } from './types.js';
 import { validateRegistry, type Registry } from './registry.js';
 import { buildTelemetryModels } from './model.js';
 import { buildRollupModel } from './rollups.js';
@@ -13,7 +13,7 @@ export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
 export type { Registry, EventSpec, RollupSpec, DimSource } from './registry.js';
 export {
   TelemetryKind, LogLevel, Env, Origin,
-  RETENTION_DAYS, SAMPLE_RATE, SCHEMA_VERSION,
+  BODY_MAX_CHARS, RETENTION_DAYS, SAMPLE_RATE, SCHEMA_VERSION,
   newId, traceKeep, plain,
 } from './types.js';
 export type { TelemetryCounters, Logger, EntityRef } from './types.js';
@@ -21,7 +21,7 @@ export { INDEX_BUDGET } from './indexes.js';
 export { truncate, resolveDim } from './rollups.js';
 export type { ForgetResult } from './forget.js';
 export type { Checkpoint } from './checkpoint.js';
-export type { EmitInput } from './emit.js';
+export type { EmitInput, EmitResult } from './emit.js';
 export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
 export type { CreateKeyInput, ParsedKey } from './keys.js';
 export { createIngest } from './ingest.js';
@@ -49,6 +49,14 @@ export interface CreateTelemetryConfig {
   modelName?: string;
   /** secret pepper for forget()'s pseudonymous rekeying. Falls back to TELEMETRY_PEPPER. */
   pepper?: string;
+  /**
+   * Host additions to `client.platform`. EXTENDS the builtin list
+   * ['web','electron','ios','android','server','cli'] — a host adding 'watchos'
+   * keeps 'web'.
+   */
+  platforms?: readonly string[];
+  /** override BODY_MAX_CHARS for this instance */
+  bodyMax?: number;
   logger?: Logger;
 }
 
@@ -72,6 +80,24 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   // boot-time contract checks — misconfiguration fails deploy, not dashboards
   validateRegistry(registry);
 
+  // A spec declaring `data` and no retentionDays inherits RETENTION_DAYS[kind],
+  // so evidence a host went out of its way to declare gets a fuse nobody chose
+  // — and `expiresAt` is stamped per row at WRITE time, so it is unrecoverable
+  // after the fact. Warn once at boot. An explicit retentionDays (including
+  // `null` for immortal) is a choice and silences this; the warning is about
+  // the host not having made one.
+  for (const [name, spec] of Object.entries(registry)) {
+    if (!spec.data) continue;
+    if (Object.prototype.hasOwnProperty.call(spec, 'retentionDays')) continue;
+    const days = RETENTION_DAYS[spec.kind];
+    if (days == null) continue;
+    logger.warn(
+      `[telemetry] "${name}" declares \`data\` but inherits retentionDays=${days} from kind=${spec.kind} — ` +
+      `its payloads are stamped to expire in ${days} days, and that cannot be undone after the write. ` +
+      `Set an explicit retentionDays (null = immortal) to choose, and to silence this.`,
+    );
+  }
+
   const conn: Connection =
     (config.connection as { connection: Connection }).connection ??
     (config.connection as Connection);
@@ -79,6 +105,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   const counters = newCounters();
   const { TelemetryModel, byKind } = buildTelemetryModels({
     connection: conn, registry, counters, modelName, collection,
+    platforms: config.platforms, bodyMax: config.bodyMax,
   });
   const RollupModel = buildRollupModel(conn, `${modelName}Rollup`, `${collection}_rollups`);
   const CheckpointModel = buildCheckpointModel(conn, `${modelName}Checkpoint`, `${collection}_checkpoints`);

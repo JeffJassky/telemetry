@@ -49,6 +49,31 @@ describe('registry validation', () => {
     ).toThrow(/ghost/);
   });
 
+  it('rejects a dimDefault containing "|" or "=" — either character corrupts the rollup _id itself', () => {
+    // dims are `label=value` and the _id joins them on `|`
+    expect(() =>
+      validateRegistry({ a: { ...base, rollups: [{ by: ['attr:x'], dimDefault: 'a|b' }] } }),
+    ).toThrow(/dimDefault/);
+    expect(() =>
+      validateRegistry({ a: { ...base, rollups: [{ by: ['attr:x'], dimDefault: 'k=v' }] } }),
+    ).toThrow(/dimDefault/);
+  });
+
+  it('rejects an empty dimDefault — an unnamed bucket is the null bucket it exists to replace', () => {
+    expect(() =>
+      validateRegistry({ a: { ...base, rollups: [{ by: ['attr:x'], dimDefault: '' }] } }),
+    ).toThrow(/dimDefault/);
+  });
+
+  it('dimDefault does not split a rollup family — it changes the bucket, never what a position means', () => {
+    expect(() =>
+      validateRegistry({
+        a: { ...base, rollups: [{ as: 'fam', by: ['attr:x'], dimDefault: 'none' }] },
+        b: { ...base, rollups: [{ as: 'fam', by: ['attr:x'] }] },
+      }),
+    ).not.toThrow();
+  });
+
   it('rejects a sampleRate outside (0, 1]', () => {
     expect(() => validateRegistry({ a: { ...base, sampleRate: 0 } })).toThrow(/sampleRate/);
     expect(() => validateRegistry({ a: { ...base, sampleRate: 1.5 } })).toThrow(/sampleRate/);

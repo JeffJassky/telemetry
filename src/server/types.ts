@@ -61,6 +61,14 @@ export const SAMPLE_RATE: Record<TelemetryKind, number> = {
 export const REJECT_TTL_DAYS = 30;
 export const SCHEMA_VERSION = 2;
 
+/**
+ * `body` is the only unbounded field on the envelope, and it feeds Mongo's
+ * 16 MB document ceiling. Every other bound in the package is stated and
+ * enforced (boundedMeta 4 KB, batch 512 KB / 100 records, index budget 24), so
+ * this one is too. Override per instance with CreateTelemetryConfig.bodyMax.
+ */
+export const BODY_MAX_CHARS = 16_384;
+
 /** surfaced via t.counters so drops are never silent */
 export interface TelemetryCounters {
   rejected: number;
@@ -68,10 +76,15 @@ export interface TelemetryCounters {
   sampled: number;
   capped: number;
   rollupSkipped: number;
+  /** an insert-gated write whose dedupeKey (or usage.idempotencyKey) already existed */
+  deduped: number;
+  /** a `body` clipped to bodyMax — the row survives, marked */
+  truncated: number;
 }
 
 export const newCounters = (): TelemetryCounters => ({
   rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0,
+  deduped: 0, truncated: 0,
 });
 
 /**

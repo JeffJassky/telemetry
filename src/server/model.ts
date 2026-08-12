@@ -1,7 +1,7 @@
 import { Schema, type Connection, type Model } from 'mongoose';
 import {
   TelemetryKind, LogLevel, Env, Origin,
-  RETENTION_DAYS, SCHEMA_VERSION, UNKNOWN, newId,
+  BODY_MAX_CHARS, RETENTION_DAYS, SCHEMA_VERSION, UNKNOWN, newId,
   type TelemetryCounters,
 } from './types.js';
 import type { Registry } from './registry.js';
@@ -23,9 +23,22 @@ const SubjectRefSchema = new Schema(
   { _id: false },
 );
 
-const ClientContextSchema = new Schema(
+/**
+ * The platforms this package ships knowing about. A host may EXTEND the list
+ * (CreateTelemetryConfig.platforms) but never replace it — a host adding
+ * 'watchos' must not lose 'web'.
+ */
+export const BUILTIN_PLATFORMS = ['web', 'electron', 'ios', 'android', 'server', 'cli'] as const;
+
+/**
+ * A factory, not a module-level const, because the enum varies per instance.
+ * Everything else in the envelope is open on purpose (`name`, `feature`,
+ * `attrs`); a closed platform enum was the one place a host had to lie.
+ */
+const buildClientContextSchema = (platforms: readonly string[]) =>
+  new Schema(
   {
-    platform: { type: String, required: true, enum: ['web', 'electron', 'ios', 'android', 'server', 'cli'] },
+    platform: { type: String, required: true, enum: platforms },
     appVersion: { type: String, required: true },
     userAgent: String,
     os: String,
@@ -45,7 +58,7 @@ const ClientContextSchema = new Schema(
     clockSkewMs: Number,
   },
   { _id: false },
-);
+  );
 
 const StackFrameSchema = new Schema(
   {
@@ -108,7 +121,12 @@ const UsageDetailSchema = new Schema(
 
 // ── base schema ─────────────────────────────────────────────────────────────
 
-function buildBaseSchema(collection: string, registry: Registry, counters: TelemetryCounters) {
+function buildBaseSchema(
+  collection: string,
+  registry: Registry,
+  counters: TelemetryCounters,
+  opts: { platforms: readonly string[]; bodyMax: number },
+) {
   const schema = new Schema(
     {
       /** UUIDv7 — sortable, insertion-local, replaces the ObjectId */
@@ -142,7 +160,19 @@ function buildBaseSchema(collection: string, registry: Registry, counters: Telem
 
       origin: { type: String, enum: Object.values(Origin), default: Origin.Server },
       /** required for client-origin events (enforced by the registry hook, not the schema) */
-      client: ClientContextSchema,
+      client: buildClientContextSchema(opts.platforms),
+
+      /**
+       * Caller-supplied idempotency for the four non-usage kinds — a Stripe
+       * webhook redelivery, a nightly lifecycle diff, a bridge that rewinds its
+       * watermark by design. Trusted server callers only; the wire dedupes on
+       * the client `_id` instead.
+       *
+       * Deliberately NOT an `_id` passthrough: `_id` is a UUIDv7 and doubles as
+       * insertion order (§2.6), so letting a caller supply an arbitrary string
+       * would break that invariant for every reader that sorts on it.
+       */
+      dedupeKey: String,
 
       // ── correlation ──
       traceId: String,
@@ -195,6 +225,13 @@ function buildBaseSchema(collection: string, registry: Registry, counters: Telem
     { expiresAt: 1 },
     { expireAfterSeconds: 0, partialFilterExpression: { expiresAt: { $exists: true } } },
   );
+  // caller idempotency, tenant-scoped. The partial filter is load-bearing for
+  // exactly the reason it is on usage.idempotencyKey (ops rule 4): without it
+  // every record WITHOUT a dedupeKey indexes null and the second one collides.
+  schema.index(
+    { tenantId: 1, dedupeKey: 1 },
+    { unique: true, partialFilterExpression: { dedupeKey: { $exists: true } } },
+  );
 
   schema.pre('validate', function (this: any) {
     this._id ??= newId();
@@ -203,6 +240,22 @@ function buildBaseSchema(collection: string, registry: Registry, counters: Telem
 
     this.attrs = sanitize(this.attrs);
     this.metrics = sanitize(this.metrics);
+
+    // `body` is the sole unbounded field feeding the 16 MB document limit.
+    // Enforced HERE rather than in emit() so every write path is covered —
+    // emit, ingest, and direct model use alike.
+    //
+    // This deliberately DIVERGES from boundedMeta's drop-never-truncate
+    // doctrine, and the difference is the data, not the mood: `data` is
+    // structured evidence where a partial object is a lie about what the caller
+    // sent, whereas `body` is prose/log text where a marked prefix is strictly
+    // more useful than nothing. The marker is visible so no reader mistakes the
+    // prefix for the whole.
+    if (typeof this.body === 'string' && this.body.length > opts.bodyMax) {
+      const dropped = this.body.length - opts.bodyMax;
+      this.body = `${this.body.slice(0, opts.bodyMax)}… [truncated ${dropped} chars]`;
+      counters.truncated++;
+    }
 
     // ── derived identity arrays ──
     const refs: string[] = (this.subjects ?? []).map((s: any) => `${s.type}:${s.id}`);
@@ -310,8 +363,13 @@ export function buildTelemetryModels(opts: {
   counters: TelemetryCounters;
   modelName: string;
   collection: string;
+  /** host additions to the builtin platform enum — union, never replacement */
+  platforms?: readonly string[];
+  bodyMax?: number;
 }): TelemetryModels {
   const { connection, registry, counters, modelName, collection } = opts;
+  const platforms = [...new Set([...BUILTIN_PLATFORMS, ...(opts.platforms ?? [])])];
+  const bodyMax = opts.bodyMax ?? BODY_MAX_CHARS;
 
   const existing = connection.models?.[modelName];
   if (existing) {
@@ -323,7 +381,7 @@ export function buildTelemetryModels(opts: {
     };
   }
 
-  const base = buildBaseSchema(collection, registry, counters);
+  const base = buildBaseSchema(collection, registry, counters, { platforms, bodyMax });
   const TelemetryModel = connection.model(modelName, base);
 
   const disc = (kind: TelemetryKind, build: () => Schema) =>

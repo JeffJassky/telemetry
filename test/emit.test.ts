@@ -121,6 +121,7 @@ describe('emit — the two planes', () => {
     const spend = await t.models.rollups.findOne({ as: 'spend' }).lean() as any;
     expect(spend.count).toBe(1); // counted once — the whole point of the inversion
     expect(spend.sums.cost_usd).toBeCloseTo(0.05);
+    expect(t.counters.deduped).toBe(2); // the replays are visible, not silent
   });
 
   it('an INVALID usage row throws to the caller — money failures are never fire-and-forget', async () => {
@@ -148,6 +149,172 @@ describe('emit — the two planes', () => {
     await t.flush();
     expect(await t.models.telemetry.countDocuments({ name: 'report.shared' })).toBe(25);
     expect(await t.models.rollups.countDocuments({ as: 'report.shared' })).toBe(25);
+  });
+
+  it('a redelivered dedupeKey writes ONE row and leaves the rollup count at 1 — gating the insert must gate aggregation', async () => {
+    // the whole point of B1: a test that only counted rows would pass while the
+    // real bug — a webhook redelivery inflating every aggregate — survived
+    const t = buildTelemetry();
+    await t.syncIndexes(); // the unique partial index must exist before the race
+    const share = {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u1' }],
+      occurredAt: at('2026-07-01T00:00:00Z'), dedupeKey: 'stripe:evt_1',
+    };
+    const first = await t.emit('report.shared', { ...share });
+    const retry = await t.emit('report.shared', { ...share }); // webhook redelivery
+    const replay = await t.emit('report.shared', { ...share }); // bridge rewound its watermark
+    await t.flush();
+
+    expect(first.outcome).toBe('written');
+    expect(retry.outcome).toBe('deduped');
+    expect(replay.outcome).toBe('deduped');
+    expect(await t.models.telemetry.countDocuments({ name: 'report.shared' })).toBe(1);
+    const roll = await t.models.rollups.findOne({ as: 'report.shared' }).lean() as any;
+    expect(roll.count).toBe(1); // NOT 3 — the dup aggregated nothing
+    expect(t.counters.deduped).toBe(2);
+  });
+
+  it('a dedupeKey is tenant-scoped — the same key under another tenant is a different fact', async () => {
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    for (const tenantId of ['tn_a', 'tn_b']) {
+      await t.emit('report.shared', {
+        tenantId, subjects: [{ type: 'user', id: 'u1' }],
+        occurredAt: at('2026-07-01T00:00:00Z'), dedupeKey: 'nightly:2026-07-01',
+      });
+    }
+    await t.flush();
+    expect(await t.models.telemetry.countDocuments({ name: 'report.shared' })).toBe(2);
+  });
+
+  it('a dedupeKey survives sampling — a record whose rollup is gated on its own insert must never be sampled away', async () => {
+    // the subtle half of B1: sampling it would take the aggregate with it,
+    // because the rollup only runs if the insert won
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    const r = await t.emit('sampled.event', {
+      tenantId: 'tn', traceId: DROP_TRACE, dedupeKey: 'lifecycle:acct1:2026-07-01',
+      occurredAt: at('2026-07-01T00:00:00Z'),
+    });
+    await t.flush();
+    expect(r.outcome).toBe('written'); // not 'sampled'
+    const row = await t.models.telemetry.findOne({ name: 'sampled.event' }).lean() as any;
+    expect(row.forced).toBe(true);
+    expect(row.sampleRate).toBe(1);
+    expect(row.dedupeKey).toBe('lifecycle:acct1:2026-07-01');
+    const roll = await t.models.rollups.findOne({ as: 'sampled_family' }).lean() as any;
+    expect(roll.count).toBe(1);
+  });
+
+  it('a malformed dedupeKey is quarantined, never silently ignored — a dropped key is a duplicate row', async () => {
+    const t = buildTelemetry();
+    const bad = async (dedupeKey: unknown) =>
+      (await t.emit('report.shared', {
+        tenantId: 'tn', subjects: [{ type: 'user', id: 'u1' }],
+        occurredAt: at('2026-07-01T00:00:00Z'), dedupeKey,
+      } as any)).outcome;
+    expect(await bad('')).toBe('rejected');
+    expect(await bad('k'.repeat(201))).toBe('rejected');
+    expect(await bad(42)).toBe('rejected');
+    await t.flush();
+    expect(await t.models.telemetry.countDocuments({})).toBe(0);
+    expect(await t.collections.rejects().countDocuments({})).toBe(3);
+  });
+
+  it('a durable span is queryable the instant await returns — no flush(), no global drain', async () => {
+    const t = buildTelemetry();
+    const r = await t.emit('llm.completion', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      traceId: 'tr_1234abcd', spanId: 's1', durationMs: 5,
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { gen_ai_system: 'anthropic', gen_ai_request_model: 'm', feature: 'chat' },
+      metrics: { tokens_in: 1, tokens_out: 1, cost_usd: 0.01 },
+      durable: true,
+    });
+    // deliberately NO flush() — that is the whole complaint durable answers
+    expect(r.outcome).toBe('written');
+    expect(await t.models.telemetry.countDocuments({ name: 'llm.completion' })).toBe(1);
+    await t.flush();
+  });
+
+  it('EventSpec.durable makes it the default for every caller of that name', async () => {
+    const t = buildTelemetry();
+    const r = await t.emit('ledger.charge', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      traceId: 'tr_5678abcd', spanId: 's1', durationMs: 3,
+      occurredAt: at('2026-07-01T00:00:00Z'), metrics: { amount_usd: 12.5 },
+    });
+    expect(r.outcome).toBe('written');
+    expect(await t.models.telemetry.countDocuments({ name: 'ledger.charge' })).toBe(1);
+    await t.flush();
+  });
+
+  it('a durable write that fails reaches the caller — the contract usage always had, now declarable', async () => {
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    const charge = {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      traceId: 'tr_9999abcd', spanId: 's1', durationMs: 3,
+      occurredAt: at('2026-07-01T00:00:00Z'), metrics: { amount_usd: 1 },
+      dedupeKey: 'charge:1',
+    };
+    await t.emit('ledger.charge', charge);
+    // durable + dedupeKey: insert-gating wins on ordering, so a replay is a
+    // clean 'deduped' rather than a throw — dedupe is not a failure
+    expect((await t.emit('ledger.charge', charge)).outcome).toBe('deduped');
+    await t.flush();
+    expect(await t.models.telemetry.countDocuments({ name: 'ledger.charge' })).toBe(1);
+  });
+
+  it('emit() reports what actually happened — written, queued, deduped, sampled, capped, rejected', async () => {
+    const t = buildTelemetry();
+    await t.syncIndexes();
+    const when = at('2026-07-01T00:00:00Z');
+
+    const written = await t.emit('ledger.charge', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o' }],
+      traceId: 'tr_1111abcd', spanId: 's1', durationMs: 1, occurredAt: when,
+      metrics: { amount_usd: 1 },
+    });
+    const queued = await t.emit('report.shared', {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u1' }], occurredAt: when,
+    });
+    await t.emit('report.shared', {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u2' }], occurredAt: when, dedupeKey: 'dk_1',
+    });
+    const deduped = await t.emit('report.shared', {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u2' }], occurredAt: when, dedupeKey: 'dk_1',
+    });
+    const sampled = await t.emit('sampled.event', { tenantId: 'tn', traceId: DROP_TRACE, occurredAt: when });
+    let capped = { outcome: 'queued' } as { outcome: string };
+    for (let i = 0; i < 61; i++) {
+      capped = await t.emit('error.unhandled', {
+        tenantId: 'tn', occurredAt: when,
+        error: { type: 'E', message: 'storm', handled: false, fingerprint: 'outcomes' },
+      });
+    }
+    const rejected = await t.emit('never.registered' as any, { tenantId: 'tn', occurredAt: when });
+    await t.flush();
+
+    expect(written.outcome).toBe('written');
+    expect(queued.outcome).toBe('queued');
+    expect(deduped.outcome).toBe('deduped');
+    expect(sampled.outcome).toBe('sampled');
+    expect(capped.outcome).toBe('capped');
+    expect(rejected.outcome).toBe('rejected');
+    // the id correlates even when nothing was stored
+    expect(rejected.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await t.models.telemetry.countDocuments({ _id: sampled.id })).toBe(0);
+  });
+
+  it('a queued write is only a promise of a row — flush() is what makes it queryable', async () => {
+    const t = buildTelemetry();
+    const r = await t.emit('report.shared', {
+      tenantId: 'tn', subjects: [{ type: 'user', id: 'u1' }], occurredAt: at('2026-07-01T00:00:00Z'),
+    });
+    expect(r.outcome).toBe('queued');
+    await t.flush();
+    expect(await t.models.telemetry.countDocuments({ _id: r.id })).toBe(1);
   });
 
   it('scoped() pins the tenant on find, aggregate, and rollups — cross-tenant reads are unreachable', async () => {

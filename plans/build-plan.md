@@ -31,6 +31,11 @@ export const REGISTRY = defineRegistry({
   // ── milestones = lifetime subject rollups; firstAt IS the milestone ──
   // once-per-account falls out of the rollup upsert: emitters may fire on
   // every render, count increments, firstAt never moves. No dedupe keys.
+  // (Stage 4 amendment: still true for milestones — the upsert IS the dedupe
+  // there. `EmitInput.dedupeKey` exists for the different problem maxed never
+  // had: an in-process caller with at-least-once delivery — webhook redelivery,
+  // a nightly diff, a bridge rewinding its watermark — where the RAW row would
+  // duplicate too. Milestones need neither.)
   'account.signed_up':   { kind: 'event', origin: 'server', subjects: ['account'],
                            attrs: z.object({ source: z.string().max(64) }),
                            rollups: [{ by: ['subject'], subjects: ['account'], capture: ['attr:source'] },
@@ -93,6 +98,8 @@ Standing user decision; not re-litigated.
 defineRegistry(specs)                      // identity + types; boot validation
 createTelemetry({ registry, db })          // → t
   t.emit(name, doc)                        // write — the only write
+                                           // → { id, outcome } — written | queued | deduped
+                                           //   | sampled | capped | rejected (schema v2.4)
   t.forget(tenantId, ref)                  // erasure: delete/redact/rekey/aliases
   t.scoped(tenantId)                       // → { records, series, distribution, rollups, trace, journey }
   t.checkpoint(key)                        // → { get, advance } — pull-importer watermark
@@ -124,6 +131,11 @@ the noun returned (`records`, `series`, `rollups`, `trace`, `journey`). Fits.
 | `EventSpec.retentionDays` | recon smell #4 — maxed has *no* retention; ships v1 (decision closed) |
 | `EventSpec.burst` | maxed `express-rate-limit` keyed on user id (routes/events.ts:58), generalized per-group |
 | `EventSpec.sampleRate` | **unproven — dormant by design** (schema §2.6); ships because it costs one field and rollups are already ordered to survive it |
+| `EventSpec.durable` + `EmitInput.durable` | *Stage 4:* the host whose cost ledger is a span. Its only prior option was `t.flush()`, which drains every in-flight write globally and serializes a busy worker (schema §4.6) |
+| `EmitInput.dedupeKey` | *Stage 4:* Stripe webhook redelivery, a nightly lifecycle diff, a bridge that rewinds its watermark by design — in-process callers with at-least-once delivery, which had no equivalent of usage's `idempotencyKey` or the wire's client `_id` |
+| `RollupSpec.dimDefault` | *Stage 4:* the null-dim drop was the one silent drop left; the fallback bucket is host-named so nothing is invented (schema §4.5) |
+| `createTelemetry.platforms` | *Stage 4:* the closed platform enum was the one place a host had to lie — it EXTENDS the builtins, never replaces them |
+| `createTelemetry.bodyMax` | *Stage 4:* `body` was the sole unbounded field feeding the 16 MB document limit while every other bound was stated (schema §6 Bounds) |
 | key `tenantMode/allowedKinds/allowedNames/origins/maxPerMinute` | maxed's `requireAuth` beacon + allowlist, split into declared trust (instrumentation §2) |
 | `createDashboard.views` | maxed's hardcoded funnel/breakdown pages, as data; user-saved views are the same shape (dashboards §3) |
 | `queryLimits` + `onSlowQuery` | recon smell #5 (in-memory slice) + maxed's query cache — caps go **inside** pipelines; traps §18 |

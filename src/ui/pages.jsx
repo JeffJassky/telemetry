@@ -571,10 +571,12 @@ export function System({ api }) {
   const { counters, quarantine, indexCount, indexBudget, keys, role } = q.data;
   return (
     <>
-      <div className="kpis" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
+      <div className="kpis" style={{ gridTemplateColumns: 'repeat(7, 1fr)' }}>
         <StatTile label="rejected" value={fmtNumber(counters.rejected)} meta="quarantined" />
         <StatTile label="sampled" value={fmtNumber(counters.sampled)} meta="dropped by rate" />
         <StatTile label="capped" value={fmtNumber(counters.capped)} meta="burst/rate caps" />
+        <StatTile label="deduped" value={fmtNumber(counters.deduped)} meta="idempotent replays" />
+        <StatTile label="truncated" value={fmtNumber(counters.truncated)} meta="body over cap" />
         <StatTile label="defaulted" value={fmtNumber(counters.defaulted)} meta="missing service/release" />
         <StatTile label="indexes" value={`${indexCount}`} meta={`payload budget ${indexBudget}`} />
       </div>

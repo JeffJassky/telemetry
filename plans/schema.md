@@ -36,6 +36,25 @@ keys, identity context, SDKs, and packaging are normative in
 > transports use insert-gated rollups (§4.6), and `forget()` deletes alias rows
 > (§4.7). Two collections join the family: `telemetry_keys`, `telemetry_aliases`
 > (defined in instrumentation.md §2, §5). The envelope is unchanged.
+>
+> **Declarable write path (v2.4, one added envelope field):** the four decisions
+> emit() was making on the caller's behalf become declarable.
+> `EmitInput.dedupeKey` gives event/state/span/error the idempotency usage and
+> the wire already had — stored top-level, `{tenantId, dedupeKey}` unique
+> partial, insert-gated like usage, and implying `forced` because a record whose
+> aggregation is gated on its own insert must never be sampled away (§4.3,
+> §4.6). `EventSpec.durable` / `EmitInput.durable` make the usage write contract
+> (`{w:'majority', j:true}`, rethrow) available to any kind, so awaiting one row
+> no longer means `flush()`-ing every in-flight write (§4.6). `emit()` returns
+> `EmitResult { id, outcome }` — `Promise<void>` meant "written" for one kind and
+> "queued" for four (§4.6). `RollupSpec.dimDefault` names the null bucket instead
+> of dropping the record; absent keeps the skip-and-count default, and the
+> subject dim is never defaulted (§4.5). `body` is capped at
+> `BODY_MAX_CHARS` (16 KB, `bodyMax` overrides) and truncated with a visible
+> marker — the one place the drop-never-truncate doctrine correctly inverts
+> (§4.3). `client.platform` becomes host-extensible (§3, §4.3), and `createTelemetry`
+> warns at boot when a spec declaring `data` inherits a finite TTL nobody chose.
+> Two counters join: `deduped`, `truncated`.
 
 ---
 
@@ -269,7 +288,9 @@ durationMs
 attrs           Map<string,string>  STRING VALUES ONLY. registry-validated, indexed on demand
 metrics         Map<string,number>  aggregatable across all kinds
 data            registry-declared object, or NOT STORED
-body            free text
+body            free text, capped at BODY_MAX_CHARS (16KB) and marked when clipped (v2.4)
+dedupeKey       caller idempotency, trusted server callers. {tenantId, dedupeKey} unique
+                partial; insert-gated and implicitly forced (v2.4, §4.6)
 
 sampleRate      1 = kept all. 0.05 = multiply counts by 20
 forced          true = kept despite sampling; exclude from ratios
@@ -342,6 +363,11 @@ export enum LogLevel { Debug = 'debug', Info = 'info', Warn = 'warn', Error = 'e
 export enum Env { Prod = 'prod', Staging = 'staging', Dev = 'dev' }
 export enum Origin { Server = 'server', Client = 'client' }
 export enum Platform { Web = 'web', Electron = 'electron', Ios = 'ios', Android = 'android', Server = 'server' }
+// v2.4: shipped as ['web','electron','ios','android','server','cli'], and the list is a
+// FLOOR, not a ceiling — CreateTelemetryConfig.platforms unions host additions onto it, so
+// ClientContextSchema is built per instance. Everything else in the envelope (name, feature,
+// attrs) is open on purpose; the closed enum was the one place a host had to lie. The public
+// type stays `…builtins… | (string & {})` so the builtins still autocomplete.
 
 export type EntityRef = `${string}:${string}`
 
@@ -603,7 +629,8 @@ const sanitize = <T>(m?: Map<string, T>) =>
   m ? new Map([...m].map(([k, v]) => [safeKey(k), v] as [string, T])) : m
 
 /** surfaced on /metrics so drops are never silent */
-export const telemetryCounters = { rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0 }
+export const telemetryCounters = { rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0,
+                                   deduped: 0, truncated: 0 }   // v2.4
 
 @pre<TelemetryBase>('validate', function () {
   this._id ??= newId()
@@ -637,6 +664,13 @@ export const telemetryCounters = { rejected: 0, defaulted: 0, sampled: 0, capped
 
   // retention: per-event override, else per-kind. undefined -> immune to the TTL index.
   // `in` rather than `??` so an explicit `retentionDays: null` means immortal.
+  //
+  // v2.4: because `expiresAt` is stamped PER ROW here, an inherited TTL is
+  // unrecoverable after the write — you cannot decide next year that the payloads
+  // should have been kept. createTelemetry() therefore warns once at boot for every
+  // spec that declares `data` and inherits a finite RETENTION_DAYS[kind]: declaring
+  // evidence and then defaulting its fuse is the one combination nobody chooses on
+  // purpose. Any explicit retentionDays (including `null`) is a choice, and silences it.
   const days = 'retentionDays' in spec
     ? (spec as any).retentionDays
     : RETENTION_DAYS[this.kind]
@@ -1064,12 +1098,20 @@ export async function recordRollup(doc: any, name: string, spec: RollupSpec) {
   const bucketKey = bucketAt ? bucketAt.toISOString() : ''
 
   // Non-subject dims resolved once. A missing dim means the record cannot be keyed
-  // at all — dropping it into a 'null' bucket would quietly corrupt every group.
+  // at all — dropping it into an IMPLICIT 'null' bucket would quietly corrupt every
+  // group. v2.4: `RollupSpec.dimDefault` lets the host name that bucket explicitly,
+  // which is a different thing — a declared group beats both a silent drop and an
+  // invented null. Absent dimDefault keeps the skip. The subject dim is never
+  // defaulted: a record with no matching subject genuinely cannot be attributed,
+  // and a placeholder ref would be invisible to forget()'s dim rekeying.
   const fixed = new Map<DimSource, string>()
   for (const src of spec.by) {
     if (src === 'subject') continue
-    const v = resolveDim(src, doc)
-    if (v == null || v === '') { telemetryCounters.rollupSkipped++; return }
+    let v = resolveDim(src, doc)
+    if (v == null || v === '') {
+      if (spec.dimDefault === undefined) { telemetryCounters.rollupSkipped++; return }
+      v = spec.dimDefault              // must contain neither '|' nor '=' (boot-checked)
+    }
     fixed.set(src, `${label(src)}=${String(v)}`)
   }
 
@@ -1213,6 +1255,36 @@ first (client-supplied `_id`; duplicate key ⇒ drop, **no rollup**) and
 aggregates after, exactly the usage inversion below generalized. Reversing
 either order double-counts: rollup-first + retries inflates aggregates,
 insert-first + sampling loses them.
+
+*v2.4 — the caller may now declare at-least-once too.* In-process delivery is
+at-most-once only until a Stripe webhook redelivers, a nightly lifecycle diff
+re-runs, or a bridge rewinds its watermark by design; for those callers
+duplicates are guaranteed, not hypothetical. `EmitInput.dedupeKey` (non-empty,
+≤200 chars, trusted server callers only) inverts the plane order per record on
+exactly the usage rule: **await the save first, roll up only if the insert won**.
+A duplicate (11000) returns `outcome: 'deduped'` having aggregated nothing —
+idempotency that still lets rollups run twice does not fix the bug.
+
+Two consequences are non-obvious and load-bearing. **`dedupeKey` implies
+`forced`**: the record's aggregation is gated on its own insert, so sampling or
+capping the evidence away would take the aggregate with it — the row would not
+merely be missing, the *count* would be. And it is `dedupeKey`, **not an `_id`
+passthrough**: `_id` is a UUIDv7 that doubles as insertion order (§2.6), and an
+arbitrary caller string breaks that invariant for every reader that sorts on it.
+
+**Durability is declarable.** `EventSpec.durable`, overridable per call with
+`EmitInput.durable`, awaits `save({ writeConcern: { w:'majority', j:true } })`
+and rethrows — the contract usage has always had. The host whose cost ledger is
+a span previously had only `t.flush()`, which drains ALL in-flight writes
+globally and so serializes a busy worker. `kind=usage` stays durable
+unconditionally. When `durable` and `dedupeKey` both apply, insert-gating wins
+on ordering and durability adds the write concern and the rethrow.
+
+**The return type states which contract you got.** `emit()` returns
+`EmitResult { id, outcome }` where outcome is `written | queued | deduped |
+sampled | capped | rejected`. `Promise<void>` resolved identically for a durably
+stored usage row and a span whose save had not started — one word for two
+contracts, which is the kind of thing that reads as a race in production.
 
 ```ts
 import { TelemetryKind, newId, traceKeep, plain, REJECT_TTL_DAYS } from './telemetry.types'
@@ -1673,17 +1745,19 @@ columnar workload, and the honest answer stays ClickHouse (§8).
 | **Sampling** | default keep-all (small-SaaS scale). When enabled: **per trace** (deterministic on `traceId`), never per record; usage never sampled. `EventSpec.sampleRate` overrides per name |
 | **Aggregates** | rollups run before the sampling verdict and the burst cap — exact at any rate; usage rolls up after its durable, deduped write |
 | **Burst** | `EventSpec.burst` caps RAW rows per resolved key per minute (per-process, approximate); cost-bearing records exempt; overflow counted in `capped` |
-| **Force-keep** | any span with `cost_usd` or an error; stamped `forced:true`, `sampleRate:1` |
-| **Delivery** | analytics fire-and-forget; usage awaited with `{w:'majority', j:true}` |
+| **Force-keep** | any span with `cost_usd` or an error, or any record with a `dedupeKey`; stamped `forced:true`, `sampleRate:1` |
+| **Delivery** | analytics fire-and-forget; usage awaited with `{w:'majority', j:true}`; any name may opt in via `EventSpec.durable` / `EmitInput.durable` |
+| **Idempotency** | usage on `usage.idempotencyKey`; the wire on the client `_id`; any other kind on `EmitInput.dedupeKey`. All three insert-gate their rollups |
 | **Retention** | usage forever, event/state 730d, error/span 90d, rejects 30d. `EventSpec.retentionDays` overrides per name (`null` = immortal) |
 | **Mutability** | usage rows append-only; corrections are new reversing rows (`usage.reverses`) |
 | **Money** | authoritative only as `usage.amount` (Decimal128); `metrics.cost_usd` is a lossy double for aggregation |
 | **Grain** | any dimension a question needs must live on the longest-retained row (or rollup family) that answers it; unbounded / nested / numeric payload goes in `data`, never `attrs` |
+| **Bounds** | `data` 4 KB drop-never-truncate; `body` 16 KB truncate-and-mark (`BODY_MAX_CHARS`); batch 512 KB / 100 records; 24 payload indexes |
 | **Cardinality** | attrs constrained by registry zod schema; ids never in attrs |
 | **Failures** | quarantine collection + counters; nothing disappears into a `.catch()` |
 | **Erasure** | delete sole-party rows, redact shared ones, always redact usage, **rekey** subject-dim rollups |
 
-Eight load-bearing lines:
+Nine load-bearing lines:
 
 1. **`{ w: 'majority', j: true }` on usage.** Everything else is fire-and-forget by
    design; usage is the one path where a dropped write means a wrong invoice.
@@ -1691,9 +1765,11 @@ Eight load-bearing lines:
    invalidates every per-trace aggregate (§2.6).
 3. **Filter `forced: false` before extrapolating counts.** Force-kept rows are
    deliberately unrepresentative.
-4. **`partialFilterExpression` on the unique idempotency index.** Discriminator
-   indexes apply to the whole collection; without the filter, every non-usage doc
-   has `usage.idempotencyKey: null` and the second one collides.
+4. **`partialFilterExpression` on every unique index.** Discriminator indexes
+   apply to the whole collection; without the filter, every non-usage doc has
+   `usage.idempotencyKey: null` and the second one collides. Identical reasoning,
+   identical filter, on `{tenantId, dedupeKey}` — every record without a
+   dedupeKey would otherwise index null and the second one would collide.
 5. **No schema `default:` on any field the validate hook also fills.** Mongoose
    applies defaults at construction, so the hook's branch becomes dead code —
    which is how dev traffic gets stamped `prod` and a drop counter reads zero
@@ -1703,9 +1779,16 @@ Eight load-bearing lines:
 7. **One `as` family, one shape, one subject class.** `validateRollupSpecs()`
    rejects mixed `by` shapes at boot; mixed subject types produce the null-join
    inflation in §5.4. Split families instead of filtering around it.
-8. **Aggregate before you drop.** Rollups run before the sampling verdict and the
-   burst cap (§4.6). Reordering that — "optimizing" the sampled path to skip
-   rollups — silently changes every dashboard the moment a rate drops below 1.
+8. **Aggregate before you drop — unless the insert is the dedupe.** Rollups run
+   before the sampling verdict and the burst cap (§4.6). Reordering that —
+   "optimizing" the sampled path to skip rollups — silently changes every
+   dashboard the moment a rate drops below 1. The three insert-gated paths
+   (usage, the wire, `dedupeKey`) invert deliberately, and pay for it by forcing
+   the record past sampling so the gate can never eat an aggregate.
+9. **`body` truncates; `data` does not.** The divergence is the data, not the
+   mood: a partial `data` object is a lie about what the caller sent, while a
+   marked `body` prefix is strictly more useful than nothing. Any new bounded
+   field has to answer which of the two it is.
 
 ---
 

@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import mongoose from 'mongoose';
+import { boundedMeta, createTelemetry, BODY_MAX_CHARS } from '../src/server/index.js';
 import { CLIENT, at, buildTelemetry, startDb, stopDb } from './helpers.js';
 
 /**
@@ -173,10 +175,84 @@ describe('envelope', () => {
     const t = buildTelemetry();
     await expect(
       t.emit('typo.event' as any, { tenantId: 'a', occurredAt: at('2026-07-01T00:00:00Z') }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ outcome: 'rejected' });
     await t.flush();
     const rej = await t.collections.rejects().findOne({ name: 'typo.event' }) as any;
     expect(rej.reason).toMatch(/unregistered/);
+  });
+
+  it('truncates a body over the cap and MARKS it — prose is not evidence, so a prefix beats nothing', async () => {
+    // the deliberate divergence from boundedMeta's drop-never-truncate: a
+    // partial `data` object is a lie about what the caller sent, a marked log
+    // prefix is not
+    const t = buildTelemetry({ bodyMax: 64 });
+    await t.emit('report.shared', {
+      tenantId: 'a', subjects: [{ type: 'user', id: 'u' }],
+      occurredAt: at('2026-07-01T00:00:00Z'), body: 'x'.repeat(200),
+    });
+    await t.flush();
+    const row = await t.models.telemetry.findOne({}).lean() as any;
+    expect(row.body.startsWith('x'.repeat(64))).toBe(true);
+    expect(row.body).toContain('… [truncated 136 chars]'); // visible, countable, honest
+    expect(t.counters.truncated).toBe(1);
+  });
+
+  it('leaves a body under the cap untouched and uncounted — BODY_MAX_CHARS is the default bound', async () => {
+    const t = buildTelemetry();
+    const body = 'y'.repeat(BODY_MAX_CHARS);
+    await t.emit('report.shared', {
+      tenantId: 'a', subjects: [{ type: 'user', id: 'u' }],
+      occurredAt: at('2026-07-01T00:00:00Z'), body,
+    });
+    await t.flush();
+    const row = await t.models.telemetry.findOne({}).lean() as any;
+    expect(row.body).toBe(body);
+    expect(t.counters.truncated).toBe(0);
+  });
+
+  it('accepts a host-declared platform and still rejects an undeclared one — the enum extends, never replaces', async () => {
+    const t = buildTelemetry({ platforms: ['watchos'] });
+    const ping = (platform: string) => ({
+      tenantId: 'a', occurredAt: at('2026-07-01T00:00:00Z'),
+      client: { platform, appVersion: '1.0.0' },
+    });
+    await t.emit('app.ping', ping('watchos') as any);
+    await t.emit('app.ping', ping('web') as any); // the builtins survive the extension
+    await t.emit('app.ping', ping('palmos') as any); // undeclared — still a reject
+    await t.flush();
+
+    const platforms = (await t.models.telemetry.find({}).lean() as any[]).map((r) => r.client.platform);
+    expect(platforms.sort()).toEqual(['watchos', 'web']);
+    expect(await t.collections.rejects().countDocuments({})).toBe(1);
+  });
+
+  it('warns at boot when a spec declaring `data` inherits a finite TTL — nobody chose that fuse', async () => {
+    const warnings: string[] = [];
+    const logger = { info() {}, warn: (...a: unknown[]) => void warnings.push(a.join(' ')), error() {} };
+    buildTelemetry({ logger });
+    // page.view declares data, sets no retentionDays → inherits event's 730d
+    expect(warnings.some((w) => w.includes('page.view') && w.includes('730'))).toBe(true);
+    // llm.completion declares data AND retentionDays: 400 — a choice, so silence
+    expect(warnings.some((w) => w.includes('llm.completion'))).toBe(false);
+  });
+
+  it('an explicit retentionDays: null silences the boot warning — immortal is a choice too', async () => {
+    const warnings: string[] = [];
+    const id = `imm${Date.now().toString(36)}`;
+    createTelemetry({
+      registry: {
+        'immortal.evidence': {
+          kind: 'event', origin: 'server', subjects: [],
+          data: boundedMeta(), retentionDays: null,
+          description: 'declared immortal on purpose',
+        },
+      },
+      connection: mongoose,
+      modelName: `Telemetry_${id}`,
+      collection: `telemetry_${id}`,
+      logger: { info() {}, warn: (...a: unknown[]) => void warnings.push(a.join(' ')), error() {} },
+    });
+    expect(warnings).toHaveLength(0);
   });
 
   it('records receivedAt via timestamps so the occurredAt↔receivedAt gap is measurable', async () => {

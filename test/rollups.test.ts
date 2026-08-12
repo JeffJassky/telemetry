@@ -130,6 +130,28 @@ describe('rollups — one primitive, four jobs', () => {
     expect(roll.count).toBe(1); // the dimless record never contaminated the group
   });
 
+  it('dimDefault puts the null-dim record in the NAMED bucket — the drop becomes a group you can query', async () => {
+    // S2: silent-drop-on-null is the failure class this package refuses
+    // everywhere else. The host names the bucket; nothing is invented.
+    const t = buildTelemetry();
+    await t.emit('dim.defaulted', { tenantId: 'tn', occurredAt: at('2026-07-01T00:00:00Z') });
+    await t.emit('dim.defaulted', {
+      tenantId: 'tn', occurredAt: at('2026-07-01T01:00:00Z'), attrs: { group: 'g1' },
+    });
+    await t.flush();
+
+    const rows = await t.models.rollups.find({ as: 'dim_defaulted' }).sort({ _id: 1 }).lean() as any[];
+    expect(rows.map((r) => r.dims[0]).sort()).toEqual(['group=g1', 'group=none']);
+    expect(rows.every((r) => r.count === 1)).toBe(true); // the fallback is its OWN group
+    expect(t.counters.rollupSkipped).toBe(0);
+
+    // and the contrast, on the same instance: no dimDefault still skips + counts
+    await t.emit('dim.probe', { tenantId: 'tn', occurredAt: at('2026-07-01T02:00:00Z') });
+    await t.flush();
+    expect(await t.models.rollups.countDocuments({ as: 'dim_probe' })).toBe(0);
+    expect(t.counters.rollupSkipped).toBe(1);
+  });
+
   it('the day-bucketed activity family writes one doc per subject per day — DAU is a count, MAU a distinct', async () => {
     const t = buildTelemetry();
     const view = (acct: string, iso: string) => ({

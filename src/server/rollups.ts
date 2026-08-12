@@ -110,20 +110,32 @@ export async function recordRollup(
   const bucketAt = truncate(at, spec.bucket);
   const bucketKey = bucketAt ? bucketAt.toISOString() : '';
 
-  // Non-subject dims resolved once. A missing dim means the record cannot be
-  // keyed at all — dropping it into a 'null' bucket would corrupt every group.
+  // Non-subject dims resolved once. Absent a declared fallback, a missing dim
+  // means the record cannot be keyed at all — an implicit 'null' bucket would
+  // silently corrupt every group. `dimDefault` makes that bucket EXPLICIT: the
+  // host names it, so "no value" is a group you can query rather than a drop
+  // you have to notice in a counter.
   const fixed = new Map<DimSource, string>();
   for (const src of spec.by) {
     if (src === 'subject') continue;
-    const v = resolveDim(src, doc);
+    let v = resolveDim(src, doc);
     if (v == null || v === '') {
-      counters.rollupSkipped++;
-      return;
+      if (spec.dimDefault === undefined) {
+        counters.rollupSkipped++;
+        return;
+      }
+      v = spec.dimDefault;
     }
     fixed.set(src, `${label(src)}=${String(v)}`);
   }
 
   // At most one `subject` dim per spec (asserted in validateRegistry).
+  // dimDefault deliberately does NOT apply here: a non-subject dim that is
+  // missing is a record we can still attribute to someone, while a record with
+  // no matching subject cannot be attributed at all. Bucketing it under a
+  // placeholder subject would invent a party that does not exist — and erasure
+  // matches subject dims by their native `type:id` form, so the placeholder
+  // would be unreachable by forget().
   const fansOut = spec.by.includes('subject');
   const refs: (string | null)[] = fansOut
     ? (doc.subjectKeys ?? []).filter(

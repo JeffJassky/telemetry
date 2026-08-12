@@ -8,6 +8,13 @@ let mongod: MongoMemoryServer;
 export async function startDb() {
   mongod = await MongoMemoryServer.create();
   await mongoose.connect(mongod.getUri(), { dbName: 'telemetry-test' });
+  // Force one real round-trip HERE, in the hook. connect() resolving is not the
+  // same as the connection being usable: mongoose buffers operations while it
+  // settles, and across a sequential 10-suite run (each booting its own mongod
+  // on the shared default connection) that buffering landed on whichever test
+  // ran first — a 30s testTimeout failure with nothing to do with the code under
+  // test. The hook has a 60s budget; this is where the wait belongs.
+  await mongoose.connection.db!.admin().ping();
 }
 
 export async function stopDb() {
@@ -138,6 +145,20 @@ export function paperRegistry() {
       attrs: z.object({ group: z.string().optional() }),
       rollups: [{ as: 'dim_probe', by: ['attr:group'] }],
       description: 'Optional-dim probe — a missing dim must skip, never null-bucket',
+    },
+    'dim.defaulted': {
+      kind: 'event', origin: 'server', subjects: [],
+      attrs: z.object({ group: z.string().optional() }),
+      rollups: [{ as: 'dim_defaulted', by: ['attr:group'], dimDefault: 'none' }],
+      description: 'The same probe with an explicit null bucket declared',
+    },
+
+    // ── the host whose cost ledger is a span (build-plan B2) ──
+    'ledger.charge': {
+      kind: 'span', origin: 'server', subjects: ['org'],
+      metrics: z.object({ amount_usd: z.number() }),
+      durable: true,
+      description: 'Declared durable — the caller awaits this row, not every in-flight write',
     },
     'app.ping': {
       kind: 'event', origin: 'client', subjects: [],

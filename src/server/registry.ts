@@ -39,6 +39,14 @@ export interface RollupSpec {
   sum?: readonly string[];
   /** dimension sources snapshotted at FIRST occurrence — cohort dimensions */
   capture?: readonly DimSource[];
+  /**
+   * Bucket name for a non-subject dim that resolves null/empty. Absent keeps
+   * the default: skip the record and count it in `rollupSkipped`. Present makes
+   * "no value" an explicit, queryable group instead of a silent drop.
+   *
+   * The SUBJECT dim is unaffected — see the fan-out comment in rollups.ts.
+   */
+  dimDefault?: string;
   /** rollup TTL. Omit or null = immortal (bucketed rollups usually want a number) */
   retentionDays?: number | null;
 }
@@ -69,6 +77,14 @@ export interface EventSpec {
    * retry loop cannot flood the collection. Omit `key` to cap the name whole.
    */
   burst?: { key?: DimSource; maxPerMinute: number };
+  /**
+   * Await the write with `{w:'majority', j:true}` and rethrow on failure — the
+   * contract usage has always had, now declarable. For the host whose cost
+   * ledger is a span: without it the only way to await was t.flush(), which
+   * drains every in-flight write globally and serializes a busy worker.
+   * kind=usage is durable unconditionally, with or without this flag.
+   */
+  durable?: boolean;
   description: string;
 }
 
@@ -159,11 +175,22 @@ export function validateRegistry(registry: Registry): void {
         fail('rollup uses subject without `subjects`');
       }
       if (r.actors && !r.actors.length) fail('rollup `actors` must be non-empty when present');
+      if (r.dimDefault !== undefined) {
+        // dims are `label=value` and the rollup `_id` joins them on `|`, so
+        // either character in the bucket name corrupts the key itself
+        if (typeof r.dimDefault !== 'string' || !r.dimDefault) {
+          fail('rollup `dimDefault` must be a non-empty string');
+        }
+        if (/[|=]/.test(r.dimDefault)) fail(`rollup dimDefault "${r.dimDefault}" may not contain "|" or "="`);
+      }
 
       const as = r.as ?? name;
       // shape = dims + bucket + subject classes: any mismatch makes docs in one
       // family mean different things at the same array position (or triggers
       // the null-join inflation of schema §5.4), so all three pin per family.
+      // dimDefault is NOT part of the shape — it changes which bucket a record
+      // lands in, never what a position MEANS, so two names may feed one family
+      // with different fallbacks.
       const shape =
         r.by.join(',') + '|' + (r.bucket ?? '') + '|' + [...(r.subjects ?? [])].sort().join(',');
       const seen = shapes.get(as);

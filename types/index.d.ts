@@ -15,6 +15,8 @@ export declare const RETENTION_DAYS: Record<TelemetryKind, number | null>;
 export declare const SAMPLE_RATE: Record<TelemetryKind, number>;
 export declare const SCHEMA_VERSION: number;
 export declare const INDEX_BUDGET: number;
+/** `body` cap in characters (16384). Over it, the value is clipped and marked. */
+export declare const BODY_MAX_CHARS: number;
 
 /** UUIDv7 — sortable, insertion-local. Never substitute crypto.randomUUID (v4). */
 export declare function newId(): string;
@@ -53,6 +55,12 @@ export interface RollupSpec {
   sum?: readonly string[];
   /** dimension sources snapshotted at FIRST occurrence — cohort dimensions */
   capture?: readonly DimSource[];
+  /**
+   * Bucket name for a non-subject dim that resolves null/empty. Absent = skip
+   * the record and count it in `rollupSkipped`. May not contain `|` or `=`.
+   * Never applies to the subject dim.
+   */
+  dimDefault?: string;
   /** rollup TTL. Omit or null = immortal. */
   retentionDays?: number | null;
 }
@@ -76,6 +84,8 @@ export interface EventSpec {
   sampleRate?: number;
   /** cap RAW rows per resolved key per minute; rollups still see every record */
   burst?: { key?: DimSource; maxPerMinute: number };
+  /** await the write with {w:'majority', j:true} and rethrow. usage is durable regardless. */
+  durable?: boolean;
   description: string;
 }
 
@@ -108,7 +118,8 @@ export interface SubjectInput {
 }
 
 export interface ClientContext {
-  platform: 'web' | 'electron' | 'ios' | 'android' | 'server' | 'cli';
+  /** the builtins autocomplete; hosts extend the accepted set via CreateTelemetryConfig.platforms */
+  platform: 'web' | 'electron' | 'ios' | 'android' | 'server' | 'cli' | (string & {});
   appVersion: string;
   userAgent?: string;
   os?: string;
@@ -148,6 +159,15 @@ export interface EmitBase {
   body?: string;
   /** keep despite sampling — set automatically for money/errors */
   forceKeep?: boolean;
+  /**
+   * Caller idempotency for event/state/span/error — trusted SERVER callers
+   * only. Non-empty, ≤200 chars. Implies forceKeep (the record's aggregation is
+   * gated on its own insert) and inverts the plane order: save first, roll up
+   * only if the insert won.
+   */
+  dedupeKey?: string;
+  /** await the write with {w:'majority', j:true} and rethrow — overrides EventSpec.durable */
+  durable?: boolean;
   error?: {
     type: string;
     message: string;
@@ -188,6 +208,25 @@ export interface TelemetryCounters {
   sampled: number;
   capped: number;
   rollupSkipped: number;
+  /** insert-gated writes whose dedupeKey / usage.idempotencyKey already existed */
+  deduped: number;
+  /** `body` values clipped to the cap — the row survives, marked */
+  truncated: number;
+}
+
+/** What emit() did. `Promise<void>` could not distinguish "written" from "queued". */
+export interface EmitResult {
+  /** the record _id — usable for correlation even when the row was not stored */
+  id: string;
+  /**
+   * written  — durably in Mongo, awaited
+   * queued   — validated and aggregated; the save is in flight, t.flush() awaits it
+   * deduped  — dedupeKey already present: nothing written, nothing aggregated
+   * sampled  — evidence plane declined; aggregates were still updated
+   * capped   — burst cap declined; aggregates were still updated
+   * rejected — unregistered or failed validation; quarantined in the rejects collection
+   */
+  outcome: 'written' | 'queued' | 'deduped' | 'sampled' | 'capped' | 'rejected';
 }
 
 export interface Checkpoint {
@@ -222,12 +261,16 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
   modelName?: string;
   /** secret pepper for forget()'s rekeying. Falls back to TELEMETRY_PEPPER. */
   pepper?: string;
+  /** EXTENDS the builtin `client.platform` list — never replaces it */
+  platforms?: readonly string[];
+  /** override BODY_MAX_CHARS for this instance */
+  bodyMax?: number;
   logger?: Logger;
 }
 
 export interface Telemetry<R extends Registry = Registry> {
-  /** write — the only write */
-  emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<void>;
+  /** write — the only write. The result says what actually happened to the row. */
+  emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<EmitResult>;
   /** erasure: delete sole-party rows, redact shared ones, rekey rollups, drop aliases */
   forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>;
   /** tenant scope is not optional — every read goes through here */
