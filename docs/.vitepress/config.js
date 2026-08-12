@@ -38,17 +38,32 @@ export default defineConfig({
           ],
         },
         {
-          text: 'Integrating',
+          text: 'Modelling',
           items: [
-            { text: 'The user adapter', link: '/guide/user-adapter' },
-            { text: 'The UI', link: '/guide/ui' },
+            { text: 'The registry', link: '/guide/registry' },
             { text: 'Data model', link: '/guide/data-model' },
+            { text: 'Rollups', link: '/guide/rollups' },
+          ],
+        },
+        {
+          text: 'Writing',
+          items: [
+            { text: 'Emitting records', link: '/guide/emit' },
+            { text: 'Ingest & keys', link: '/guide/ingest' },
+          ],
+        },
+        {
+          text: 'Reading',
+          items: [
+            { text: 'Queries & funnels', link: '/guide/queries' },
+            { text: 'The dashboard', link: '/guide/dashboard' },
           ],
         },
         {
           text: 'Operating',
           items: [
-            { text: 'Account deletion', link: '/guide/account-deletion' },
+            { text: 'Adapters', link: '/guide/adapters' },
+            { text: 'Erasure', link: '/guide/erasure' },
             { text: 'Testing', link: '/guide/testing' },
           ],
         },
@@ -59,9 +74,7 @@ export default defineConfig({
           items: [
             { text: 'createTelemetry', link: '/reference/factory' },
             { text: 'Routers', link: '/reference/routers' },
-            { text: 'UI routers', link: '/reference/ui-routers' },
-            { text: 'Client', link: '/reference/client' },
-            { text: 'Model factory', link: '/reference/model' },
+            { text: 'Client SDKs', link: '/reference/client' },
           ],
         },
         {
