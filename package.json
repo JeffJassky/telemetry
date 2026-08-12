@@ -1,6 +1,6 @@
 {
   "name": "@jeffjassky/telemetry",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Unified telemetry — product events, errors, traces, state transitions, and billable usage in one Mongo envelope, with typed SDKs and a mountable dashboard.",
   "license": "MIT",
   "author": "Jeff Jassky <jeff@jeffjassky.com>",
