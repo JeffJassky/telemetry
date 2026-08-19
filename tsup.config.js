@@ -23,6 +23,8 @@ export default defineConfig({
     vue: 'src/client/vue.ts',
     electron: 'src/client/electron.ts',
     cli: 'src/client/cli.ts',
+    mcp: 'src/server/mcp.ts',
+    'mcp-sdk': 'src/server/mcp-sdk.ts',
   },
   format: ['esm', 'cjs'],
   sourcemap: true,

@@ -110,7 +110,7 @@ the full suite in CI. `react` and `vue` are optional peers for their client
 entries.
 
 Entry points: `.` (server), `/core`, `/web`, `/react`, `/vue`, `/electron`,
-`/cli`.
+`/cli`, `/mcp` (agent tools), `/mcp/sdk` (official-SDK seam).
 
 ## Try it
 

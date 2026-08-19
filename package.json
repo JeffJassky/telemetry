@@ -1,6 +1,6 @@
 {
   "name": "@jeffjassky/telemetry",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Unified telemetry — product events, errors, traces, state transitions, and billable usage in one Mongo envelope, with typed SDKs and a mountable dashboard.",
   "license": "MIT",
   "author": "Jeff Jassky <jeff@jeffjassky.com>",
@@ -58,6 +58,16 @@
       "types": "./types/cli.d.ts",
       "import": "./dist/cli.js",
       "require": "./dist/cli.cjs"
+    },
+    "./mcp": {
+      "types": "./types/mcp.d.ts",
+      "import": "./dist/mcp.js",
+      "require": "./dist/mcp.cjs"
+    },
+    "./mcp/sdk": {
+      "types": "./types/mcp-sdk.d.ts",
+      "import": "./dist/mcp-sdk.js",
+      "require": "./dist/mcp-sdk.cjs"
     },
     "./package.json": "./package.json"
   },

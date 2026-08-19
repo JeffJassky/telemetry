@@ -476,6 +476,35 @@ const spa: string = defaultSpaDir();
 const derived: ResolvedView[] = deriveViews(registry);
 const caps: QueryLimits = DEFAULT_LIMITS;
 
+// ── /mcp (types/mcp.d.ts) + /mcp/sdk (types/mcp-sdk.d.ts) ──
+// The tool suite reuses the dashboard's Viewer/SubjectAdapter, ctx-generic.
+import type { CreateTelemetryMcpOptions, McpViewerAdapter, ToolDescriptor } from './mcp.js';
+import { createTelemetryMcp, toJsonSchema } from './mcp.js';
+import type { McpServerLike } from './mcp-sdk.js';
+import { registerTelemetryTools } from './mcp-sdk.js';
+
+const mcpViewer: McpViewerAdapter = {
+  // ctx is opaque — the host's MCP request, forwarded, never inspected here
+  resolveViewer: (ctx) => (isPlatformScope(String(ctx)) ? platformViewer : viewer),
+};
+const mcpOpts: CreateTelemetryMcpOptions = {
+  telemetry: t,
+  viewerAdapter: mcpViewer,
+  subjectAdapter,
+  configured: [view],
+  limits: { records: 50 },
+  redact: (r) => r, // opt back into raw payloads; `false` disables entirely
+};
+const mcpTools: ToolDescriptor[] = createTelemetryMcp(mcpOpts);
+const firstTool: ToolDescriptor = mcpTools[0]!;
+void firstTool.name, firstTool.title, firstTool.description, firstTool.inputSchema;
+void firstTool.handler({}, { session: 'x' });
+const mcpSchema = toJsonSchema(firstTool);
+void mcpSchema;
+// the SDK seam is structural — a bare registerTool object satisfies it
+const mcpServer: McpServerLike = { registerTool: () => undefined };
+registerTelemetryTools(mcpServer, mcpTools);
+
 async function primitives() {
   const q: Queries = createQueries({
     TelemetryModel: t.models.telemetry,
