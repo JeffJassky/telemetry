@@ -41,26 +41,16 @@ jobs:
       # Build BEFORE test: the UI tests assert against the bundle in dist/ui.
       # See standards/traps.md #11.
       - run: npm run build
+
+      # The hand-written .d.ts files ARE the contract, and `import type` proves
+      # only that a name is declared — not that it is declared as the VALUE the
+      # build ships. Six vocabulary consts drifted that way before this existed.
+      # Needs the artifact, so it runs after build. See standards/traps.md #9.
+      - run: npm run check-exports
+
       - run: npm test
 
-      # A host compiled to CommonJS can only `require()`, and an ESM-only
-      # package fails there with ERR_REQUIRE_ESM. Prove the CJS half is real by
-      # calling THROUGH it, not by checking a file exists.
-      #
-      # Assert the factory: it is the one export every package has by
-      # construction. This step used to assert `defaultSpaDir()` because it
-      # happened to cover the shim check below too — which meant a package
-      # without a SPA failed here, after all tests passed, with
-      # `TypeError: p.defaultSpaDir is not a function` naming an export rather
-      # than a workflow. See standards/traps.md #24.
+      # import.meta.url cannot be expressed in CJS by esbuild; tsup shims it.
+      # defaultSpaDir() exercises the shim — verify after every tsup bump (traps #7).
       - name: CJS entry actually loads
-        run: node -e "const p=require('./dist/index.cjs'); if (typeof p.createTelemetry !== 'function') process.exit(1)"
-
-      # UI PACKAGES ONLY — delete this step along with src/ui.
-      #
-      # `import.meta.url` (src/server/ui.ts, locating the SPA) cannot be
-      # expressed in CJS by esbuild. tsup shims it; verify the shim survived the
-      # last tsup bump. A package that never touches the filesystem has nothing
-      # to check here. See standards/traps.md #7.
-      - name: import.meta.url shim survived the tsup bump
         run: node -e "const p=require('./dist/index.cjs'); if (typeof p.defaultSpaDir() !== 'string') process.exit(1)"
