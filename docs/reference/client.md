@@ -144,6 +144,32 @@ After `maxRetries` consecutive failures the batch is dropped and the counter
 advances — retrying forever is how a client with a bad URL becomes a
 denial-of-service against itself.
 
+### `beforeSend`
+
+```ts
+beforeSend?: (rec: WireRecord) => WireRecord | null | undefined | void;
+```
+
+The last gate before a record joins the queue — and the **only** one every kind
+passes through, because `track`, `captureError`, `state`, spans and usage all
+funnel into the same `enqueue`. Return the record to keep it, a modified copy to
+redact it, `null` to drop it:
+
+```ts
+beforeSend: (rec) => {
+  if (rec.error?.message?.includes('third-party widget')) return null;
+  return { ...rec, attrs: { ...rec.attrs, email: '[redacted]' } };
+}
+```
+
+A **throwing hook drops the record** and reports through `onError`. Fail-closed
+is deliberate: the common use is redaction, and a half-applied redaction that
+still ships is worse than a lost record.
+
+Filter here rather than at the platform edge. Swallowing `window.onerror`
+before the SDK sees it means winning a listener-registration race — and it
+misses every `captureError()` the app calls directly.
+
 ### Consent
 
 `consent() === false` **clears the queue** rather than holding it:
@@ -171,6 +197,26 @@ function createWebTelemetry<R>(opts: WebTelemetryOptions): TelemetryClient<R>;
 |---|---|---|
 | `consent` | `() => true` | Host consent — a cookie banner check. **ANDed** with the hard signals. |
 | `captureGlobalErrors` | `true` | Wire `window.onerror` and `unhandledrejection`. |
+| `ignoreErrors` | `[]` | Drop error records by message. Strings match by substring, RegExp by `test`. **Added to** the built-in list, not replacing it. |
+| `captureBenignErrors` | `false` | Keep the `BENIGN_BROWSER_ERRORS` records instead of dropping them. |
+
+#### `BENIGN_BROWSER_ERRORS`
+
+```ts
+export const BENIGN_BROWSER_ERRORS: readonly RegExp[];
+```
+
+Errors the browser raises that are not failures — currently the
+`ResizeObserver loop completed with undelivered notifications` family. Chrome
+raises it as an *uncaught error* whenever an observer callback dirties layout
+and the next batch lands a frame later. Nothing is broken and nothing is
+actionable, but it fires often enough to bury real errors: one production host
+saw **49 of its last 50** error records come from this one message.
+
+Dropped by default, because the alternative is every host discovering it
+separately. Both this list and `ignoreErrors` are implemented as a
+`beforeSend`, so a host-supplied `beforeSend` still runs on everything that
+survives the filter.
 
 **Context capture.** `platform: 'web'`, `appVersion` from `release`, plus
 `userAgent`, `locale`, `timezone` (from `Intl`), `screenW/H`, `viewportW/H`,

@@ -782,6 +782,9 @@ interface CreateClientOptions {
   /** false = drop instead of send. Web adapter wires DNT/GPC here. */
   consent?: () => boolean;
   errorName?: string;                // 'error.unhandled'
+  /** last gate before the queue — return the record, a redacted copy, or null
+   *  to drop it. A throwing hook drops the record and reports via onError. */
+  beforeSend?: (rec: WireRecord) => WireRecord | null | undefined | void;
   onError?: (e: unknown) => void;
 }
 
@@ -866,7 +869,11 @@ interface WebTelemetryOptions extends Omit<CreateClientOptions, 'storage' | 'con
   /** host consent (cookie banner etc). ANDed with DNT/GPC — those always win. */
   consent?: () => boolean;
   captureGlobalErrors?: boolean;    // true
+  /** drop error records by message; ADDED to BENIGN_BROWSER_ERRORS */
+  ignoreErrors?: Array<string | RegExp>;
+  captureBenignErrors?: boolean;    // false — true keeps the benign list
 }
+const BENIGN_BROWSER_ERRORS: readonly RegExp[];
 function createWebTelemetry<R>(opts: WebTelemetryOptions): TelemetryClient<R>;
 
 // /react

@@ -1,4 +1,4 @@
-import { createClient, type CreateClientOptions, type TelemetryClient } from './core.js';
+import { createClient, type CreateClientOptions, type TelemetryClient, type WireRecord } from './core.js';
 
 /**
  * Browser wiring (instrumentation §7): ClientContext capture, global error
@@ -45,15 +45,63 @@ const privacySignalsAllow = () => {
   return true;
 };
 
+/**
+ * Errors the browser raises that are not failures.
+ *
+ * `ResizeObserver loop completed with undelivered notifications` is the whole
+ * list for now, and it earns its place: Chrome raises it as an *uncaught
+ * error* whenever an observer callback dirties layout and the next batch
+ * lands a frame later. Nothing is broken, nothing is actionable, and it is
+ * emitted often enough to bury real errors — one production host saw 49 of
+ * its last 50 error records come from this one message.
+ *
+ * Filtered by default because the alternative is every host discovering it
+ * separately. Opt back in with `captureBenignErrors: true`.
+ */
+export const BENIGN_BROWSER_ERRORS: readonly RegExp[] = [
+  /ResizeObserver loop (?:completed with undelivered notifications|limit exceeded)/,
+];
+
 export interface WebTelemetryOptions extends Omit<CreateClientOptions, 'storage' | 'consent'> {
   /** host consent, e.g. a cookie-banner check. ANDed with DNT/GPC. */
   consent?: () => boolean;
   /** auto-capture window.onerror / unhandledrejection (default true) */
   captureGlobalErrors?: boolean;
+  /**
+   * Drop error records whose message matches. Strings match by substring,
+   * RegExp by test. ADDED to `BENIGN_BROWSER_ERRORS`, not replacing it.
+   */
+  ignoreErrors?: Array<string | RegExp>;
+  /** keep the `BENIGN_BROWSER_ERRORS` records instead of dropping them */
+  captureBenignErrors?: boolean;
 }
 
 export function createWebTelemetry(opts: WebTelemetryOptions): TelemetryClient {
-  const { consent = () => true, captureGlobalErrors = true, clientContext, ...rest } = opts;
+  const {
+    consent = () => true,
+    captureGlobalErrors = true,
+    ignoreErrors,
+    captureBenignErrors = false,
+    clientContext,
+    ...rest
+  } = opts;
+
+  // Message filtering rides core's `beforeSend` rather than the global error
+  // listeners: the listeners are not the only way a record is born
+  // (`captureError()` calls from app code are), and a host-supplied
+  // `beforeSend` must still get its turn on everything that survives.
+  const patterns = [...(captureBenignErrors ? [] : BENIGN_BROWSER_ERRORS), ...(ignoreErrors ?? [])];
+  const hostBeforeSend = rest.beforeSend;
+  const beforeSend = (rec: WireRecord) => {
+    const message = (rec.error as { message?: string } | undefined)?.message;
+    if (
+      message &&
+      patterns.some((p) => (typeof p === 'string' ? message.includes(p) : p.test(message)))
+    ) {
+      return null;
+    }
+    return hostBeforeSend ? hostBeforeSend(rec) : rec;
+  };
 
   const storage =
     typeof localStorage === 'undefined'
@@ -75,6 +123,7 @@ export function createWebTelemetry(opts: WebTelemetryOptions): TelemetryClient {
 
   const client = createClient({
     ...rest,
+    beforeSend,
     storage,
     clientContext: { ...browserContext(), appVersion: opts.release ?? 'unknown', ...clientContext },
     consent: () => privacySignalsAllow() && consent(),

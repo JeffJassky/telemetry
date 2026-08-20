@@ -7,6 +7,30 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [Unreleased]
+
+### Added
+- `beforeSend` on `CreateClientOptions` — the last gate before a record joins
+  the queue, and the one place every kind passes through. Return the record to
+  keep it, a modified copy to redact it, `null` to drop it. A throwing hook
+  drops the record and reports via `onError` (fail-closed: a half-applied
+  redaction that still ships is worse than a lost record).
+- `/web`: `ignoreErrors` (strings match by substring, RegExp by `test`) and
+  `BENIGN_BROWSER_ERRORS`, the browser-raised non-errors filtered by default.
+
+### Changed
+- **`/web` now drops `ResizeObserver loop completed with undelivered
+  notifications` (and `loop limit exceeded`) by default.** Chrome raises these
+  as uncaught errors when an observer callback dirties layout; nothing is
+  broken and nothing is actionable, but they fire often enough to bury real
+  errors — one production host saw 49 of its last 50 error records come from
+  this one message. Hosts that were counting them will see the count go to
+  zero; `captureBenignErrors: true` restores the old behavior.
+
+  Filtering here rather than at the platform edge is the point: swallowing
+  `window.onerror` before the SDK sees it means winning a listener-registration
+  race, and it misses every `captureError()` the app calls directly.
+
 ## [0.1.0] — first release
 
 ### Added

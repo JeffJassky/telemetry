@@ -6,6 +6,7 @@ import express from 'express';
 import request from 'supertest';
 import { createClient } from '../src/client/core.js';
 import { createCliTelemetry } from '../src/client/cli.js';
+import { createWebTelemetry, BENIGN_BROWSER_ERRORS } from '../src/client/web.js';
 import { createIngest, newId } from '../src/server/index.js';
 import { buildTelemetry, startDb, stopDb } from './helpers.js';
 
@@ -135,6 +136,55 @@ describe('client core', () => {
     expect(e1.error.frames[0].filename).toContain('client.test');
   });
 
+  it('beforeSend drops a record by returning null, and every kind passes through it', async () => {
+    const { batches, transport } = fakeTransport();
+    const seen: string[] = [];
+    const c = createClient(
+      opts(transport, {
+        beforeSend: (rec: any) => {
+          seen.push(rec.name);
+          return rec.name === 'app.noisy' ? null : rec;
+        },
+      }),
+    );
+    c.track('app.noisy');
+    c.track('app.ping');
+    c.captureError(new Error('boom'));
+    await c.flush();
+
+    expect(seen).toEqual(['app.noisy', 'app.ping', 'error.unhandled']);
+    expect(batches[0].records.map((r: any) => r.name)).toEqual(['app.ping', 'error.unhandled']);
+  });
+
+  it('beforeSend can redact: the modified record is what ships', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createClient(
+      opts(transport, {
+        beforeSend: (rec: any) => ({ ...rec, attrs: { ...rec.attrs, email: '[redacted]' } }),
+      }),
+    );
+    c.track('app.ping', { attrs: { email: 'someone@example.com' } });
+    await c.flush();
+    expect(batches[0].records[0].attrs.email).toBe('[redacted]');
+  });
+
+  it('a throwing beforeSend drops the record and reports — fail-closed, so a broken filter cannot leak', async () => {
+    const { batches, transport } = fakeTransport();
+    const errors: unknown[] = [];
+    const c = createClient(
+      opts(transport, {
+        beforeSend: () => {
+          throw new Error('filter bug');
+        },
+        onError: (e: unknown) => errors.push(e),
+      }),
+    );
+    c.track('app.ping');
+    await c.flush();
+    expect(batches).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+  });
+
   it('consent=false drops the queue instead of sending OR hoarding', async () => {
     const { batches, transport } = fakeTransport();
     const c = createClient(opts(transport, { consent: () => false }));
@@ -144,6 +194,71 @@ describe('client core', () => {
     c.identify({ user: 'u' }); // queue must not grow unboundedly while opted out
     await c.flush();
     expect(batches).toHaveLength(0);
+  });
+});
+
+describe('web adapter error filtering', () => {
+  const webOpts = (transport: any, over: Record<string, unknown> = {}) => ({
+    key: 'pk_live_tk_000000000000000000000000',
+    url: 'https://x/ingest',
+    flushIntervalMs: 0,
+    transport,
+    ...over,
+  });
+
+  it('drops the benign ResizeObserver loop error by default', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createWebTelemetry(webOpts(transport));
+    c.captureError(new Error('ResizeObserver loop completed with undelivered notifications'));
+    c.captureError(new Error('ResizeObserver loop limit exceeded'));
+    c.captureError(new Error('genuinely broken'));
+    await c.flush();
+    expect(batches[0].records).toHaveLength(1);
+    expect(batches[0].records[0].error.message).toBe('genuinely broken');
+  });
+
+  it('captureBenignErrors keeps them', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createWebTelemetry(webOpts(transport, { captureBenignErrors: true }));
+    c.captureError(new Error('ResizeObserver loop limit exceeded'));
+    await c.flush();
+    expect(batches[0].records).toHaveLength(1);
+  });
+
+  it('ignoreErrors ADDS to the defaults — strings match by substring, RegExp by test', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createWebTelemetry(
+      webOpts(transport, { ignoreErrors: ['third-party widget', /^Script error\.?$/] }),
+    );
+    c.captureError(new Error('a third-party widget exploded'));
+    c.captureError(new Error('Script error.'));
+    c.captureError(new Error('ResizeObserver loop limit exceeded')); // still the default list
+    c.captureError(new Error('ours'));
+    await c.flush();
+    expect(batches[0].records).toHaveLength(1);
+    expect(batches[0].records[0].error.message).toBe('ours');
+  });
+
+  it('a host beforeSend still runs on everything the filter lets through', async () => {
+    const { batches, transport } = fakeTransport();
+    const seen: string[] = [];
+    const c = createWebTelemetry(
+      webOpts(transport, {
+        beforeSend: (rec: any) => {
+          seen.push(rec.error?.message ?? rec.name);
+          return rec;
+        },
+      }),
+    );
+    c.captureError(new Error('ResizeObserver loop limit exceeded'));
+    c.captureError(new Error('real'));
+    await c.flush();
+    expect(seen).toEqual(['real']); // the ignored one never reaches the host hook
+    expect(batches[0].records).toHaveLength(1);
+  });
+
+  it('BENIGN_BROWSER_ERRORS is exported so a host can see what is filtered', () => {
+    expect(BENIGN_BROWSER_ERRORS.some((re) => re.test('ResizeObserver loop limit exceeded'))).toBe(true);
   });
 });
 

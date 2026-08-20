@@ -92,6 +92,22 @@ export interface CreateClientOptions {
   consent?: () => boolean;
   /** registry name used by captureError. Convention: 'error.unhandled'. */
   errorName?: string;
+  /**
+   * Last gate before a record joins the queue — the one place every kind
+   * (event, error, span, state, usage) passes through. Return the record to
+   * keep it, a modified copy to redact it, or `null` to drop it silently.
+   *
+   * This is where noise dies. A host that filters at the platform level
+   * instead — swallowing `window.onerror` before the SDK sees it — has to win
+   * a listener-registration race to do it, which is a real footgun; the whole
+   * point of putting the hook here is that the host never has to think about
+   * ordering.
+   *
+   * A throwing hook DROPS the record and reports via `onError`. Fail-closed is
+   * deliberate: the common use is redaction, and a half-applied redaction that
+   * still ships is worse than a lost record.
+   */
+  beforeSend?: (rec: WireRecord) => WireRecord | null | undefined | void;
   /** SDK-internal failures — never thrown at the app */
   onError?: (e: unknown) => void;
 }
@@ -150,6 +166,7 @@ export function createClient(options: CreateClientOptions) {
     storage = memoryStorage(),
     consent = () => true,
     errorName = 'error.unhandled',
+    beforeSend,
     onError = () => {},
   } = options;
 
@@ -187,7 +204,17 @@ export function createClient(options: CreateClientOptions) {
   let timer: ReturnType<typeof setInterval> | undefined;
 
   const enqueue = (rec: WireRecord) => {
-    queue.push(rec);
+    let out: WireRecord | null | undefined | void = rec;
+    if (beforeSend) {
+      try {
+        out = beforeSend(rec);
+      } catch (e) {
+        onError(e); // fail-closed: a broken filter must not leak what it was filtering
+        return;
+      }
+    }
+    if (!out) return;
+    queue.push(out);
     while (queue.length > maxQueueSize) {
       queue.shift(); // drop-oldest: fresh telemetry outranks stale
       dropped++;

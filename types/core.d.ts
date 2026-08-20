@@ -81,6 +81,12 @@ export interface CreateClientOptions {
   consent?: () => boolean;
   /** registry name used by captureError. Convention: 'error.unhandled'. */
   errorName?: string;
+  /**
+   * Last gate before a record joins the queue — every kind passes through it.
+   * Return the record to keep it, a modified copy to redact it, `null` to drop
+   * it. A throwing hook drops the record and reports via `onError`.
+   */
+  beforeSend?: (rec: WireRecord) => WireRecord | null | undefined | void;
   onError?: (e: unknown) => void;
 }
 
