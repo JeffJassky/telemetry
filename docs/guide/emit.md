@@ -62,6 +62,32 @@ Invalid records reach **neither** plane. Hydration and validation run once, up
 front, for every record — kept, sampled, or capped alike — so the aggregate plane
 never sees an under-derived or unvalidated document.
 
+## Subject linking, and why it happens *here*
+
+If the instance was built with a
+[`subjectLinker`](/guide/adapters#subjectlinker), the host is
+asked *"who else is this record about?"* once per record — after the registry
+check, and before the document exists.
+
+Before, because it has to be. The validate hook derives `subjectKeys` from
+`subjects`, and `subjectKeys` is what a `by:['subject']` rollup fans out over. A
+subject attached any later lands on the row and **not** on its aggregates, which
+is precisely the split the hook exists to close: a lifetime milestone family is
+keyed on the subject the record was written with, permanently, so a `user` added
+after the fact is a `user` that family has never heard of.
+
+It cannot fail a write. The call is bounded by `subjectLinkTimeoutMs` (50 ms)
+and guarded against throws and nonsense; every failure writes the record with
+the subjects it came with and moves one of six counters. Ingest is
+at-least-once and unattended, so a stalled resolver must cost a record its
+`user`, never its existence.
+
+One ordering consequence, stated rather than discovered: on the insert-gated
+paths below, the **insert** is the dedupe verdict, and the subjects have to be
+on the document before it. So a redelivered record asks the linker and then
+writes nothing — it aggregates nothing either, exactly as before. The cost of a
+duplicate is one cached lookup.
+
 ## The inversion, and the single rule behind it
 
 The plane order above reverses for two cases, and both are the same rule:
@@ -294,6 +320,17 @@ is a payload, quarantines it.
 | `rollupSkipped` | a non-subject dim resolved empty with no `dimDefault` — see [Rollups](/guide/rollups) |
 | `defaulted` | `service` or `release` was missing and stamped `unknown` |
 | `truncated` | a `body` was clipped to `BODY_MAX_CHARS` (16384) and marked |
+| `subjectsLinked` | a `subjectLinker` added a subject — counted per subject, not per record |
+| `subjectLinkMisses` | the linker answered `[]`. *"No link exists"* is an answer |
+| `subjectLinkErrors` | the linker threw, rejected, or answered with something that is not a list of refs |
+| `subjectLinkTimeouts` | the linker outran its budget; the record was written unlinked |
+| `subjectLinkUndeclared` | a linked subject type the event does not declare — refused |
+| `subjectLinkCapped` | a linked subject over `SUBJECT_MAX` (8) on one record |
+
+The six linking counters stay at zero without a `subjectLinker`, and the five
+failure ones exist because every way linking can fail produces the same row —
+one written with the subjects it arrived with. Without the split, a broken
+resolver and a host with nothing to link are the same silence.
 
 Three places to look:
 

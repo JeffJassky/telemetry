@@ -1,7 +1,7 @@
 import type { Model } from 'mongoose';
 import {
-  TelemetryKind, RESERVED_TENANT_MESSAGE, SAMPLE_RATE, bumpCounterMap, isPlatformScope, newId,
-  traceKeep, plain,
+  TelemetryKind, COUNTER_MAP_MAX, RESERVED_TENANT_MESSAGE, SAMPLE_RATE, bumpCounterMap,
+  isPlatformScope, newId, traceKeep, plain,
   type TelemetryCounters, type Logger,
 } from './types.js';
 import type { EventSpec, Registry } from './registry.js';
@@ -32,6 +32,8 @@ export interface EmitCtx {
   logger: Logger;
   /** in-flight fire-and-forget writes, awaited by t.flush() */
   track: (p: Promise<unknown>) => void;
+  /** write-time subject linking, or null when no `subjectLinker` is configured */
+  linkSubjects?: LinkSubjects | null;
 }
 
 export interface EmitInput {
@@ -109,6 +111,236 @@ export function noteUndeclaredAttrs(
   }
 }
 
+// ── write-time subject linking ───────────────────────────────────────────────
+
+/**
+ * The host's answer to "who else is this record about?", asked once per record,
+ * on the way to disk.
+ *
+ * NOT `SubjectAdapter` (dashboard.ts), which labels refs at READ time and
+ * changes nothing about what is stored. This one changes the row.
+ *
+ * The failure mode it exists for: a desktop client knows its install and
+ * nothing else, so every record it sends carries `machine:<installId>` and no
+ * `user`. The host can map most of those to an account — but doing that at read
+ * time leaves a cohort funnel anchored on `user` reading zero for every desktop
+ * stage. `import.completed` is there in volume and invisible to the only
+ * question anyone asked of it. Joining at write time puts the party on the row
+ * AND on its rollups, and the rollups are the half a read-time join can never
+ * reach: a lifetime `by:['subject']` family is keyed on the subject the record
+ * was written with, forever.
+ */
+export interface SubjectLinker {
+  /**
+   * Additional subjects to attach to a record being written. Return `[]` when
+   * nothing links — that is an answer, and it is counted as one.
+   *
+   * MUST be fast, and is expected to be CACHED. It runs on the ingest hot path,
+   * once per record, and the package bounds it rather than trusting it: a throw
+   * or an overrun writes the record unlinked. It should not throw; the package
+   * guards anyway.
+   */
+  link(
+    subjects: Array<{ type: string; id: string; role?: string }>,
+    ctx: { name: string; tenantId: string },
+  ):
+    | Array<{ type: string; id: string; role?: string }>
+    | Promise<Array<{ type: string; id: string; role?: string }>>;
+}
+
+type SubjectRef = { type: string; id: string; role?: string };
+
+/**
+ * Total subjects one record may carry once linking has run. The envelope is
+ * multi-party by design, but `subjectKeys` is a multikey index term and every
+ * subject fans a `by:['subject']` rollup out one more time — so an unbounded
+ * array is an unbounded write amplification with a host's cache bug behind it.
+ */
+export const SUBJECT_MAX = 8;
+
+/** what link() gets before the record is written unlinked */
+export const SUBJECT_LINK_TIMEOUT_MS = 50;
+
+/** merged subjects to write, or null when nothing changed */
+export type LinkSubjects = (
+  name: string,
+  spec: Pick<EventSpec, 'subjects'>,
+  tenantId: string,
+  declared: unknown,
+) => Promise<SubjectRef[] | null>;
+
+/** the race token — a Symbol so no host error can ever impersonate a timeout */
+const LINK_TIMEOUT = Symbol('telemetry.subjectLink.timeout');
+
+/**
+ * Wrap a host `SubjectLinker` in the guarantees the write path needs.
+ *
+ * Returns `null` — not a pass-through — when no linker is configured, so a host
+ * without one runs the code 0.4.0 ran rather than an extra `await` per record.
+ *
+ * Every failure resolves the same way: write the record with the subjects it
+ * came with, and count. Ingest is at-least-once and unattended, so a resolver
+ * that hangs must cost a record its `user` and never its existence — an
+ * unlinked row is a worse row, a dropped row is a lie about what happened.
+ */
+export function createSubjectLinking(opts: {
+  linker?: SubjectLinker;
+  timeoutMs?: number;
+  counters: TelemetryCounters;
+  logger: Logger;
+}): LinkSubjects | null {
+  const { linker, counters, logger } = opts;
+  if (!linker) return null;
+  const timeoutMs = opts.timeoutMs ?? SUBJECT_LINK_TIMEOUT_MS;
+
+  // Once per reason, ever. This fires from the write path, so a line per record
+  // IS the outage — and none of these are things a human reads twice. The set
+  // is bounded for the same reason the counter maps are: one of the keys
+  // carries an event name and a subject type.
+  const warned = new Set<string>();
+  const warnOnce = (key: string, msg: string) => {
+    if (warned.has(key) || warned.size >= COUNTER_MAP_MAX) return;
+    warned.add(key);
+    logger.warn(msg);
+  };
+
+  return async function linkSubjects(name, spec, tenantId, declared) {
+    const have: SubjectRef[] = Array.isArray(declared) ? declared : [];
+
+    // The host is asked about a COPY of the well-formed refs. Handing it the
+    // array that is about to be written would make a stray `push` in someone
+    // else's memo cache a mutation of this record; malformed entries are left
+    // out because validation is about to reject them anyway and the host should
+    // not have to defend against them.
+    const seen = new Set<string>();
+    const view: SubjectRef[] = [];
+    for (const s of have) {
+      const ref = wellFormed(s);
+      if (!ref) continue;
+      seen.add(`${ref.type}:${ref.id}`);
+      view.push(ref);
+    }
+
+    let out: unknown;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      out = await Promise.race([
+        // the async wrapper turns a SYNCHRONOUS throw into a rejection, so a
+        // linker that dies on its first line lands in the same catch as one
+        // whose promise rejects
+        (async () => linker.link(view, { name, tenantId }))(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(LINK_TIMEOUT), timeoutMs);
+        }),
+      ]);
+    } catch (e) {
+      if (e === LINK_TIMEOUT) {
+        counters.subjectLinkTimeouts++;
+        warnOnce(
+          'timeout',
+          `[telemetry] subjectLinker.link() exceeded ${timeoutMs}ms — records are being written ` +
+          'UNLINKED rather than waiting. The hook is expected to answer from a cache; a resolver ' +
+          'that queries per record cannot keep up with ingest. Warned once — the count is ' +
+          'counters.subjectLinkTimeouts.',
+        );
+      } else {
+        counters.subjectLinkErrors++;
+        warnOnce(
+          'threw',
+          `[telemetry] subjectLinker.link() threw — records are being written unlinked: ${e}. ` +
+          'Warned once — the count is counters.subjectLinkErrors.',
+        );
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!Array.isArray(out)) {
+      counters.subjectLinkErrors++;
+      warnOnce(
+        'shape',
+        `[telemetry] subjectLinker.link() resolved to ${typeof out}, not an array — records are ` +
+        'being written unlinked. Return [] when nothing links. Warned once — the count is ' +
+        'counters.subjectLinkErrors.',
+      );
+      return null;
+    }
+    if (!out.length) {
+      counters.subjectLinkMisses++;
+      return null;
+    }
+
+    // Room is measured against what the record already declares, so a caller
+    // that arrives at the cap loses its LINKS and keeps its own subjects — the
+    // host's own refs are never displaced by a derived one.
+    let room = Math.max(0, SUBJECT_MAX - have.length);
+    let capped = 0;
+    const add: SubjectRef[] = [];
+
+    for (const s of out) {
+      const ref = wellFormed(s);
+      if (!ref) {
+        counters.subjectLinkErrors++;
+        warnOnce(
+          'entry',
+          '[telemetry] subjectLinker returned an entry that is not { type, id } — dropped. ' +
+          'Warned once — the count is counters.subjectLinkErrors.',
+        );
+        continue;
+      }
+      // A ref the record already carries is never doubled, and the DECLARED one
+      // survives whole — including its `role`, which the caller knew and the
+      // linker is guessing at.
+      const key = `${ref.type}:${ref.id}`;
+      if (seen.has(key)) continue;
+
+      // A linked type the registry does not declare is REFUSED, not written.
+      // The registry is the description of what rows contain; a write path that
+      // can quietly add a type nobody declared makes it a description of what
+      // rows used to contain.
+      if (!spec.subjects.includes(ref.type)) {
+        counters.subjectLinkUndeclared++;
+        warnOnce(
+          `undeclared|${name}|${ref.type}`,
+          `[telemetry] subjectLinker returned subject type "${ref.type}" for "${name}", which ` +
+          'does not declare it — the subject was dropped and the record written with what it ' +
+          'came with. Read this before "fixing" it: `EventSpec.subjects` is a REQUIRED list, so ' +
+          `adding "${ref.type}" there also makes it mandatory, and every record of this name ` +
+          'whose link MISSES would then fail validation and be quarantined. Declare it only ' +
+          'where the link is total. Warned once per event and type — the count is ' +
+          'counters.subjectLinkUndeclared.',
+        );
+        continue;
+      }
+      if (room <= 0) {
+        capped++;
+        continue;
+      }
+      seen.add(key);
+      room--;
+      add.push(ref);
+    }
+
+    counters.subjectLinkCapped += capped;
+    // Nothing survived. Deliberately NOT counted as a miss: a miss is the host
+    // saying no link exists, which is a different fact from a link it named and
+    // the package refused.
+    if (!add.length) return null;
+    counters.subjectsLinked += add.length;
+    return [...have, ...add];
+  };
+}
+
+/** a ref the envelope can actually store, copied — or null */
+function wellFormed(s: unknown): SubjectRef | null {
+  if (!s || typeof s !== 'object') return null;
+  const { type, id, role } = s as SubjectRef;
+  if (typeof type !== 'string' || !type) return null;
+  if (typeof id !== 'string' || !id) return null;
+  return typeof role === 'string' && role ? { type, id, role } : { type, id };
+}
+
 export function createEmitter(ctx: EmitCtx) {
   const { registry, byKind, RollupModel, rejects, counters } = ctx;
 
@@ -182,6 +414,24 @@ export function createEmitter(ctx: EmitCtx) {
     // it is a stored, indexed field and rides through in `rest`.
     const { forceKeep: _drop, durable: _durable, ...rest } = doc;
 
+    // ── write-time subject linking ──
+    // HERE, and not after hydration, because the merged subjects have to be on
+    // the document before pre('validate') derives `subjectKeys` — and
+    // subjectKeys is what recordRollup fans a `by:['subject']` family out over.
+    // Link any later and the row carries a party its own milestone rollup has
+    // never heard of, which is the read/write split this feature exists to
+    // close.
+    //
+    // Bounded, guarded, and never fatal: see createSubjectLinking(). One
+    // ordering consequence is worth stating rather than discovering — on the
+    // insert-gated path below, the INSERT is the dedupe verdict, so a record
+    // that turns out to be a redelivery has already asked the linker by the
+    // time it learns nothing will be written. It writes nothing and aggregates
+    // nothing, as before; the cost of the duplicate is one cached lookup.
+    const linked = ctx.linkSubjects
+      ? await ctx.linkSubjects(name, spec, doc.tenantId, doc.subjects)
+      : null;
+
     // `...rest` FIRST. Spreading it last would let a caller override `forced`,
     // `sampleRate`, `name`, or `_id` — and a cost-bearing span passed
     // forced:false gets sampled away, dangling the usage→span join (ops rule 6).
@@ -193,6 +443,9 @@ export function createEmitter(ctx: EmitCtx) {
       ...rest,
       _id: id,
       name,
+      // computed like everything below it, and absent when nothing linked, so a
+      // host with no linker hands the model the exact object 0.4.0 did
+      ...(linked ? { subjects: linked } : {}),
       sampleRate: forced ? 1 : baseRate,
       forced,
       attrs: safe(doc.attrs),

@@ -325,6 +325,19 @@ export function createIngest(opts: CreateIngestOptions): Router {
         // so one row at a time.
         noteUndeclaredAttrs(t.counters, name, spec, rec.attrs);
 
+        // ── write-time subject linking, on the path that actually needs it ──
+        // The desktop client knows its install and nothing else, so this — the
+        // wire — is where `machine:<installId>` with no `user` arrives. Ingest
+        // does not call emit() (at-least-once delivery inverts the plane order,
+        // §4.6), so the hook is invoked HERE, from the same instance-wide
+        // implementation emit() uses. Before construction, for the same reason
+        // as there: pre('validate') derives `subjectKeys` and the rollups below
+        // fan out over it.
+        const subjects = mergeSubjects(rec.subjects);
+        const linked = t.linkSubjects
+          ? await t.linkSubjects(name, spec, tenantId, subjects)
+          : null;
+
         const Model = t.models.byKind[spec.kind as TelemetryKind];
         const d = new Model({
           // facts the wire may not assert: tenant, service, env, origin, plane
@@ -335,7 +348,7 @@ export function createIngest(opts: CreateIngestOptions): Router {
           tenantId,
           occurredAt,
           severity: typeof rec.severity === 'string' ? rec.severity : undefined,
-          subjects: mergeSubjects(rec.subjects),
+          subjects: linked ?? subjects,
           actor: ctx.actor ?? (typeof rec.actor === 'string' ? rec.actor : batchActor),
           onBehalfOf: typeof rec.onBehalfOf === 'string' ? rec.onBehalfOf : undefined,
           service: key.service,

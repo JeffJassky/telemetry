@@ -209,7 +209,7 @@ Where "never drop silently" stops being a slogan and becomes a screen. It is not
 optional and it is not behind a flag, because a package that counts its drops and
 never shows them has not solved anything.
 
-**Counters** — the seven numbers from `t.counters`, tiled:
+**Counters** — the seven core numbers from `t.counters`, tiled:
 
 | | |
 |---|---|
@@ -221,10 +221,18 @@ never shows them has not solved anything.
 | `defaulted` | records missing `service`/`release`, filled with `unknown` |
 | `rollupSkipped` | records skipped by a rollup for an unresolvable dimension |
 
+A second row appears when — and only when — the instance has a
+[`subjectLinker`](/guide/adapters#subjectlinker) that has
+actually run: `linked`, and the five ways linking can decline. It is conditional
+because six permanent zeros on every other host's System page is noise, and
+because for a host that *does* link, those five are the whole difference between
+*"nothing links"* and *"the link is broken and every desktop row is landing
+anonymous"*.
+
 These are per-process, in-memory counters. Scrape them onto your own `/metrics`
 too — the page is for a human noticing, not for alerting.
 
-**Attribution** — two maps beside the seven numbers, because a scalar tells you
+**Attribution** — two maps beside the numbers, because a scalar tells you
 something went wrong and not where:
 
 | | |

@@ -15,11 +15,13 @@ interface CreateTelemetryConfig<R extends Registry = Registry> {
   platforms?: readonly string[];
   bodyMax?: number;
   globalSubjectRefs?: boolean;
+  subjectLinker?: SubjectLinker;
+  subjectLinkTimeoutMs?: number;
   logger?: Logger;
 }
 ```
 
-Two keys are required (`registry`, `connection`); the other seven have defaults
+Two keys are required (`registry`, `connection`); the other nine have defaults
 that are correct for a single-instance host.
 
 ## `registry` — required
@@ -203,6 +205,56 @@ Note the asymmetry that makes this safe either way: `forget()` still refuses
 flag only reaches `'*'` rows owned by one named ref. Bounded by the person, never
 by the tenant. See [Erasure](/guide/erasure).
 
+## `subjectLinker`
+
+**Default: absent.** A host hook that attaches additional subjects to a record
+**at write time** — the one place in the config where the package asks *you* a
+question about the row it is about to store.
+
+```ts
+createTelemetry({
+  registry,
+  connection: mongoose,
+  subjectLinker: {
+    link: (subjects) => {
+      const machine = subjects.find((s) => s.type === 'machine');
+      const userId = machine && OWNER_CACHE.get(machine.id);
+      return userId ? [{ type: 'user', id: userId }] : [];
+    },
+  },
+});
+```
+
+**Change it when** records arrive knowing one party and you know another. The
+case it was built for: a desktop client knows its install and nothing else, so
+every record carries `machine:<installId>` and no `user`. Joining that at read
+time still leaves a cohort funnel anchored on `user` reading zero for every
+desktop stage — a lifetime `by:['subject']` rollup is keyed on the subject the
+record was written with, and no later join can reach back into it.
+
+It runs once per record, on the ingest path, so it must answer from a **cache**.
+It can never fail a write: a throw, a nonsense return value, or an overrun of
+`subjectLinkTimeoutMs` all write the record with the subjects it came with and
+move a counter. Six of those counters exist, and the five failure ones are the
+difference between *"nothing links"* and *"the link is broken"*.
+
+One trap is worth reading before you configure it: a linked subject whose type
+the event does not declare is **refused**, and `EventSpec.subjects` is a
+REQUIRED list — so declaring the type to let the link land also makes it
+mandatory for that event. Full semantics, merge order and counters are on
+[Adapters](/guide/adapters#subjectlinker).
+
+## `subjectLinkTimeoutMs`
+
+**Default: `SUBJECT_LINK_TIMEOUT_MS` (50).** What `subjectLinker.link()` gets per
+record before the write proceeds **unlinked** and `counters.subjectLinkTimeouts`
+increments.
+
+**Change it when** you have measured the resolver and know it needs more — and
+know what that costs, because this number multiplies by every record in a batch.
+The default is chosen so that a host outage degrades telemetry rather than
+stalling ingest behind it. Ignored without a `subjectLinker`.
+
 ## `logger`
 
 **Default: a no-op.** Any object with `info`, `warn` and `error` methods —
@@ -246,6 +298,14 @@ app.get('/metrics', (req, res) => res.json(t.counters));
 | `rollupSkipped` | a rollup dimension resolved empty and had no `dimDefault` |
 | `deduped` | an insert-gated write lost to an existing `dedupeKey` / `usage.idempotencyKey` |
 | `truncated` | a `body` was clipped to `bodyMax` |
+| `subjectsLinked` | a `subjectLinker` added a subject to a record — counted per subject |
+| `subjectLinkMisses` | the linker answered `[]` — no link exists |
+| `subjectLinkErrors` | the linker threw, rejected, or answered with something that is not a list of refs |
+| `subjectLinkTimeouts` | the linker outran `subjectLinkTimeoutMs`; the record was written unlinked |
+| `subjectLinkUndeclared` | a linked subject type the event does not declare — refused |
+| `subjectLinkCapped` | a linked subject over `SUBJECT_MAX` (8) on one record |
+
+The six linking counters stay at zero without a `subjectLinker`.
 
 Surface them. A silent drop that nobody counts is the failure mode this package
 exists to prevent, and every one of these numbers has a configuration change

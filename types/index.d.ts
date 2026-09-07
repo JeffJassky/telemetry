@@ -632,6 +632,24 @@ export interface TelemetryCounters {
    * not stripped; this groups what the quarantine lists one row at a time.
    */
   undeclaredAttrs: Record<string, number>;
+  /**
+   * Write-time subject linking. All six stay at zero without a
+   * `subjectLinker`. They are split six ways because every way linking can fail
+   * ends in the same row — one written with the subjects it arrived with — and
+   * a silently unlinked record is indistinguishable from one nobody could link.
+   */
+  /** subjects actually ADDED to records — two links on one record count twice */
+  subjectsLinked: number;
+  /** records where the linker answered `[]` — no link exists, which is an answer */
+  subjectLinkMisses: number;
+  /** the linker threw, rejected, or returned something that is not a list of refs */
+  subjectLinkErrors: number;
+  /** the linker outran `subjectLinkTimeoutMs`; the record was written unlinked */
+  subjectLinkTimeouts: number;
+  /** a linked subject whose `type` the event's `EventSpec.subjects` does not declare */
+  subjectLinkUndeclared: number;
+  /** a linked subject dropped because the record already held `SUBJECT_MAX` of them */
+  subjectLinkCapped: number;
 }
 
 /**
@@ -709,8 +727,70 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
    * different person in each, and one tenant's erasure would reach another's.
    */
   globalSubjectRefs?: boolean;
+  /**
+   * Attach additional subjects to a record AT WRITE TIME — the desktop
+   * `machine:<installId>` the host can resolve to a `user`, joined once, onto
+   * the row and its rollups, rather than at every read that ever wants it.
+   * Must be cached: it runs once per record on the ingest path.
+   */
+  subjectLinker?: SubjectLinker;
+  /**
+   * What `subjectLinker.link()` gets per record before the write proceeds
+   * UNLINKED and counts a timeout. Default 50.
+   */
+  subjectLinkTimeoutMs?: number;
   logger?: Logger;
 }
+
+/**
+ * WRITE-time subject linking — distinct from `SubjectAdapter`, which labels
+ * refs at read time and changes nothing about what is stored.
+ *
+ * A desktop client knows its install and nothing else, so its records carry
+ * `machine:<installId>` and no `user`. Resolving that at read time leaves a
+ * cohort funnel anchored on `user` reading zero for every desktop stage;
+ * resolving it at write time puts the party on the row AND on its rollups,
+ * which is the half a read-time join can never reach.
+ */
+export interface SubjectLinker {
+  /**
+   * Additional subjects for a record being written. `[]` when nothing links —
+   * that is an answer, and it is counted as one.
+   *
+   * Runs once per record on the write path, so it must answer from a cache.
+   * The package bounds it rather than trusting it: past `subjectLinkTimeoutMs`,
+   * or on a throw, the record is written unlinked and counted. A linked subject
+   * whose `type` the event does not declare is refused, not written.
+   */
+  link(
+    subjects: SubjectInput[],
+    ctx: { name: string; tenantId: string },
+  ): SubjectInput[] | Promise<SubjectInput[]>;
+}
+
+/**
+ * The guarded linker the instance resolved at construction: the merged subjects
+ * to write, or `null` when nothing changed. Exposed as `t.linkSubjects` for the
+ * router factories, which reach it the way they reach the registry.
+ */
+export type LinkSubjects = (
+  name: string,
+  spec: { subjects: readonly string[] },
+  tenantId: string,
+  declared: unknown,
+) => Promise<SubjectInput[] | null>;
+
+/**
+ * Total subjects one record may carry once linking has run. `subjectKeys` is a
+ * multikey index term and every subject fans a `by:['subject']` rollup out one
+ * more time, so an unbounded array is unbounded write amplification with a
+ * host's cache bug behind it. Overflow is dropped and counted in
+ * `counters.subjectLinkCapped`.
+ */
+export declare const SUBJECT_MAX: 8;
+
+/** default `subjectLinkTimeoutMs` — past it the record is written unlinked */
+export declare const SUBJECT_LINK_TIMEOUT_MS: 50;
 
 export interface Telemetry<R extends Registry = Registry> {
   /** write — the only write. The result says what actually happened to the row. */
@@ -739,6 +819,14 @@ export interface Telemetry<R extends Registry = Registry> {
   counters: TelemetryCounters;
   /** the registry this instance validates against */
   registry: R;
+  /**
+   * Write-time subject linking, guarded and resolved once at construction;
+   * `null` without a `subjectLinker`. Exposed for the router factories: the
+   * wire path does not go through `emit()` — at-least-once delivery inverts the
+   * plane order — so `createIngest` reaches the one implementation here rather
+   * than growing a second copy of the rules.
+   */
+  linkSubjects: LinkSubjects | null;
   logger: Logger;
   /** mint an ingest key against this instance's key collection */
   createKey(input: CreateKeyInput): Promise<{ key: string; id: string }>;

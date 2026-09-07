@@ -34,8 +34,10 @@ import type {
   MetricsOf,
   Registry,
   RollupSpec,
+  LinkSubjects,
   Scoped,
   SubjectInput,
+  SubjectLinker,
   Telemetry,
   TelemetryCounters,
 } from './index.js';
@@ -61,6 +63,8 @@ import {
   RETENTION_DAYS,
   SAMPLE_RATE,
   SCHEMA_VERSION,
+  SUBJECT_LINK_TIMEOUT_MS,
+  SUBJECT_MAX,
   TelemetryKind,
 } from './index.js';
 
@@ -101,6 +105,15 @@ const registry = defineRegistry({
 
 declare const mongooseish: CreateTelemetryConfig['connection'];
 
+/** WRITE-time: the desktop's machine ref, resolved to the account that owns it */
+const subjectLinker: SubjectLinker = {
+  link: async (subjects, { name, tenantId }) => {
+    void name, tenantId;
+    const machine = subjects.find((s) => s.type === 'machine');
+    return machine ? [{ type: 'user', id: `u_${machine.id}`, role: 'owner' }] : [];
+  },
+};
+
 const t = createTelemetry({
   registry,
   connection: mongooseish,
@@ -108,7 +121,14 @@ const t = createTelemetry({
   platforms: ['watchos'], // EXTENDS the builtins; 'web' still validates
   bodyMax: 4096,
   globalSubjectRefs: true, // refs name one party in every tenant — forget() reaches '*' views
+  subjectLinker,
+  subjectLinkTimeoutMs: SUBJECT_LINK_TIMEOUT_MS,
 });
+
+// the guarded linker the instance resolved, shared with the router factories
+const linkSubjects: LinkSubjects | null = t.linkSubjects;
+const subjectCap: number = SUBJECT_MAX;
+void linkSubjects, subjectCap;
 
 // ── emit is typed against the registry ──
 async function writes() {

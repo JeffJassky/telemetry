@@ -1249,6 +1249,15 @@ export function System({ api }) {
   if (q.loading) return <Loading />;
   if (q.error) return <Failed error={q.error} />;
   const { counters, quarantine, indexCount, indexBudget, keys, role, suggestions } = q.data;
+  const link = (k) => counters[k] ?? 0;
+  // Only a host that configured a `subjectLinker` has any of these, so the row
+  // appears when linking has actually happened rather than sitting at six
+  // permanent zeros for everyone else. For a host that did configure one, the
+  // five failure counters are the whole difference between "nothing links" and
+  // "the link is broken and every desktop row is landing anonymous".
+  const linking =
+    link('subjectsLinked') + link('subjectLinkMisses') + link('subjectLinkErrors') +
+    link('subjectLinkTimeouts') + link('subjectLinkUndeclared') + link('subjectLinkCapped');
   return (
     <>
       <div className="kpis" style={{ gridTemplateColumns: 'repeat(7, 1fr)' }}>
@@ -1260,6 +1269,17 @@ export function System({ api }) {
         <StatTile label="defaulted" value={fmtNumber(counters.defaulted)} meta="missing service/release" />
         <StatTile label="indexes" value={`${indexCount}`} meta={`payload budget ${indexBudget}`} />
       </div>
+
+      {linking > 0 && (
+        <div className="kpis" style={{ gridTemplateColumns: 'repeat(6, 1fr)' }}>
+          <StatTile label="linked" value={fmtNumber(link('subjectsLinked'))} meta="subjects added on write" />
+          <StatTile label="link misses" value={fmtNumber(link('subjectLinkMisses'))} meta="host knew of no link" />
+          <StatTile label="link errors" value={fmtNumber(link('subjectLinkErrors'))} meta="threw or answered garbage" />
+          <StatTile label="link timeouts" value={fmtNumber(link('subjectLinkTimeouts'))} meta="written unlinked" />
+          <StatTile label="link undeclared" value={fmtNumber(link('subjectLinkUndeclared'))} meta="type not in the registry" />
+          <StatTile label="link capped" value={fmtNumber(link('subjectLinkCapped'))} meta="over the subject cap" />
+        </div>
+      )}
 
       {/* the loop closed the other way: what the DATA says the registry is
           missing, each with the line that would fix it (reports §9) */}

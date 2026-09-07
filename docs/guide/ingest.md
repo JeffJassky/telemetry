@@ -218,6 +218,17 @@ secure.
 Batch-level context carries the subjects and actor **once**, not per record —
 that is most of why batching pays for itself on a chatty page.
 
+A client can only send subjects it knows about, which for a desktop build is its
+own install and nothing else. If the instance was constructed with a
+[`subjectLinker`](/guide/adapters#subjectlinker), the wire
+path calls it too — once per record, before the record is built — so a batch
+arriving as `machine:<installId>` lands with the account it belongs to on the
+row *and* on its rollups. Ingest does not go through `emit()` (delivery is
+at-least-once, so the plane order inverts), but it runs the same guarded hook
+off the same instance, with the same timeout and the same counters. A slow or
+broken resolver never costs the wire a record: the batch is still accepted, the
+row is written unlinked, and a counter says so.
+
 ### Caps
 
 | Cap | Default | Option |

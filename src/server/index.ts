@@ -4,7 +4,7 @@ import { validateRegistry, type Registry } from './registry.js';
 import { buildTelemetryModels } from './model.js';
 import { buildRollupModel } from './rollups.js';
 import { buildCheckpointModel, createCheckpointFactory } from './checkpoint.js';
-import { createEmitter, type EmitInput } from './emit.js';
+import { createEmitter, createSubjectLinking, type EmitInput, type SubjectLinker } from './emit.js';
 import { createForget } from './forget.js';
 import { createSyncIndexes } from './indexes.js';
 import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
@@ -22,7 +22,8 @@ export { INDEX_BUDGET } from './indexes.js';
 export { truncate, resolveDim } from './rollups.js';
 export type { ForgetResult } from './forget.js';
 export type { Checkpoint } from './checkpoint.js';
-export type { EmitInput, EmitResult } from './emit.js';
+export { SUBJECT_MAX, SUBJECT_LINK_TIMEOUT_MS } from './emit.js';
+export type { EmitInput, EmitResult, LinkSubjects, SubjectLinker } from './emit.js';
 export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
 export type { CreateKeyInput, ParsedKey } from './keys.js';
 export { createIngest } from './ingest.js';
@@ -91,6 +92,24 @@ export interface CreateTelemetryConfig {
    * different person in each and one tenant's erasure would reach another's.
    */
   globalSubjectRefs?: boolean;
+  /**
+   * Attach additional subjects to a record AT WRITE TIME — the desktop
+   * `machine:<installId>` that the host can resolve to a `user`, joined once,
+   * onto the row and its rollups, instead of at every read that ever wants it.
+   *
+   * See SubjectLinker in emit.ts for what it must not do. In one line: it must
+   * be cached, because it runs once per record on the ingest path, and it can
+   * never fail a write — a slow or broken linker costs records their link, not
+   * their existence.
+   */
+  subjectLinker?: SubjectLinker;
+  /**
+   * What `subjectLinker.link()` gets per record before the write proceeds
+   * UNLINKED and counts a timeout. Default 50ms. Raise it only if you have
+   * measured the resolver; the default is chosen so a host outage degrades
+   * telemetry rather than stalling ingest behind it.
+   */
+  subjectLinkTimeoutMs?: number;
   logger?: Logger;
 }
 
@@ -157,7 +176,19 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     void p.finally(() => inFlight.delete(p));
   };
 
-  const emit = createEmitter({ registry, byKind, RollupModel, rejects, counters, logger, track });
+  // Resolved ONCE, and shared with the ingest router below rather than built
+  // twice: the linker is a policy (dedupe, the declared-type refusal, the cap,
+  // the timeout), and a policy that exists in two places is two policies.
+  const linkSubjects = createSubjectLinking({
+    linker: config.subjectLinker,
+    timeoutMs: config.subjectLinkTimeoutMs,
+    counters,
+    logger,
+  });
+
+  const emit = createEmitter({
+    registry, byKind, RollupModel, rejects, counters, logger, track, linkSubjects,
+  });
 
   const forget = createForget({
     TelemetryModel,
@@ -227,6 +258,17 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     counters,
     /** the registry, exposed for the router factories — hosts should import their own */
     registry,
+    /**
+     * Write-time subject linking, exposed for the router factories. `null` when
+     * no `subjectLinker` is configured.
+     *
+     * The wire path does not go through emit() — createIngest() builds its
+     * record itself, because at-least-once delivery inverts the plane order
+     * (insert first, THEN aggregate). So it reaches the linker the same way it
+     * reaches the registry and the models: off the instance, running the one
+     * implementation, rather than growing a second copy of the rules.
+     */
+    linkSubjects,
     logger,
     /** mint an ingest key; the full key string is returned once, never again */
     createKey: (input: CreateKeyInput) => createKey(KeyModel, input),

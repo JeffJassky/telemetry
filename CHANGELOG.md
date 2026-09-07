@@ -7,6 +7,70 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.5.0]
+
+### Added
+- **`subjectLinker` — the host attaches subjects at WRITE time, so a desktop
+  record can finally answer a question about a user.** A desktop client knows
+  its install and nothing else, so every record it sends carries
+  `machine:<installId>` and no `user`. The host can resolve most of those to an
+  account, but resolving them at READ time leaves a cohort funnel anchored on
+  `user` reading **zero** for every desktop stage: `import.completed`,
+  `export.completed`, `storyboard.opened` and `share.published` exist in volume
+  and are invisible to the only question anyone asked of them. A lifetime
+  `by:['subject']` rollup is keyed on the subject the record was written with,
+  permanently, and no later join can reach back into it — so the join has to
+  happen once, before the write, or the aggregate half never happens at all.
+
+  `createTelemetry({ subjectLinker })` takes one method — `link(subjects, { name,
+  tenantId })` — asked once per record, after the registry check and before the
+  document exists. Linked refs are **appended**; a `type:id` the record already
+  carries is never doubled and the DECLARED ref survives whole, `role` included,
+  because the caller knew and the linker is guessing. Past `SUBJECT_MAX` (8)
+  subjects on one record, further links are dropped and counted: every subject
+  is a multikey index term and one more fan-out per subject family, so the array
+  is bounded rather than trusted.
+
+  A linked type the event's `EventSpec.subjects` does not declare is **refused**
+  — dropped, counted, and warned about once. A write path that can quietly add a
+  type nobody declared turns the registry from a description of what rows
+  contain into a description of what rows used to contain. Note the edge before
+  you act on the warning: `EventSpec.subjects` is a REQUIRED list, so declaring
+  the type to let the link land also makes it mandatory, and a record whose link
+  MISSES then fails validation. Declare it only where the link is total.
+
+  **It can never fail a write.** The call is bounded by `subjectLinkTimeoutMs`
+  (default 50 ms) and guarded against synchronous throws, rejections and
+  nonsense return values. Every one of those resolves the same way: the record
+  is written with the subjects it came with, and a counter moves. Ingest is
+  at-least-once and unattended — a resolver that hangs must cost a record its
+  `user`, never its existence. An unlinked row is a worse row; a dropped row is
+  a lie about what happened.
+
+  Six new counters on `t.counters`, all zero without a linker, surfaced
+  everywhere the existing ones are (`/api/system`, the System page,
+  `telemetry_health`): `subjectsLinked` (subjects actually added, counted per
+  subject), `subjectLinkMisses` (the host answered `[]` — no link exists, which
+  is an answer), `subjectLinkErrors` (threw, rejected, or answered with
+  something that is not a list of refs), `subjectLinkTimeouts`,
+  `subjectLinkUndeclared`, `subjectLinkCapped`. They are split that finely
+  because every way linking can fail produces the SAME row, so without the split
+  a broken resolver and a host with nothing to link are the same silence. The
+  System page renders them as a second tile row only when linking has actually
+  run.
+
+  The hook lives at `emit()` **and** at the ingest router, running one shared
+  implementation off `t.linkSubjects`. Not two policies — one policy, two call
+  sites, because `createIngest` does not go through `emit()`: at-least-once
+  delivery inverts the plane order (insert first, THEN aggregate), so the wire
+  builds its own record. The wire is also where the machine ref actually
+  arrives, so a hook that lived only in `emit()` would have left the case the
+  feature exists for completely unlinked.
+
+  Nothing changes for a host that does not configure one: the linker resolves to
+  `null` at construction and the write path is the one 0.4.0 shipped. No new
+  indexes, no envelope change, no payload-index budget movement.
+
 ## [0.4.0]
 
 ### Added

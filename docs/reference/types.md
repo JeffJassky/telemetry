@@ -61,6 +61,8 @@ defineRegistry({
 | `INDEX_BUDGET` | `24` | Payload indexes the registry may plan. Mongo caps a collection at 64; base + discriminators use about ten. `syncIndexes()` throws over it. |
 | `BODY_MAX_CHARS` | `16384` | `body` cap in characters. Over it the value is clipped with a visible `… [truncated N chars]` marker and `counters.truncated` increments. Per-instance override: `bodyMax`. |
 | `PLATFORM_SCOPE` | `'*'` | The dashboard's cross-tenant read scope, and a **reserved** tenant token on every write path. |
+| `SUBJECT_MAX` | `8` | Total subjects one record may carry once `subjectLinker` has run. Every subject is a multikey index term and one more fan-out per `by:['subject']` family, so the array is bounded. Overflow is dropped and counted. |
+| `SUBJECT_LINK_TIMEOUT_MS` | `50` | Default `subjectLinkTimeoutMs`. Past it the record is written **unlinked** rather than waiting. |
 | `DEFAULT_LIMITS` | see [Query and view types](#query-and-view-types) | `QueryLimits`. |
 
 ### Helpers
@@ -419,10 +421,17 @@ interface TelemetryCounters {
   rollupSkippedBy: Record<string, number>;
   /** `${name}|${attrKey}` → count — which undeclared attr key keeps arriving */
   undeclaredAttrs: Record<string, number>;
+  /** write-time subject linking — all six stay at zero without a `subjectLinker` */
+  subjectsLinked: number;        // subjects actually ADDED, counted per subject
+  subjectLinkMisses: number;     // the host answered [] — no link exists
+  subjectLinkErrors: number;     // threw, rejected, or answered with non-refs
+  subjectLinkTimeouts: number;   // outran subjectLinkTimeoutMs; written unlinked
+  subjectLinkUndeclared: number; // a linked type the event does not declare
+  subjectLinkCapped: number;     // over SUBJECT_MAX (8) subjects on one record
 }
 ```
 
-The seven scalars are the shape hosts scrape; the two maps are additive, and
+The seven original scalars are the shape hosts scrape; the two maps are additive, and
 they exist because a scalar says something went wrong without saying where.
 `rollupSkippedBy` turns "12 records went missing" into a `dimDefault` you can go
 and declare; `undeclaredAttrs` groups a wave of identical validation failures
@@ -433,6 +442,11 @@ fold into `COUNTER_OVERFLOW_KEY` (`'(other)|(other)'`). The keys are
 client-controlled — an event name, an attr key — so an unbounded map would let a
 hostile client grow the process heap. The totals stay honest; only the
 attribution stops.
+
+The six linking counters are split that finely for the same reason: every way
+linking can fail ends in the *same row* — one written with the subjects it
+arrived with — so without the split, a broken resolver and a host that simply
+has no link to offer are the same silence.
 
 ## Suggestions
 
@@ -483,8 +497,26 @@ interface CreateTelemetryConfig<R extends Registry = Registry> {
   platforms?: readonly string[];  // EXTENDS the builtin platform list
   bodyMax?: number;               // else BODY_MAX_CHARS
   globalSubjectRefs?: boolean;    // a ref names the same party in EVERY tenant
+  subjectLinker?: SubjectLinker;  // WRITE-time: who else is this record about?
+  subjectLinkTimeoutMs?: number;  // else SUBJECT_LINK_TIMEOUT_MS (50)
   logger?: Logger;
 }
+
+/** WRITE-time — not `SubjectAdapter`, which labels refs at READ time */
+interface SubjectLinker {
+  link(
+    subjects: SubjectInput[],
+    ctx: { name: string; tenantId: string },
+  ): SubjectInput[] | Promise<SubjectInput[]>;
+}
+
+/** the guarded linker the instance resolved: merged subjects, or null if unchanged */
+type LinkSubjects = (
+  name: string,
+  spec: { subjects: readonly string[] },
+  tenantId: string,
+  declared: unknown,
+) => Promise<SubjectInput[] | null>;
 
 interface Telemetry<R extends Registry = Registry> {
   emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<EmitResult>;
@@ -495,6 +527,8 @@ interface Telemetry<R extends Registry = Registry> {
   flush(): Promise<void>;
   counters: TelemetryCounters;
   registry: R;
+  /** null without a `subjectLinker`; exposed for the router factories */
+  linkSubjects: LinkSubjects | null;
   logger: Logger;
   createKey(input: CreateKeyInput): Promise<{ key: string; id: string }>;
   models: {
@@ -526,6 +560,17 @@ interface ForgetResult {
 ```
 
 See [`createTelemetry`](/reference/factory) for the behaviour of each.
+
+`subjectLinker` is the only inbound adapter on the **write** side, and it is
+deliberately not `subjectAdapter` under another name: that one labels refs on a
+screen, this one changes what is stored. It is bounded by
+`subjectLinkTimeoutMs`, guarded against throws, and can never fail a write. Full
+semantics on [Adapters](/guide/adapters#subjectlinker).
+
+`t.linkSubjects` is that hook after the package has wrapped it — exposed the way
+`registry` and `models` are, because the ingest router does not call `emit()`
+and must reach the same implementation rather than growing a second copy of the
+rules.
 
 `globalSubjectRefs` is the host asserting something the package cannot verify:
 that `user:u_1` is the same person in every tenant. Its only effect today is that

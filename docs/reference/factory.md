@@ -38,6 +38,8 @@ survive into `AttrsOf`/`MetricsOf`.
 | `platforms` | `readonly string[]` | `[]` | **Extends** the builtin `client.platform` enum (`web`, `electron`, `ios`, `android`, `server`, `cli`) — never replaces it. |
 | `bodyMax` | `number` | `BODY_MAX_CHARS` (16384) | Per-instance `body` character cap. Over it the value is clipped, marked, and `counters.truncated` increments. |
 | `globalSubjectRefs` | `boolean` | `false` | Declares that a subject ref names the same party in **every** tenant. Only effect today: `forget()` also erases the person's platform-scoped saved views. Leave off when ids are minted per tenant. |
+| `subjectLinker` | `SubjectLinker` | absent | Attaches additional subjects to a record **at write time** — the desktop `machine:<installId>` you can resolve to a `user`, joined onto the row *and its rollups*. Runs once per record, so it must answer from a cache. See [Adapters](/guide/adapters#subjectlinker). |
+| `subjectLinkTimeoutMs` | `number` | `SUBJECT_LINK_TIMEOUT_MS` (50) | What `subjectLinker.link()` gets per record before the write proceeds **unlinked** and `counters.subjectLinkTimeouts` increments. |
 | `logger` | `Logger` | no-op | `{ info, warn, error }`. |
 
 ### Throws at construction

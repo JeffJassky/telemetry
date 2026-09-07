@@ -117,11 +117,32 @@ export interface TelemetryCounters {
    * happens to those records (they are rejected, not stripped).
    */
   undeclaredAttrs: Record<string, number>;
+  /**
+   * Write-time subject linking (createSubjectLinking() in emit.ts). All six are
+   * zero for a host with no `subjectLinker`, and they exist because linking is
+   * the one part of the write path that runs HOST code: every way it can fail
+   * ends in a record written unlinked, and a silently unlinked record is
+   * indistinguishable from one nobody could link. The split says which.
+   */
+  /** subjects actually ADDED to records — two links on one record count twice */
+  subjectsLinked: number;
+  /** records where the linker answered `[]` — no link exists, which is an answer */
+  subjectLinkMisses: number;
+  /** the linker threw, rejected, or returned something that is not a list of refs */
+  subjectLinkErrors: number;
+  /** the linker outran subjectLinkTimeoutMs and the record was written unlinked */
+  subjectLinkTimeouts: number;
+  /** a linked subject whose `type` the event's EventSpec.subjects does not declare */
+  subjectLinkUndeclared: number;
+  /** a linked subject dropped because the record already held SUBJECT_MAX of them */
+  subjectLinkCapped: number;
 }
 
 export const newCounters = (): TelemetryCounters => ({
   rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0,
   deduped: 0, truncated: 0, rollupSkippedBy: {}, undeclaredAttrs: {},
+  subjectsLinked: 0, subjectLinkMisses: 0, subjectLinkErrors: 0,
+  subjectLinkTimeouts: 0, subjectLinkUndeclared: 0, subjectLinkCapped: 0,
 });
 
 /**

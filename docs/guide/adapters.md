@@ -8,7 +8,8 @@ They come in two directions, and documenting only one is what makes the other lo
 arbitrary:
 
 - **Inbound** — the package asks the host a question. `resolveViewer(req)` → *who
-  is looking, and how widely?*
+  is looking, and how widely?*; `link(subjects)` → *who else is this record
+  about?*
 - **Outbound** — the host tells the package about a lifecycle event.
   `forget(tenantId, ref)` → *this person is gone.*
 
@@ -17,6 +18,7 @@ arbitrary:
 | `contextAdapter` | in | `createIngest` | only for `session`-mode keys |
 | `viewerAdapter` | in | `createDashboard` | **yes** |
 | `subjectAdapter` | in | `createDashboard` | no |
+| `subjectLinker` | in | `createTelemetry` | no |
 | `onSlowQuery` | out (package → host) | `createDashboard`, `createQueries` | no |
 | `logger` | out (package → host) | `createTelemetry` | no |
 | `forget()` | out (host → package) | — it is a method | — |
@@ -182,6 +184,116 @@ Returning a partial map is fine — refs you omit render raw too.
 
 ---
 
+## `subjectLinker` — inbound, **write time** {#subjectlinker}
+
+```ts
+interface SubjectLinker {
+  link(
+    subjects: SubjectInput[],
+    ctx: { name: string; tenantId: string },
+  ): SubjectInput[] | Promise<SubjectInput[]>;
+}
+```
+
+```ts
+const t = createTelemetry({
+  registry,
+  connection: mongoose,
+  subjectLinker: {
+    // answer from a cache. This runs once per record, on the ingest path.
+    link: (subjects) => {
+      const machine = subjects.find((s) => s.type === 'machine');
+      const userId = machine && OWNER_CACHE.get(machine.id);
+      return userId ? [{ type: 'user', id: userId }] : [];
+    },
+  },
+  subjectLinkTimeoutMs: 50,   // the default
+});
+```
+
+**When it is called:** once per record on the way to disk — from `emit()` and
+from the ingest router alike — after the registry check and before the record is
+built. Never for a record that was never going to be written: an unregistered
+name, a reserved tenant and a malformed `dedupeKey` are all refused before the
+host is asked.
+
+**Read the pair with `subjectAdapter`, because the names are close and the jobs
+are not.** `subjectAdapter.describe()` is a **read**-time labeller: it turns
+`user:u_1` into *"Dana Ellis"* on a screen and changes nothing about what is
+stored. `subjectLinker.link()` **changes the row**.
+
+**Why the write side needs its own seam at all.** A desktop client knows its
+install and nothing else, so every record it sends carries
+`machine:<installId>` and no `user`. Resolve that at read time and the raw rows
+can be joined — but a cohort funnel anchored on `user` still reads **zero** for
+every desktop stage, because a lifetime `by:['subject']` rollup is keyed on the
+subject the record was written with, permanently. `import.completed` exists in
+volume and is invisible to the only question anyone asked of it. Linking at
+write time puts the party on the row **and** on its aggregates, and the second
+half is the one no later join can reach.
+
+**Merge semantics, in the order they apply:**
+
+1. Linked refs are **appended** to the ones the record declared.
+2. A `type:id` the record already carries is never doubled, and the **declared**
+   one survives whole — including its `role`, which the caller knew and the
+   linker is guessing at.
+3. A linked type the event's `EventSpec.subjects` does not declare is **refused**
+   — dropped from the record, counted in `counters.subjectLinkUndeclared`, and
+   warned about once. A write path that can quietly add a type nobody declared
+   turns the registry from a description of what rows contain into a description
+   of what rows used to contain.
+4. Past `SUBJECT_MAX` (8) subjects on one record, further links are dropped and
+   counted in `counters.subjectLinkCapped`. Room is measured against what the
+   record brought, so its own refs are never displaced by a derived one.
+
+::: warning `EventSpec.subjects` is a REQUIRED list
+Declaring `user` on `import.completed` so the link may land also makes `user`
+**mandatory** for that event — and a record whose link *misses* then fails
+validation and is quarantined, which is a far worse outcome than an unlinked
+row. Declare the linked type only for events whose link is **total**. For events
+where the host resolves *most* machines, leave the type undeclared and read the
+refusal counter until that changes.
+:::
+
+**It can never fail a write.** The call is wrapped in a timeout
+(`subjectLinkTimeoutMs`, default 50 ms) and guarded against throws, rejections
+and nonsense return values. Every one of those resolves the same way: the record
+is written with the subjects it came with, and a counter moves. Ingest is
+at-least-once and unattended — a resolver that hangs must cost a record its
+`user`, never its existence. An unlinked row is a worse row; a dropped row is a
+lie about what happened.
+
+**So it must be cached.** It runs once per record. A resolver that queries the
+database per record will spend its 50 ms and start writing everything unlinked,
+which the timeout counter will say out loud and the funnel will not.
+
+**Six counters, because six things can happen:**
+
+| counter | |
+|---|---|
+| `subjectsLinked` | subjects actually **added** — two links on one record count twice |
+| `subjectLinkMisses` | the host answered `[]`. *"No link exists"* is an answer, not a failure |
+| `subjectLinkErrors` | threw, rejected, or answered with something that is not a list of refs |
+| `subjectLinkTimeouts` | outran the budget; the record went to disk unlinked |
+| `subjectLinkUndeclared` | a linked type the event does not declare — refused |
+| `subjectLinkCapped` | over `SUBJECT_MAX` on one record |
+
+The failure four are the difference between *"nothing links"* and *"the link is
+broken and every desktop row is landing anonymous"*, which is otherwise the same
+silence. They surface on `t.counters`, on the dashboard's System page and in
+`telemetry_health`, like every other counter.
+
+**When it is absent:** nothing is called, nothing is counted, and the write path
+is exactly the one that shipped before it existed. `t.linkSubjects` is `null`.
+
+**Linking is not retroactive.** It runs at write time, so it fixes the rows and
+rollups written *after* you configure it. Records already on disk keep the
+subjects they were written with — backfilling those is a host migration over
+`t.scoped()`, not something this hook can reach.
+
+---
+
 ## `onSlowQuery` — outbound, observability
 
 ```ts
@@ -270,6 +382,7 @@ sink, and both already have a universal shape in every host.
 ## Where to go next
 
 - [Ingest & keys](/guide/ingest) — `contextAdapter` in its three key modes
+- [Emitting records](/guide/emit) — where `subjectLinker` sits in the write path
 - [The dashboard](/guide/dashboard) — mounting behind `viewerAdapter`
 - [Erasure](/guide/erasure) — the outbound direction in full
 - [Configuration](/guide/configuration) — everything else on the factory
