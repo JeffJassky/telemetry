@@ -31,13 +31,19 @@ real if CI runs the matrix. See standards/traps.md #10.
   is a multikey index term and one more fan-out per subject family, so the array
   is bounded rather than trusted.
 
-  A linked type the event's `EventSpec.subjects` does not declare is **refused**
-  — dropped, counted, and warned about once. A write path that can quietly add a
-  type nobody declared turns the registry from a description of what rows
-  contain into a description of what rows used to contain. Note the edge before
-  you act on the warning: `EventSpec.subjects` is a REQUIRED list, so declaring
-  the type to let the link land also makes it mandatory, and a record whose link
-  MISSES then fails validation. Declare it only where the link is total.
+  A linked type the event's `EventSpec.subjects` does not declare is **written
+  anyway**, and counted in `subjectLinkUndeclared`. Refusing it was the obvious
+  rule and it is the wrong one: `EventSpec.subjects` is a REQUIRED list, so the
+  only way to satisfy a refusal is to make the type mandatory — and a linked
+  type is mandatory for nobody, because linking exists precisely because SOME
+  records resolve and some do not. Declaring `user` on a desktop event to permit
+  the link would quarantine every record from a machine that has not been
+  activated yet, deleting the pre-activation funnel in order to describe the
+  post-activation one. A refusal that can only be obeyed by losing data is not a
+  rule, it is a dead feature: the type stays undeclared, every link is dropped,
+  and the hook does nothing at all. So undeclared is a fact to REPORT — the
+  counter names which event carries which extra type, ready for the day the link
+  becomes total.
 
   **It can never fail a write.** The call is bounded by `subjectLinkTimeoutMs`
   (default 50 ms) and guarded against synchronous throws, rejections and

@@ -28,11 +28,13 @@ const linkRegistry = () =>
       rollups: [{ by: ['subject'], subjects: ['user'] }],
       description: 'A desktop import finished — the stage the user funnel could not see',
     },
-    // the same shape with `user` UNDECLARED — the refusal path
+    // the same shape with `user` UNDECLARED — the shape a real host is FORCED
+    // into, because declaring `user` here would make it required and quarantine
+    // every record from a machine nobody has activated yet
     'export.completed': {
       kind: 'event', origin: 'any', subjects: ['machine'],
       rollups: [{ by: ['subject'], subjects: ['user'] }],
-      description: 'Declares only machine — a linked user has nowhere legal to land',
+      description: 'Declares only machine — the link still has to land, or the hook is dead',
     },
     'share.published': {
       kind: 'event', origin: 'server', subjects: ['machine', 'user'],
@@ -151,26 +153,39 @@ describe('subject linking — the desktop record the user funnel could not see',
     expect(t.counters.subjectLinkCapped).toBe(1);
   });
 
-  it('a linked type the event does not declare is REFUSED and counted — the registry stays a description of what rows contain', async () => {
+  it('a linked type the event does not declare is WRITTEN and counted — refusing it could only be obeyed by losing rows', async () => {
     const { hook } = linker(resolveOwner);
-    const { warns, logger } = warnLogger();
-    const t = build({ subjectLinker: hook, logger });
+    const t = build({ subjectLinker: hook });
 
     for (const id of ['m1', 'm2', 'm3']) await t.emit('export.completed', machineOnly(id));
     await t.flush();
 
     const rows = await t.models.telemetry.find({ name: 'export.completed' }).lean() as any[];
-    expect(rows).toHaveLength(3); // the record survives its refused link
+    expect(rows).toHaveLength(3);
+    // The link LANDS. `export.completed` does not declare `user` and must not:
+    // the declaration is a REQUIRED list, so declaring it to permit the link
+    // would quarantine every record from an unactivated machine instead.
     // fire-and-forget writes land in any order, so assert the SET
-    expect(rows.flatMap((r) => r.subjectKeys).sort()).toEqual(['machine:m1', 'machine:m2', 'machine:m3']);
+    expect(rows.flatMap((r) => r.subjectKeys).sort())
+      .toEqual(['machine:m1', 'machine:m2', 'machine:m3', 'user:u_m1', 'user:u_m2', 'user:u_m3'].sort());
+    expect(t.counters.subjectsLinked).toBe(3);
+    // reported, not enforced — this is what tells a host the registry has
+    // drifted from what rows actually carry
     expect(t.counters.subjectLinkUndeclared).toBe(3);
-    expect(t.counters.subjectsLinked).toBe(0);
+  });
 
-    // rate-limited: three records, ONE line. This fires from the write path.
-    const undeclared = warns.filter((w) => w.includes('does not declare it'));
-    expect(undeclared).toHaveLength(1);
-    // …and it names the trap rather than telling a host to make `user` required
-    expect(undeclared[0]).toContain('REQUIRED list');
+  it('an undeclared linked subject reaches the ROLLUP too — a milestone family keyed by it is the whole point', async () => {
+    const { hook } = linker(resolveOwner);
+    const t = build({ subjectLinker: hook });
+
+    await t.emit('export.completed', machineOnly('m1'));
+    await t.flush();
+
+    // `export.completed` declares only `machine`, so this rollup exists ONLY
+    // because the undeclared link was written rather than refused
+    const roll = await t.models.rollups.findOne({ as: 'export.completed' }).lean() as any;
+    expect(roll.dims).toEqual(['user:u_m1']);
+    expect(roll.subjectType).toBe('user');
   });
 
   it('a linker that throws costs the record its link, never its existence — ingest is unattended', async () => {

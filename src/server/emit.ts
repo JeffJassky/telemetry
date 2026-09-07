@@ -295,23 +295,26 @@ export function createSubjectLinking(opts: {
       const key = `${ref.type}:${ref.id}`;
       if (seen.has(key)) continue;
 
-      // A linked type the registry does not declare is REFUSED, not written.
-      // The registry is the description of what rows contain; a write path that
-      // can quietly add a type nobody declared makes it a description of what
-      // rows used to contain.
+      // A linked type the registry does not declare is WRITTEN, and counted.
+      //
+      // Refusing it here was the obvious rule and it is the wrong one, because
+      // `EventSpec.subjects` is a REQUIRED list — `model.ts` quarantines a
+      // record missing any type declared there. So the only way to satisfy a
+      // refusal is to make the type mandatory, and a linked type is mandatory
+      // for nobody: linking exists precisely because SOME records resolve and
+      // some do not. Declaring `user` on a desktop event to permit the link
+      // would quarantine every record from a machine that has not been
+      // activated yet — deleting the pre-activation funnel to describe the
+      // post-activation one. A refusal that can only be satisfied by data loss
+      // is not a rule, it is a dead feature: the type stays undeclared, every
+      // link is dropped, and the hook does nothing at all.
+      //
+      // Undeclared is therefore a fact to REPORT, not to enforce. The registry
+      // stays honest because the count says exactly which name is carrying
+      // which extra type, and `deriveSuggestions` can turn that into "declare
+      // it" advice on the day the link becomes total.
       if (!spec.subjects.includes(ref.type)) {
         counters.subjectLinkUndeclared++;
-        warnOnce(
-          `undeclared|${name}|${ref.type}`,
-          `[telemetry] subjectLinker returned subject type "${ref.type}" for "${name}", which ` +
-          'does not declare it — the subject was dropped and the record written with what it ' +
-          'came with. Read this before "fixing" it: `EventSpec.subjects` is a REQUIRED list, so ' +
-          `adding "${ref.type}" there also makes it mandatory, and every record of this name ` +
-          'whose link MISSES would then fail validation and be quarantined. Declare it only ' +
-          'where the link is total. Warned once per event and type — the count is ' +
-          'counters.subjectLinkUndeclared.',
-        );
-        continue;
       }
       if (room <= 0) {
         capped++;

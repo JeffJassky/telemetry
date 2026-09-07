@@ -238,22 +238,31 @@ half is the one no later join can reach.
 2. A `type:id` the record already carries is never doubled, and the **declared**
    one survives whole — including its `role`, which the caller knew and the
    linker is guessing at.
-3. A linked type the event's `EventSpec.subjects` does not declare is **refused**
-   — dropped from the record, counted in `counters.subjectLinkUndeclared`, and
-   warned about once. A write path that can quietly add a type nobody declared
-   turns the registry from a description of what rows contain into a description
-   of what rows used to contain.
+3. A linked type the event's `EventSpec.subjects` does not declare is **written
+   anyway**, and counted in `counters.subjectLinkUndeclared`. See the warning
+   below for why refusing it would be a rule that can only be obeyed by losing
+   data.
 4. Past `SUBJECT_MAX` (8) subjects on one record, further links are dropped and
    counted in `counters.subjectLinkCapped`. Room is measured against what the
    record brought, so its own refs are never displaced by a derived one.
 
-::: warning `EventSpec.subjects` is a REQUIRED list
-Declaring `user` on `import.completed` so the link may land also makes `user`
-**mandatory** for that event — and a record whose link *misses* then fails
-validation and is quarantined, which is a far worse outcome than an unlinked
-row. Declare the linked type only for events whose link is **total**. For events
-where the host resolves *most* machines, leave the type undeclared and read the
-refusal counter until that changes.
+::: warning Do not declare the linked type to "permit" the link
+`EventSpec.subjects` is a **required** list: `model.ts` quarantines any record
+missing a type declared there. So declaring `user` on `import.completed` does
+not authorise the link, it makes `user` **mandatory** — and every record from a
+machine that has not been activated yet fails validation and is thrown away.
+That is the pre-activation funnel, deleted in order to describe the
+post-activation one.
+
+This is exactly why an undeclared linked type is written rather than refused. A
+linked type is mandatory for nobody — linking exists *because* some records
+resolve and some do not — so a refusal could only ever be satisfied by data
+loss, and in practice would not be satisfied at all: the type stays undeclared,
+every link is dropped, and the hook does nothing.
+
+`subjectLinkUndeclared` is therefore a **report**, not an enforcement. It names
+which event is carrying which extra type, so the registry can be corrected on
+the day a link becomes total — and left alone while it is not.
 :::
 
 **It can never fail a write.** The call is wrapped in a timeout
@@ -276,7 +285,7 @@ which the timeout counter will say out loud and the funnel will not.
 | `subjectLinkMisses` | the host answered `[]`. *"No link exists"* is an answer, not a failure |
 | `subjectLinkErrors` | threw, rejected, or answered with something that is not a list of refs |
 | `subjectLinkTimeouts` | outran the budget; the record went to disk unlinked |
-| `subjectLinkUndeclared` | a linked type the event does not declare — refused |
+| `subjectLinkUndeclared` | a linked type the event does not declare — written, and reported |
 | `subjectLinkCapped` | over `SUBJECT_MAX` on one record |
 
 The failure four are the difference between *"nothing links"* and *"the link is

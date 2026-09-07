@@ -324,7 +324,7 @@ is a payload, quarantines it.
 | `subjectLinkMisses` | the linker answered `[]`. *"No link exists"* is an answer |
 | `subjectLinkErrors` | the linker threw, rejected, or answered with something that is not a list of refs |
 | `subjectLinkTimeouts` | the linker outran its budget; the record was written unlinked |
-| `subjectLinkUndeclared` | a linked subject type the event does not declare — refused |
+| `subjectLinkUndeclared` | a linked subject type the event does not declare — written, and reported |
 | `subjectLinkCapped` | a linked subject over `SUBJECT_MAX` (8) on one record |
 
 The six linking counters stay at zero without a `subjectLinker`, and the five
