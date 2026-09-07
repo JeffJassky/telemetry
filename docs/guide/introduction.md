@@ -35,7 +35,9 @@ Stating this first, because the scope is narrow on purpose ([build plan
 - **Not session replay, not an issue tracker.** Error grouping is here; status,
   assignee, and workflow are host data.
 - **No components in your tree.** The dashboard is a router you mount, not a
-  React component you import. Your app can be Vue, Svelte, or server-rendered.
+  React component you import. Your app can be Vue, Svelte, or server-rendered —
+  and it derives its report builder from your registry, so a new event or rollup
+  family is a new chart with no UI code ([Reports](/guide/reports)).
 - **No schedulers.** The package ships jobs; your host schedules them.
 
 Sized for small SaaS — thousands of users, not billions of events. That
@@ -128,5 +130,7 @@ derived aggregates are exact regardless of either.
   field is where it is.
 - [Emitting records](/guide/emit) — the two-plane write path, outcomes,
   idempotency, durability.
+- [Reports](/guide/reports) — the catalog derived from your registry, and the
+  one shape every chart, saved view and MCP query is written in.
 - [Erasure](/guide/erasure) — what `forget()` guarantees and why `data` is
   dropped unless declared.

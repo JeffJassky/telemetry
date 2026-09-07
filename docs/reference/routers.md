@@ -60,6 +60,12 @@ The read surface: `/api/*` plus the built React SPA with hashed assets and an SP
 fallback. See [The dashboard](/guide/dashboard) and
 [Admin HTTP API](/reference/http-admin).
 
+The options below are unchanged by the report engine. What changed is inside the
+SPA: it ships an **Explore** page — a report builder derived from the catalog,
+whose URL is the Report it renders — and `views[].query` is now a
+[Report](/guide/reports) rather than a bag of filter terms. Neither needs
+configuration; both fall out of `telemetry.registry`.
+
 ### Options
 
 | Option | Type | Default | |
@@ -67,7 +73,7 @@ fallback. See [The dashboard](/guide/dashboard) and
 | `telemetry` | `Telemetry` | — | **Required.** |
 | `viewerAdapter` | `ViewerAdapter` | — | **Required — construction throws without it.** `{ resolveViewer(req): Viewer \| null \| Promise<…> }`. |
 | `subjectAdapter` | `SubjectAdapter` | none | `{ describe(refs): Promise<Record<string, { label, href? }>> }`. Absent, `/api/subjects/describe` returns `{ refs: {} }` and the UI renders raw refs. |
-| `views` | `ViewSpec[]` | `[]` | Configured views — versioned in host code. Shadowed by saved views of the same name; shadow derived ones. |
+| `views` | `ViewSpec[]` | `[]` | Configured views — versioned in host code. Shadowed by saved views of the same name; shadow derived ones. Each `query` is a [Report](/guide/reports); the pre-Report shape still parses. |
 | `queryLimits` | `Partial<QueryLimits>` | [`DEFAULT_LIMITS`](/reference/types#query-and-view-types) | Per-primitive caps. |
 | `onSlowQuery` | `(info: { op, ms, params }) => void` | none | Called when a read exceeds `slowMs`. |
 | `slowMs` | `number` | `500` | The threshold `onSlowQuery` fires above. Forwarded to [`createQueries`](/reference/types#queries). |
@@ -80,9 +86,10 @@ fallback. See [The dashboard](/guide/dashboard) and
 
 The query cache is **per router instance**, in memory, on the same terms as the
 ingest router's key cache: two Node processes hold two caches. It covers the
-four aggregating primitives — `series`, `distribution`, `rollups`,
-`distinctCount` — so `cacheTtlMs` is also the lag between a write landing and a
-chart moving. `records`, `trace`, `journey`, and `funnel` are never cached.
+five aggregating primitives — `series`, `breakdown`, `distribution`, `rollups`,
+`distinctCount` — plus the `/values` lookup, which keeps a cache of its own on
+the same semantics. So `cacheTtlMs` is also the lag between a write landing and
+a chart moving. `records`, `trace`, `journey`, and `funnel` are never cached.
 
 ### Throws at construction
 

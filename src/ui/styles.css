@@ -239,6 +239,7 @@ a { color: inherit; text-decoration: none; }
 
 /* ===== Charts ===== */
 .spark { width: 100%; height: 32px; display: block; }
+.chart-svg { width: 100%; display: block; }
 .chart-card { padding: 16px; }
 .chart-axis text { font-size: 10.5px; fill: var(--fg-subtle); font-family: var(--font-sans); }
 .chart-grid line { stroke: var(--border); stroke-dasharray: 2 3; }

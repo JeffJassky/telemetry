@@ -16,9 +16,12 @@ import { findFamily, runFunnel, type FunnelParams, type FunnelResult } from './f
  *
  * What is universal is the cap: every primitive carries its `$limit` INSIDE the
  * pipeline rather than applying it to a materialised result, the caps are
- * config, and the four that can cut an answer short — rollups, distribution,
- * distinctCount, funnel — report `truncated` rather than undercounting in
- * silence. The slow-query counter is an adapter. Every response reports
+ * config, and the five that can cut an answer short — rollups, distribution,
+ * distinctCount, funnel, breakdown — report `truncated` rather than
+ * undercounting in silence. What each cap BOUNDS differs, and QueryLimits below
+ * says which are output caps and which are scan caps: breakdown's, like
+ * series', bounds the groups returned and never the rows read. The slow-query
+ * counter is an adapter. Every response reports
  * `dataSource` (recon #2) so a spliced number can always say which store
  * answered.
  *
@@ -34,12 +37,36 @@ import { findFamily, runFunnel, type FunnelParams, type FunnelResult } from './f
  * attributable — do not project it away.
  */
 
+/**
+ * Two kinds of cap live here and the difference is worth stating, because the
+ * word "limit" hides it. An OUTPUT cap bounds what the response contains: its
+ * `$limit` sits after the `$group`/sort or rides an indexed cursor, so the work
+ * behind it is bounded by the range and the indexes, not by the number. A SCAN
+ * cap bounds what the primitive reads, which means an answer past it is an
+ * undercount — so every scan-capped primitive reports `truncated`.
+ */
 export interface QueryLimits {
+  // ── output caps ──
   records: number;
   series: number;
   rollups: number;
   trace: number;
   journey: number;
+  /**
+   * Distinct GROUPS one breakdown() returns — the top N by measure, read as
+   * cap+1 so truncation is observed. Never a bound on rows scanned: "the top
+   * models this quarter" is exactly the question Mongo folds a million rows
+   * into in one pass (reports §6).
+   */
+  breakdown: number;
+  /**
+   * Distinct VALUES one /values lookup returns — the top N by count, read as
+   * cap+1 so truncation is observed. Never a bound on rows scanned: the
+   * `$limit` sits after the `$group`, exactly as breakdown's does (reports §5).
+   */
+  values: number;
+
+  // ── scan caps ──
   /** raw docs distribution will scan before it reports an undercount */
   distribution: number;
   /** rollup docs distinctCount will scan before it reports an undercount */
@@ -54,6 +81,8 @@ export const DEFAULT_LIMITS: QueryLimits = {
   rollups: 500,
   trace: 500,
   journey: 500,
+  breakdown: 50, // top groups — a starting point, to be measured on real hosts
+  values: 200, // top values of one dimension — a picker, not a table
   distribution: 100_000,
   distinct: 100_000,
   funnel: 5_000,
@@ -61,7 +90,14 @@ export const DEFAULT_LIMITS: QueryLimits = {
 
 export interface RecordFilter {
   kind?: string;
-  name?: string;
+  /**
+   * One event name, or a SET of them as an `$in`. The set form exists because a
+   * namespace or a rollup family is several names, and without it the only
+   * honest read for one was "every record of that kind in the range" — a scan
+   * sold as a filter (reports §6). An empty array is treated as absent, never
+   * as a term that matches nothing.
+   */
+  name?: string | string[];
   severity?: string;
   env?: string;
   service?: string;
@@ -82,9 +118,33 @@ export interface TimeRange {
   to: Date;
 }
 
+/** one group of a breakdown; `at` only when an `interval` was asked for */
+export interface BreakdownRow {
+  dims: (string | null)[];
+  at?: Date;
+  value: number;
+}
+
+export interface BreakdownResult {
+  rows: BreakdownRow[];
+  /** distinct groups RETURNED — never more than the cap */
+  groups: number;
+  /** more groups existed than the cap; the ones kept are the top by measure */
+  truncated: boolean;
+  /**
+   * The per-bucket pass hit ITS ceiling (`limits.series` buckets per returned
+   * group), so some group is missing buckets. Always false without an
+   * `interval`, and separate from `truncated` because they cut different axes:
+   * one drops groups, the other drops periods of a group that IS shown.
+   */
+  bucketsTruncated: boolean;
+  dataSource: 'raw';
+}
+
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-function buildMatch(scope: string, range: TimeRange, f: RecordFilter): Record<string, unknown> {
+/** exported for values.ts — the raw step must match rows exactly as the primitives do */
+export function buildMatch(scope: string, range: TimeRange, f: RecordFilter): Record<string, unknown> {
   const match: Record<string, any> = {
     // the ONLY place the tenant term is optional. Omitted under '*' — every
     // other term still applies, and the time range is still mandatory (§18).
@@ -92,7 +152,12 @@ function buildMatch(scope: string, range: TimeRange, f: RecordFilter): Record<st
     occurredAt: { $gte: range.from, $lt: range.to },
   };
   for (const k of ['kind', 'name', 'severity', 'env', 'service', 'release', 'traceId'] as const) {
-    if (f[k]) match[k] = f[k];
+    const v = f[k];
+    // only `name` is ever a set; an empty one is an absent term rather than an
+    // `$in: []` that silently matches nothing
+    if (Array.isArray(v)) {
+      if (v.length) match[k] = { $in: v };
+    } else if (v) match[k] = v;
   }
   if (f.subject) match.subjectKeys = f.subject;
   for (const [k, v] of Object.entries(f.attrs ?? {})) match[`attrs.${k}`] = v;
@@ -117,8 +182,107 @@ function buildMatch(scope: string, range: TimeRange, f: RecordFilter): Record<st
   return match;
 }
 
-/** simple TTL cache with in-flight coalescing — proven shape in maxed */
-class QueryCache {
+export type Interval = 'hour' | 'day' | 'week' | 'month';
+
+const INTERVALS: readonly Interval[] = ['hour', 'day', 'week', 'month'];
+
+/** weeks start Monday, UTC — the same truncation everywhere it is asked for */
+const truncTo = (path: string, unit: Interval) => ({
+  $dateTrunc: { date: path, unit, ...(unit === 'week' ? { startOfWeek: 'monday' } : {}) },
+});
+
+/**
+ * The measure grammar, in ONE place: `count` (default), `sum:<metric>`,
+ * `avg:<metric>`. series() and breakdown() must agree on what a measure means
+ * — two copies of this regex is two chances for "sum:cost_usd" to mean
+ * different things on a chart and in the table beside it.
+ *
+ * `count` sums 1/sampleRate rather than counting documents, so it extrapolates
+ * correctly the day a rate drops below 1 (§5.3).
+ *
+ * `durationMs` is the one metric name that is not in `metrics`: a span's
+ * duration lives on the ENVELOPE, which is where distribution() has always read
+ * it from. Resolving it to `$metrics.durationMs` here would have aggregated a
+ * path no record carries and reported 0 — a number, confidently wrong — so the
+ * branch is in the shared accumulator rather than in either caller.
+ */
+function measureAccumulator(measure: string): Record<string, unknown> {
+  const m = /^(sum|avg):(.+)$/.exec(measure);
+  if (!m) return { $sum: { $divide: [1, { $ifNull: ['$sampleRate', 1] }] } };
+  const path = m[2] === 'durationMs' ? '$durationMs' : `$metrics.${m[2]}`;
+  return m[1] === 'sum' ? { $sum: path } : { $avg: path };
+}
+
+const badRequest = (message: string) =>
+  Object.assign(new Error(`telemetry: breakdown() — ${message}`), { status: 400 });
+
+/**
+ * The envelope paths breakdown() will `$group` on. An ALLOWLIST, not a
+ * passthrough: every one of these is either indexed or low-cardinality
+ * enveloped metadata. `data.*` and `body` are deliberately absent — they are
+ * free-form user content with no index behind them, and a `$group` over an
+ * arbitrary path is an unbounded scan of exactly the payloads the rest of this
+ * package works to keep out of aggregates.
+ */
+const BREAKDOWN_FIELDS: readonly string[] = [
+  'kind', 'name', 'severity', 'env', 'service', 'release', 'origin',
+  'client.platform', 'client.appVersion',
+  'usage.meter', 'usage.billedTo', 'usage.unit',
+  'state.key', 'state.to',
+  'error.type', 'error.handled',
+];
+
+/** 'user:u_1' → 'user'; null for an absent ref, never a thrown $split */
+const typePrefix = (ref: unknown) => ({
+  $let: {
+    vars: { ref },
+    in: {
+      $cond: [
+        { $eq: [{ $type: '$$ref' }, 'string'] },
+        { $arrayElemAt: [{ $split: ['$$ref', ':'] }, 0] },
+        null,
+      ],
+    },
+  },
+});
+
+/**
+ * One groupBy token → the aggregation expression it groups on. The syntax is
+ * the catalog's and the rollup `by` syntax, so a dim key passes straight
+ * through from one to the other.
+ *
+ * Every expression resolves an absent value to an explicit `null` rather than
+ * leaving the field missing: a record with no `plan` is a group ("none"), not a
+ * row to drop. That is the raw-side analogue of a family's `dimDefault`.
+ */
+export function dimExpression(dim: string): unknown {
+  if (dim.startsWith('attr:')) {
+    const key = dim.slice(5);
+    if (!key) throw badRequest('`attr:` needs a key, e.g. "attr:plan"');
+    return { $ifNull: [`$attrs.${key}`, null] };
+  }
+  if (dim.startsWith('field:')) {
+    const path = dim.slice(6);
+    if (!BREAKDOWN_FIELDS.includes(path)) {
+      throw badRequest(
+        `"field:${path}" is not groupable. Allowed paths: ${BREAKDOWN_FIELDS.join(', ')}. ` +
+          'Grouping by `data.*`, `body`, or an arbitrary path is refused — those are unindexed ' +
+          'free-form content, and a $group over them scans it all. Use `attr:<key>` for a declared attr.',
+      );
+    }
+    return { $ifNull: [`$${path}`, null] };
+  }
+  if (dim === 'subjectType') return typePrefix({ $arrayElemAt: ['$subjectKeys', 0] });
+  if (dim === 'actorType') return typePrefix('$actor');
+  throw badRequest(
+    `"${dim}" is not a dimension. Use "attr:<key>", "field:<path>", "subjectType" or "actorType".`,
+  );
+}
+
+/** simple TTL cache with in-flight coalescing — proven shape in maxed.
+ *  Exported so values.ts memoizes on exactly these semantics rather than
+ *  keeping a second copy that could drift on eviction or error handling. */
+export class QueryCache {
   private store = new Map<string, { at: number; value: Promise<unknown> }>();
   constructor(private ttlMs: number, private cap: number) {}
   get<T>(key: string, produce: () => Promise<T>): Promise<T> {
@@ -212,30 +376,141 @@ export function createQueries(ctx: QueryCtx) {
       scope: string,
       range: TimeRange,
       filter: RecordFilter,
-      opts: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' } = {},
+      opts: { measure?: string; interval?: Interval } = {},
     ) {
       const { measure = 'count', interval = 'day' } = opts;
       const key = JSON.stringify(['series', scope, range.from, range.to, filter, measure, interval]);
       return cache.get(key, () =>
         timed('series', { scope, filter, measure, interval }, async () => {
-          const m = /^(sum|avg):(.+)$/.exec(measure);
-          const value = !m
-            ? { $sum: { $divide: [1, { $ifNull: ['$sampleRate', 1] }] } }
-            : m[1] === 'sum'
-              ? { $sum: `$metrics.${m[2]}` }
-              : { $avg: `$metrics.${m[2]}` };
           const buckets = await ctx.TelemetryModel.aggregate([
             { $match: buildMatch(scope, range, filter) },
-            {
-              $group: {
-                _id: { $dateTrunc: { date: '$occurredAt', unit: interval, ...(interval === 'week' ? { startOfWeek: 'monday' } : {}) } },
-                value,
-              },
-            },
+            { $group: { _id: truncTo('$occurredAt', interval), value: measureAccumulator(measure) } },
             { $sort: { _id: 1 } },
             { $limit: limits.series },
           ] as any[]);
           return { buckets: buckets.map((b: any) => ({ at: b._id, value: b.value })), dataSource: 'raw' as const };
+        }),
+      );
+    },
+
+    /**
+     * Top groups of a measure by one or two dimensions — "which models cost the
+     * most", "errors by release", "events by platform per week". The primitive
+     * that replaces a page's client-side grouping of whatever rows it happened
+     * to have fetched, which answered "this page" while reading like it
+     * answered the range (reports §6).
+     *
+     * THE CAP IS ON GROUPS RETURNED, NEVER ON ROWS SCANNED. Every `$limit`
+     * below sits AFTER a `$group`, exactly as series() does: the scan is bounded
+     * by buildMatch — tenant, range, filters, indexes — and nothing else, so a
+     * quarter of a million records is one pass and 50 rows. Truncation
+     * therefore keeps the TOP groups by measure, which is what a breakdown
+     * table means; a cap on documents scanned would return an arbitrary prefix
+     * and call it the top.
+     *
+     * With an `interval` this runs a SECOND aggregate restricted to the top
+     * groups, rather than one pipeline that groups by (dims, bucket) and folds.
+     * Two reasons: the ranking must be the measure over the WHOLE range (the
+     * same number the no-interval call reports), and folding in one pass means
+     * `$push`-ing every bucket of every group before the cap can apply — the
+     * unbounded intermediate this primitive exists to avoid. The restriction is
+     * an `$expr`/`$or` over the ≤ cap tuples because a dim can be a computed
+     * expression (subjectType), which a plain `$in` on a path cannot address.
+     *
+     * Under PLATFORM_SCOPE it aggregates ACROSS tenants, like series() — one
+     * set of groups with every tenant summed into it, which is the platform-wide
+     * table a platform operator came for. Ask for a per-tenant split by scoping
+     * to a tenant, or with rollups().
+     */
+    breakdown(
+      scope: string,
+      range: TimeRange,
+      filter: RecordFilter,
+      opts: {
+        /** 1–2 of `attr:<key>` | `field:<path>` | `subjectType` | `actorType` */
+        groupBy: string[];
+        measure?: string;
+        interval?: Interval;
+        /** groups, clamped to limits.breakdown */
+        limit?: number;
+      },
+    ) {
+      const groupBy = opts.groupBy ?? [];
+      if (groupBy.length < 1 || groupBy.length > 2) {
+        // three dims is a pivot table nobody can read and a group count that
+        // multiplies; zero is series() with extra steps
+        throw badRequest(`groupBy takes 1 or 2 dimensions, got ${groupBy.length}`);
+      }
+      const measure = opts.measure ?? 'count';
+      const interval = opts.interval;
+      if (interval && !INTERVALS.includes(interval)) {
+        throw badRequest(`interval must be one of ${INTERVALS.join(', ')}`);
+      }
+      // resolved (and refused) BEFORE the cache key is built — an invalid dim is
+      // a 400 on every call, not a rejection remembered for ten minutes
+      const dims = groupBy.map(dimExpression);
+      const cap = Math.min(Math.max(1, opts.limit ?? limits.breakdown), limits.breakdown);
+      const key = JSON.stringify([
+        'breakdown', scope, range.from, range.to, filter, groupBy, measure, interval ?? null, cap,
+      ]);
+      return cache.get(key, () =>
+        timed('breakdown', { scope, filter, groupBy, measure, interval }, async (): Promise<BreakdownResult> => {
+          const match = buildMatch(scope, range, filter);
+          const dimId = Object.fromEntries(dims.map((expr, i) => [`d${i}`, expr]));
+          // cap+1 so truncation is OBSERVED rather than inferred from an exact
+          // match, the same read rollups() and distribution() do
+          const top = await ctx.TelemetryModel.aggregate([
+            { $match: match },
+            { $group: { _id: dimId, value: measureAccumulator(measure) } },
+            { $sort: { value: -1, _id: 1 } },
+            { $limit: cap + 1 },
+          ] as any[]);
+          const truncated = top.length > cap;
+          if (truncated) top.pop();
+          const tuples: (string | null)[][] = top.map((g: any) =>
+            groupBy.map((_, i) => g._id?.[`d${i}`] ?? null),
+          );
+          if (!interval) {
+            return {
+              rows: top.map((g: any, i: number) => ({ dims: tuples[i]!, value: g.value })),
+              groups: top.length,
+              truncated,
+              bucketsTruncated: false,
+              dataSource: 'raw' as const,
+            };
+          }
+          if (!tuples.length) {
+            return { rows: [], groups: 0, truncated, bucketsTruncated: false, dataSource: 'raw' as const };
+          }
+          const inTop = {
+            $or: tuples.map((t) => ({ $and: dims.map((expr, i) => ({ $eq: [expr, t[i] ?? null] })) })),
+          };
+          // this pass has a ceiling of its own — buckets × groups — and it used
+          // to be the one cap in the file that could cut an answer without
+          // saying so. Read as cap+1, like every other one, and reported as
+          // `bucketsTruncated`.
+          const bucketCap = limits.series * top.length;
+          const perBucket = await ctx.TelemetryModel.aggregate([
+            { $match: { ...match, $expr: inTop } },
+            { $group: { _id: { at: truncTo('$occurredAt', interval), ...dimId }, value: measureAccumulator(measure) } },
+            // `at` is the first key of `_id`, so one BSON sort orders by bucket
+            // then by dims — deterministic without a second sort key
+            { $sort: { _id: 1 } },
+            { $limit: bucketCap + 1 },
+          ] as any[]);
+          const bucketsTruncated = perBucket.length > bucketCap;
+          if (bucketsTruncated) perBucket.pop();
+          return {
+            rows: perBucket.map((b: any) => ({
+              dims: groupBy.map((_, i) => b._id?.[`d${i}`] ?? null) as (string | null)[],
+              at: b._id.at as Date,
+              value: b.value,
+            })),
+            groups: top.length,
+            truncated,
+            bucketsTruncated,
+            dataSource: 'raw' as const,
+          };
         }),
       );
     },

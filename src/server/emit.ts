@@ -1,9 +1,10 @@
 import type { Model } from 'mongoose';
 import {
-  TelemetryKind, RESERVED_TENANT_MESSAGE, SAMPLE_RATE, isPlatformScope, newId, traceKeep, plain,
+  TelemetryKind, RESERVED_TENANT_MESSAGE, SAMPLE_RATE, bumpCounterMap, isPlatformScope, newId,
+  traceKeep, plain,
   type TelemetryCounters, type Logger,
 } from './types.js';
-import type { Registry } from './registry.js';
+import type { EventSpec, Registry } from './registry.js';
 import { recordRollup, resolveDim } from './rollups.js';
 
 /**
@@ -70,6 +71,42 @@ export interface EmitResult {
    * rejected — unregistered or failed validation; quarantined in the rejects collection
    */
   outcome: 'written' | 'queued' | 'deduped' | 'sampled' | 'capped' | 'rejected';
+}
+
+/**
+ * Count attrs keys the record's spec does not declare, BEFORE anything parses
+ * them.
+ *
+ * What actually happens to those keys, so nobody has to guess: model.ts's
+ * pre('validate') hook parses `attrs` as `spec.attrs.strict()`, so an
+ * undeclared key is a validation FAILURE — the whole record is quarantined and
+ * counted in `rejected`. Nothing is silently stripped, and a spec declaring no
+ * `attrs` at all refuses any attrs the same way (`"x" declares no attrs`).
+ *
+ * So this counter is not the only trace of the drop; it is the GROUPING of it.
+ * The quarantine lists 41 failed writes one row at a time and a human reads
+ * none of them; this says "all 41 carried `codec`", which is a zod line the
+ * System page can hand you (see suggest.ts).
+ *
+ * Keys are sanitized the way the writer sanitizes them (dots → underscores, as
+ * mongoose Map keys demand), or a client's `gen_ai.model` would read as
+ * undeclared against a perfectly well declared `gen_ai_model`.
+ */
+export function noteUndeclaredAttrs(
+  counters: TelemetryCounters,
+  name: string,
+  spec: Pick<EventSpec, 'attrs'>,
+  attrs: unknown,
+): void {
+  if (!attrs || typeof attrs !== 'object') return;
+  const keys = attrs instanceof Map ? [...attrs.keys()] : Object.keys(attrs);
+  const shape = (spec.attrs as { shape?: Record<string, unknown> } | undefined)?.shape;
+  for (const raw of keys) {
+    const key = String(raw).replace(/\./g, '_');
+    if (shape && Object.prototype.hasOwnProperty.call(shape, key)) continue;
+    // bounded: the key half is client-controlled, so it folds past the cap
+    bumpCounterMap(counters.undeclaredAttrs, `${name}|${key}`);
+  }
 }
 
 export function createEmitter(ctx: EmitCtx) {
@@ -161,6 +198,9 @@ export function createEmitter(ctx: EmitCtx) {
       attrs: safe(doc.attrs),
       metrics: safe(doc.metrics),
     };
+
+    // Observed before hydration, because the hook below is where they die.
+    noteUndeclaredAttrs(counters, name, spec, doc.attrs);
 
     const onFail = async (e: unknown) => {
       counters.rejected++;

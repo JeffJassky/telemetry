@@ -27,25 +27,87 @@ telemetry tool is a data leak an agent will find.
 
 ## The tools
 
-All fourteen, or none — there is no allowlist. Register the subset you want at
+All seventeen, or none — there is no allowlist. Register the subset you want at
 the server layer.
 
 | tool | answers |
 | --- | --- |
-| `describe_telemetry` | the vocabulary — event names, attributes, metrics, rollup families. **Agents should call this first.** |
+| `describe_telemetry` | the vocabulary — event names, attributes, metrics, rollup families, **and the derived catalog**. **Agents should call this first.** |
 | `search_events` | raw records matching a filter, newest first, paged |
 | `list_errors` | recent errors — "what is breaking?" |
 | `event_trends` | a measure over time, bucketed |
+| `event_breakdown` | top groups of a measure by one or two dimensions — "which models cost the most" |
 | `metric_distribution` | percentiles + histogram — "what is p95 latency?" |
 | `rollup_breakdown` | top rows of a rollup family — top issues, top spenders |
+| `dimension_values` | the values a dimension actually takes — call it before filtering or grouping |
 | `active_users` | exact DAU/WAU/MAU |
 | `funnel_analysis` | cohort funnel, conversion, median time-to-step |
 | `inspect_trace` | one request correlated across services |
 | `user_journey` | one subject's timeline |
-| `list_reports` | the menu of saved / configured / derived reports |
-| `run_report` | execute one named report |
+| `list_reports` | the menu of saved / configured / derived reports, each with the source it reads |
+| `run_report` | execute a report — one from the menu, or an inline one you compose |
+| `plan_report` | what a report WOULD cost, without doing the read |
 | `list_tenants` | the tenant activity roster (platform operators) |
-| `telemetry_health` | drop counters, quarantine, index budget |
+| `telemetry_health` | drop counters, quarantine, index budget — and the registry edits the data is asking for |
+
+### What `describe_telemetry` returns
+
+`{ registry, catalog, kinds }`. `registry` is the flat projection — key lists
+per event name — and it is unchanged. `catalog` is the
+[derived catalog](/reference/types#catalog-types), and it is the half an
+agent should read: every dimension typed, with its closed value domain when it
+has one and an `indexed` flag saying whether filtering on it is a lookup or a
+scan; the measures each event can be aggregated by; and, per `sum:` measure,
+the rollup families that answer it **exactly** rather than by reading raw rows.
+
+That is what lets an agent pick a cheap, answerable query instead of guessing a
+key name and finding out from a 400.
+
+### `run_report` and `plan_report`
+
+`run_report` takes either a `name` from `list_reports` **or** an inline `report`
+— the same [Report](/guide/reports) shape the dashboard stores and
+`GET /api/report` parses. The inline form is the
+general "ask telemetry a question" door: say what is counted (`source`), over
+what range, by which `groupBy` dims and with what `measure`, and the planner
+picks the primitive.
+
+```jsonc
+{ "report": {
+    "source": { "event": "llm.completion" },
+    "range": "30d",
+    "interval": "day",
+    "measure": "sum:cost_usd",
+    "groupBy": ["attr:gen_ai_request_model"],
+    "filters": [{ "dim": "attr:feature", "op": "eq", "value": "chat" }],
+    "compare": "previous" } }
+```
+
+The answer carries the `plan` it ran — `primitive`, `exactness`
+(`exact` / `raw` / `scan`), the family it went `via`, and a `why` sentence — so
+an agent can say which store answered and how exact the number is. Raw records
+are redacted exactly as `search_events` redacts them. `from`/`to` override the
+report's own range. A stored view written before Reports existed still runs: it
+comes back marked `legacy: true` with its records, rather than failing.
+
+`plan_report` takes the same input and returns that plan **without doing the
+read** — ask before you spend it. When nothing can answer the report it returns
+`{ unavailable: true, why }`, and the `why` names the offending key and the
+registry change that would make it answerable. A refusal is an answer: read it
+and ask a different question rather than retrying the same one.
+
+### What `telemetry_health` returns
+
+`{ counters, quarantine, indexCount, suggestions }`. `counters` now carries the
+two attributed maps beside the seven scalars — `rollupSkippedBy`
+(`` `${family}|${dimLabel}` ``) and `undeclaredAttrs` (`` `${name}|${attrKey}` ``)
+— and `suggestions` is those plus the quarantine read back as registry lines:
+each one a `message` and a pasteable `fix`. See
+[Suggestions](/reference/types#suggestions).
+
+An agent asked "why is this chart missing data?" can therefore answer with the
+edit rather than the symptom. It still only reads: nothing here writes to the
+registry.
 
 ## Wiring to the official SDK
 

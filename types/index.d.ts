@@ -166,6 +166,351 @@ export declare function boundedMeta(): z.ZodType<Record<string, unknown> | undef
 /** Boot-time contract checks — throws on misconfiguration. createTelemetry runs it. */
 export declare function validateRegistry(registry: Registry): void;
 
+// ── catalog (reports §3) ────────────────────────────────────────────────────
+
+/**
+ * Everything a reader can ask this instance, inferred from the registry alone:
+ * typed dimensions with their value domains, the measures each event supports,
+ * and which rollup family answers a sum exactly. Pure and boot-time, like
+ * validateRegistry — createDashboard() and createTelemetryMcp() build one each
+ * and serve it beside the projection.
+ */
+export interface Catalog {
+  events: Record<string, EventFacet>;
+  families: Record<string, FamilyFacet>;
+  /** name prefix before the first '.' → event names. An undotted name namespaces to itself. */
+  namespaces: Record<string, string[]>;
+  /** dims every record carries — filterable and groupable raw, whatever the source */
+  envelope: DimFacet[];
+  /** every subject type named by any spec's `subjects` or any rollup's `subjects` */
+  subjectTypes: string[];
+}
+
+export interface EventFacet {
+  kind: TelemetryKind;
+  origin: Origin | 'any';
+  subjects: string[];
+  description: string;
+  namespace: string;
+  /** one per declared attr, typed, followed by this kind's own envelope fields */
+  dims: DimFacet[];
+  /** 'count' first, then per metric key: sum:, avg:, p50:, p95:, p99: */
+  measures: MeasureFacet[];
+  /** rollup family names this event feeds (its `as`, or its own name) */
+  families: string[];
+  indexedAttrs: string[];
+  indexedMetrics: string[];
+  /** the EFFECTIVE retention — the spec's override, else RETENTION_DAYS[kind] */
+  retentionDays: number | null;
+}
+
+export interface FamilyFacet {
+  as: string;
+  /** the grain, in declared order (pinned per family by validateRegistry) */
+  by: DimSource[];
+  /** rollups.ts `label(src)` per dim — the `x=` prefix written into `dims` */
+  labels: string[];
+  bucket: 'hour' | 'day' | 'week' | 'month' | null;
+  /** a lifetime rollup has no bucket, and its `firstAt` IS the milestone */
+  lifetime: boolean;
+  /** the spec's `subjects` when `by` has a subject dim, else [] */
+  subjectTypes: string[];
+  sums: string[];
+  /** labels of `capture` sources */
+  capture: string[];
+  /** event names declaring this family, registry order */
+  feeders: string[];
+  retentionDays: number | null;
+}
+
+export interface DimFacet {
+  /**
+   * The DimSource form, so it passes straight through to a rollup `by`, to a
+   * groupBy, and to a filter term: 'attr:model' | 'field:client.platform' |
+   * 'subjectType' | 'actorType'.
+   */
+  key: string;
+  /** what rollups.ts writes before '=' — 'model', 'client.platform'; for the two pseudo-dims, the key */
+  label: string;
+  type: 'string' | 'enum' | 'number' | 'boolean' | 'date';
+  /** closed domain when known: z.enum / z.literal values, envelope enums */
+  values?: string[];
+  optional: boolean;
+  /** true when a real index exists — an `indexedAttrs` attr, or a base-indexed envelope field */
+  indexed: boolean;
+}
+
+export interface MeasureFacet {
+  /** 'count' | 'sum:cost_usd' | 'avg:cost_usd' | 'p95:duration_ms' … */
+  key: string;
+  metric?: string;
+  /** families whose `sum` carries this metric — exact answers. Only 'sum:' keys ever have one. */
+  exactVia: string[];
+}
+
+export interface DeriveCatalogOptions {
+  /** host additions to `client.platform`, exactly as CreateTelemetryConfig.platforms extends them */
+  platforms?: readonly string[];
+}
+
+/** the projection `/api/registry` and `describe_telemetry` have always returned */
+export interface RegistryProjectionEntry {
+  kind: TelemetryKind;
+  origin: Origin | 'any';
+  subjects: string[];
+  description: string;
+  attrKeys: string[];
+  metricKeys: string[];
+  indexedAttrs: string[];
+  indexedMetrics: string[];
+  rollups: {
+    as: string;
+    by: DimSource[];
+    bucket: 'hour' | 'day' | 'week' | 'month' | null;
+    sum: string[];
+    subjects: string[];
+  }[];
+}
+export type RegistryProjection = Record<string, RegistryProjectionEntry>;
+
+/** Pure. No Mongo, no I/O — derive once at boot and cache it on the instance. */
+export declare function deriveCatalog(registry: Registry, opts?: DeriveCatalogOptions): Catalog;
+
+/** the catalog narrowed back to the projection, so adding it costs the SPA nothing */
+export declare function projectRegistry(catalog: Catalog): RegistryProjection;
+
+// ── suggestions (reports §9) ────────────────────────────────────────────────
+
+/**
+ * One registry edit the data is asking for. `message` is the sentence a human
+ * reads; `fix` is the line they paste. Nothing here writes anything — the host
+ * still edits the registry by hand, the package just stops making it guess.
+ */
+export interface Suggestion {
+  kind: 'undeclared_attr' | 'missing_dim_default' | 'unregistered_event';
+  /** the registry entry to touch — an event name, or a rollup family name */
+  target: string;
+  /** attr key or dim label, when the suggestion is about one */
+  key?: string;
+  count: number;
+  message: string;
+  /** the registry change, as code */
+  fix: string;
+}
+
+export interface DeriveSuggestionsInput {
+  counters: TelemetryCounters;
+  catalog: Catalog;
+  /** the quarantine rows the caller already fetched — only `name` and `reason` are read */
+  quarantine?: readonly { name?: unknown; reason?: unknown; [k: string]: unknown }[];
+}
+
+/**
+ * Pure, like deriveCatalog: counters + catalog + quarantine in, registry lines
+ * out. Served on `GET /api/system` and by the `telemetry_health` MCP tool.
+ */
+export declare function deriveSuggestions(input: DeriveSuggestionsInput): Suggestion[];
+
+/** the returned list is capped here — a System page is a thing a human reads */
+export declare const MAX_SUGGESTIONS: 50;
+
+// ── reports (reports §4, §6) ────────────────────────────────────────────────
+
+/**
+ * A Report is one shape: what a page renders, what a saved view stores, what a
+ * URL hash carries, and what `run_report` executes. `resolveReport` turns one
+ * into a Plan — the cheapest primitive that answers it exactly, a raw plan when
+ * nothing can, and a refusal with a reason when nothing at all can.
+ */
+export type ReportSource =
+  | { event: string }
+  | { namespace: string }
+  | { kind: TelemetryKind }
+  | { family: string };
+
+/** a shorthand from the UI's RANGES ('7d'), or an explicit half-open ISO pair */
+export type ReportRange = string | { from: string; to: string };
+
+export interface ReportFilter {
+  /** a DimFacet.key: 'attr:model' | 'field:env' | 'subjectType' | 'field:name' … */
+  dim: string;
+  op: 'eq' | 'in' | 'gte' | 'lte';
+  value: string | string[] | number;
+}
+
+export interface Report {
+  source: ReportSource;
+  range: ReportRange;
+  interval?: 'hour' | 'day' | 'week' | 'month';
+  /** a MeasureFacet.key. Default 'count'; also 'distinct:<subjectType>' and 'funnel' */
+  measure?: string;
+  /** DimFacet.key[], at most two */
+  groupBy?: string[];
+  filters?: ReportFilter[];
+  excludeActorTypes?: string[];
+  /** a rendering hint carried with the Report; no primitive takes it today */
+  sort?: 'value' | 'label' | 'time';
+  limit?: number;
+  /** same length, immediately before */
+  compare?: 'previous';
+
+  // ── funnel-only (`measure: 'funnel'`) ──
+  stages?: string[];
+  anchor?: string;
+  exits?: string[];
+  subjectType?: string;
+}
+
+/**
+ * The pre-Report `ViewSpec.query`, still parsed and lifted by normalizeQuery().
+ * Its `display` key is removed — the renderer decides from the Report itself
+ * (reports §8) — and a stored view still carrying one keeps parsing.
+ * @deprecated write a Report.
+ */
+export interface LegacyQuery {
+  range?: string;
+  filters?: Record<string, unknown>;
+  groupBy?: string;
+  sort?: string;
+}
+
+export type PlanPrimitive =
+  | 'records' | 'series' | 'breakdown' | 'distribution'
+  | 'rollups' | 'distinctCount' | 'funnel';
+
+/**
+ * How the executor folds a `rollups` plan: `rollups()` has no server-side
+ * groupBy, and the requested dims ARE the family's dims, so the grouping is a
+ * fold over the returned rows. `labels[i]` is the `dims` prefix rollups.ts
+ * writes for `groupBy[i]`; a subject dim labels to 'subject' and its stored
+ * value is the bare `type:id` ref.
+ */
+export interface PlanShape {
+  groupBy: string[];
+  labels: string[];
+  measure: string;
+  interval?: 'hour' | 'day' | 'week' | 'month';
+  filters?: { dim: string; label: string; op: ReportFilter['op']; value: ReportFilter['value'] }[];
+}
+
+export interface Plan {
+  primitive: PlanPrimitive;
+  /** positional args AFTER scope — the executor is literally `q[primitive](scope, ...args)` */
+  args: unknown[];
+  exactness: 'exact' | 'raw' | 'scan';
+  /** the family that answers it, when one does */
+  via?: string;
+  /** human sentence — the UI badge and the MCP explanation */
+  why: string;
+  /** how to fold the rows a `rollups` plan returns */
+  shape?: PlanShape;
+  /** present when `compare: 'previous'` — same primitive, range shifted back by its own length */
+  previous?: { args: unknown[] };
+}
+
+export interface Unavailable {
+  unavailable: true;
+  why: string;
+}
+
+export interface ResolveOptions {
+  /** injected so a plan is deterministic — shorthand ranges end here */
+  now?: Date;
+  limits?: Partial<QueryLimits>;
+}
+
+/**
+ * Report → Plan, pure. No Mongo, no I/O, deterministic given `now` — pinned by
+ * unit tests like deriveCatalog and summarizeStages.
+ */
+export declare function resolveReport(
+  report: Report,
+  catalog: Catalog,
+  opts?: ResolveOptions,
+): Plan | Unavailable;
+
+/** lift a stored view's legacy query onto a Report. null when nothing names a source. */
+export declare function normalizeQuery(query: Report | LegacyQuery | null | undefined): Report | null;
+
+/**
+ * A Report is a URL, and these two are inverses: `parseReportQuery(reportToQuery(r))`
+ * deep-equals `r`. `source=event:<name>|namespace:<ns>|kind:<kind>|family:<as>`,
+ * `range=7d` or `from`+`to`, `groupBy` and `excludeActors` comma-separated, and
+ * `filter=<dim>:<op>:<value>` REPEATED — the dim may itself contain a colon, so
+ * the first `eq`/`in`/`gte`/`lte` token ends it. Unknown params are ignored; a
+ * malformed one throws with `status: 400` naming the param.
+ */
+export declare function parseReportQuery(query: Record<string, unknown>): Report;
+export declare function reportToQuery(report: Report): Record<string, string | string[]>;
+
+// ── the executor ────────────────────────────────────────────────────────────
+
+export interface ExecuteOptions {
+  /** injected so a plan is deterministic — shorthand ranges end here */
+  now?: Date;
+  limits?: Partial<QueryLimits>;
+  /** applied to a `records` plan's items before they leave (mcp.ts passes its redactor) */
+  redact?: (items: any[]) => any[];
+}
+
+export interface ReportResult {
+  /** the Report as executed — after a legacy lift, so the caller sees what ran */
+  report: Report;
+  plan: Plan;
+  /** the primitive's own result, EXCEPT a `rollups` plan, which arrives folded */
+  result: unknown;
+  /** present when `compare: 'previous'` — the same call, range shifted back */
+  previous?: unknown;
+  dataSource: 'raw' | 'rollups' | 'raw+rollups';
+}
+
+/** the fields the fold reads off a rollup doc */
+export interface RollupDoc {
+  /** dimension values in the family's `by` order: 'region=eu', or a bare 'user:u_1' */
+  dims: string[];
+  bucketAt?: Date | string | null;
+  count?: number;
+  sums?: Record<string, number> | Map<string, number> | null;
+}
+
+/** what `breakdown()` returns, answered from the rollup store instead */
+export interface FoldedRollups {
+  rows: Array<{ dims: (string | null)[]; at?: Date; value: number }>;
+  groups: number;
+  truncated: boolean;
+  dataSource: 'rollups';
+}
+
+/**
+ * Report → the answer: resolve, then `q[plan.primitive](scope, ...plan.args)`.
+ * An `Unavailable` throws with `status: 400` and the `why` as its message —
+ * a refusal is an answer to `resolveReport`, but not to someone asking for data.
+ */
+export declare function executeReport(
+  q: Queries,
+  scope: string,
+  report: Report,
+  catalog: Catalog,
+  opts?: ExecuteOptions,
+): Promise<ReportResult>;
+
+/**
+ * Fold a `rollups` plan's docs into the row shape `breakdown()` returns, per
+ * `Plan.shape` — the family's docs ARE the groups, so this is arithmetic rather
+ * than a second read, and a renderer never learns which store answered. Pure.
+ */
+export declare function foldRollups(
+  rows: readonly RollupDoc[],
+  shape: PlanShape,
+  truncated?: boolean,
+): FoldedRollups;
+
+/** '7d' → a half-open pair ending at `now`; an ISO pair validated. Throws `status: 400`. */
+export declare function rangeOf(range: ReportRange, now?: Date): TimeRange;
+
+/** the interval that keeps a range under ~120 buckets — util.js `intervalFor`, for pairs too */
+export declare function intervalForRange(range: ReportRange, now?: Date): 'hour' | 'day' | 'week' | 'month';
+
 // ── typed emit ──────────────────────────────────────────────────────────────
 
 export type AttrsOf<R extends Registry, N extends keyof R> =
@@ -275,7 +620,28 @@ export interface TelemetryCounters {
   deduped: number;
   /** `body` values clipped to the cap — the row survives, marked */
   truncated: number;
+  /**
+   * `rollupSkipped`, attributed: `${family}|${dimLabel}` → count. Which family
+   * dropped which dim, so the scalar becomes a `dimDefault` you can go and
+   * declare. The seven numbers above are unchanged — this is additive.
+   */
+  rollupSkippedBy: Record<string, number>;
+  /**
+   * attrs keys a record carried that its spec does not declare:
+   * `${name}|${key}` → count. Those records are REJECTED by the strict parse,
+   * not stripped; this groups what the quarantine lists one row at a time.
+   */
+  undeclaredAttrs: Record<string, number>;
 }
+
+/**
+ * Distinct keys either attributed map holds before new ones fold into a single
+ * `(other)` bucket. Both are keyed on client-controlled data, so the bound is
+ * what stops a hostile client growing the process heap; the totals stay
+ * honest, only the attribution stops.
+ */
+export declare const COUNTER_MAP_MAX: 1000;
+export declare const COUNTER_OVERFLOW_KEY: '(other)|(other)';
 
 /** What emit() did. `Promise<void>` could not distinguish "written" from "queued". */
 export interface EmitResult {
@@ -470,12 +836,33 @@ export declare function createIngest(opts: CreateIngestOptions): import('express
 
 // ── dashboard (dashboards §2–§8) ────────────────────────────────────────────
 
+/**
+ * Two kinds of cap, and the word "limit" hides the difference. An OUTPUT cap
+ * bounds what the response CONTAINS — its `$limit` sits after the `$group`/sort
+ * or rides an indexed cursor, so the work behind it is bounded by the range and
+ * the indexes, not by the number. A SCAN cap bounds what the primitive READS,
+ * so an answer past it is an undercount — which is why all three report
+ * `truncated`.
+ */
 export interface QueryLimits {
+  // ── output caps ──
   records: number;
   series: number;
   rollups: number;
   trace: number;
   journey: number;
+  /**
+   * Distinct GROUPS one breakdown() returns — the top N by measure, read as
+   * cap+1 so truncation is observed. Never a bound on rows scanned.
+   */
+  breakdown: number;
+  /**
+   * Distinct VALUES one values() lookup returns — the top N by count, read as
+   * cap+1 so truncation is observed. Never a bound on rows scanned.
+   */
+  values: number;
+
+  // ── scan caps ──
   /** raw docs distribution will scan before it reports an undercount */
   distribution: number;
   /** rollup docs distinctCount will scan before it reports an undercount */
@@ -492,7 +879,8 @@ export interface TimeRange {
 
 export interface RecordFilter {
   kind?: string;
-  name?: string;
+  /** one event name, or a SET of them as an `$in` — a namespace or a family is several */
+  name?: string | string[];
   severity?: string;
   env?: string;
   service?: string;
@@ -631,6 +1019,28 @@ export interface Queries {
   series(scope: string, range: TimeRange, filter: RecordFilter, opts?: { measure?: string; interval?: 'hour' | 'day' | 'week' | 'month' }):
     Promise<{ buckets: Array<{ at: Date; value: number }>; dataSource: 'raw' }>;
   /**
+   * Top groups of a measure by one or two dimensions. `groupBy` takes
+   * `attr:<key>`, `field:<path>` (an allowlist of envelope paths), `subjectType`
+   * or `actorType`; 0 or 3+ dims, an unlisted path, or a bad interval throw with
+   * `status: 400`. Rows carry `at` only when an `interval` is given.
+   *
+   * `limit` caps the GROUPS returned, never the rows scanned — the scan is
+   * bounded by the range and the indexes exactly as `series` is, and truncation
+   * keeps the TOP groups by measure. A record missing the dim groups under
+   * `null` rather than being dropped. Aggregates across tenants under `'*'`.
+   *
+   * Two truncation flags, because they cut different axes: `truncated` means
+   * groups were dropped, `bucketsTruncated` that the per-interval pass hit its
+   * own ceiling (`limits.series` buckets per returned group) and some group
+   * shown is missing periods. `bucketsTruncated` is always false with no
+   * `interval`.
+   *
+   * `sum:durationMs` / `avg:durationMs` read the ENVELOPE field, not
+   * `metrics.durationMs` — a span's duration is not a declared metric.
+   */
+  breakdown(scope: string, range: TimeRange, filter: RecordFilter, opts: { groupBy: string[]; measure?: string; interval?: 'hour' | 'day' | 'week' | 'month'; limit?: number }):
+    Promise<{ rows: Array<{ dims: (string | null)[]; at?: Date; value: number }>; groups: number; truncated: boolean; bucketsTruncated: boolean; dataSource: 'raw' }>;
+  /**
    * The sample is complete — nothing is sampled away between the match and the
    * math — but `$percentile` is `method: 'approximate'` and the scan stops at
    * `limits.distribution`. `truncated` says when that ceiling was reached; the
@@ -678,17 +1088,75 @@ export declare function createQueries(ctx: {
   cacheSize?: number;
 }): Queries;
 
+// ── values (reports §5) ─────────────────────────────────────────────────────
+
+/**
+ * The observed domain of one dimension — the lookup a report builder makes
+ * before it names a value. NOT a tenth primitive: it reads the catalog, which
+ * the primitives deliberately do not, and it answers from whichever of four
+ * sources is cheapest.
+ */
+export interface ValuesParams {
+  /**
+   * A `DimFacet.key` — `attr:model`, `field:client.platform`, `subjectType`,
+   * `actorType`. The literal `'subject'` also works and is the only way to ask
+   * a family for its subject refs.
+   */
+  dim: string;
+  /** the Report's source events: decides the raw step, narrows the other two */
+  names?: string[];
+  /** required by the raw step; ignored by the others */
+  range?: TimeRange;
+  /** values cap, default `limits.values` (200), clamped to it */
+  limit?: number;
+}
+
+export interface ValuesResult {
+  /** catalog order for a declared enum, else by count desc then value asc */
+  values: string[];
+  /** parallel to `values` when the source can count — absent for 'catalog' */
+  counts?: number[];
+  /**
+   * Which of the four answered, in preference order: `catalog` (a declared
+   * enum — no read at all), `rollups` (one indexed `$group` over a family keyed
+   * by the dim), `raw` (an indexed attr or envelope dim over the range), or
+   * `none`. `none` is an ANSWER, never an error: the caller offers free-text
+   * equality with a scan badge.
+   */
+  source: 'catalog' | 'rollups' | 'raw' | 'none';
+  /** the family read, when `source === 'rollups'` */
+  via?: string;
+  /** more values existed than the cap; the ones kept are the top by count */
+  truncated: boolean;
+  dataSource: 'catalog' | 'rollups' | 'raw' | 'none';
+}
+
+export interface ValuesCtx {
+  catalog: Catalog;
+  TelemetryModel: Model<any>;
+  RollupModel: Model<any>;
+  limits?: Partial<QueryLimits>;
+  onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  slowMs?: number;
+  cacheTtlMs?: number;
+  cacheSize?: number;
+}
+
+export type Values = (scope: string, params: ValuesParams) => Promise<ValuesResult>;
+
+/** memoized like `series`; never throws on the `none` path */
+export declare function createValues(ctx: ValuesCtx): Values;
+
 export interface ViewSpec {
   name: string;
   icon?: string;
-  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system';
-  query: {
-    range?: string;
-    filters?: Record<string, unknown>;
-    groupBy?: string;
-    sort?: string;
-    display?: 'table' | 'series' | 'breakdown' | 'stream';
-  };
+  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system' | 'explore';
+  /**
+   * A Report — or the pre-Report shape, which every stored view still carries
+   * and `normalizeQuery()` lifts. `spec` is a Mixed document, so nothing has to
+   * migrate: a query with no `source` is read as legacy.
+   */
+  query: Report | LegacyQuery;
 }
 
 export interface ResolvedView extends ViewSpec {
@@ -698,8 +1166,13 @@ export interface ResolvedView extends ViewSpec {
   shared?: boolean;
 }
 
-/** derived views — generated from the registry, zero config */
-export declare function deriveViews(registry: Registry): ResolvedView[];
+/**
+ * Derived views — generated from the registry, zero config. Five shapes, every
+ * one a Report: per event, per rollup family, per namespace, per usage event
+ * that meters money, and one funnel per subject type. Pass the boot-time
+ * catalog to skip re-deriving one.
+ */
+export declare function deriveViews(registry: Registry, catalog?: Catalog): ResolvedView[];
 
 export interface Viewer {
   /**

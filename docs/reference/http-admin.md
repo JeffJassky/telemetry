@@ -48,11 +48,12 @@ The range is **half-open** everywhere: `occurredAt ≥ from`, `< to`. An unparse
 date, or `from >= to`, is `400 { "error": "invalid time range" }`. This is what
 makes an unbounded read unreachable rather than merely discouraged.
 
-**Filters** — accepted by `/records`, `/series`, and `/distribution`.
+**Filters** — accepted by `/records`, `/series`, `/breakdown`, and `/distribution`.
 
 | Param | |
 |---|---|
-| `kind` `name` `severity` `env` `service` `release` `traceId` | exact equality |
+| `kind` `severity` `env` `service` `release` `traceId` | exact equality |
+| `name` | exact equality, or a **set**: `name=a,b` reads both in one `$in`. Event names never contain a comma, so the split is unambiguous, and a single name behaves exactly as before. |
 | `subject` | pin to one subject ref, e.g. `user:u_1` |
 | `attrs` | `attrs=format:pdf,route:/reports` — equality per key. Values may contain `:`; the first one splits. |
 | `metrics` | `metrics=cost_usd>0.5,tokens_in<100` — `>` becomes `$gte`, `<` becomes `$lte`. Only `[\w.]+` keys and numeric values parse; anything else is silently ignored. |
@@ -79,6 +80,7 @@ number that cannot say which tenant it came from is unusable.
       "rollups": [{ "as": "llm_cost", "by": ["attr:gen_ai_request_model"], "bucket": "day", "sum": ["cost_usd"], "subjects": [] }]
     }
   },
+  "catalog":  { "events": {}, "families": {}, "namespaces": {}, "envelope": [], "subjectTypes": [] },
   "kinds":    ["event", "error", "span", "state", "usage"],
   "role":     "admin",
   "scope":    "acc_9",
@@ -90,6 +92,53 @@ A **projection**, not the registry: names and shapes only. Zod objects are
 reduced to key lists, so no validator internals ever reach the wire.
 
 `200`. No parameters.
+
+#### The `catalog` key
+
+`registry` answers "what did the host declare?". `catalog` answers "what can I
+ask?" — the same registry, derived once at boot into the shape a page or an
+agent actually needs, so that nothing has to be written twice. It is
+[`deriveCatalog()`](/reference/types#catalog-types) verbatim, and the rule it exists to
+enforce is that a page may not name a metric, an attr, or a family: it asks.
+
+```jsonc
+{
+  "events": {
+    "llm.completion": {
+      "kind": "span", "origin": "server", "namespace": "llm",
+      // every declared attr, typed, with its closed domain when it has one, and
+      // `indexed` marking the ones a real index answers rather than a scan
+      "dims": [{ "key": "attr:feature", "label": "feature", "type": "string", "optional": false, "indexed": true }],
+      // 'count', then sum:/avg:/p50:/p95:/p99: per metric. `exactVia` names the
+      // rollup families that can answer this sum without touching a raw row.
+      "measures": [{ "key": "sum:cost_usd", "metric": "cost_usd", "exactVia": ["llm_cost"] }],
+      "families": ["llm_cost"],
+      "retentionDays": 400          // EFFECTIVE — the override, else the per-kind default
+    }
+  },
+  "families": {
+    "llm_cost": {
+      "as": "llm_cost",
+      "by": ["attr:gen_ai_request_model", "attr:feature"],
+      "labels": ["gen_ai_request_model", "feature"],   // the `x=` prefixes stored in `dims`
+      "bucket": "day", "lifetime": false,
+      "subjectTypes": [], "sums": ["cost_usd"], "capture": [],
+      "feeders": ["llm.completion"], "retentionDays": null
+    }
+  },
+  // the prefix before the first '.', so `billing.*` is one page
+  "namespaces": { "llm": ["llm.completion"] },
+  // dims EVERY record carries, in the same `field:`/pseudo-dim form a rollup
+  // `by` uses, so a groupBy built from one matches what rollups.ts writes
+  "envelope": [{ "key": "field:kind", "label": "kind", "type": "enum", "values": ["event"], "optional": false, "indexed": true }],
+  "subjectTypes": ["user", "account", "session", "org"]
+}
+```
+
+`subjectType` and `actorType` are the two pseudo-dims: they carry no `field:`
+prefix because they are derived at query time from `subjectKeys` and `actor`.
+`field:client.platform` reports this instance's platform enum, host additions
+included.
 
 ---
 
@@ -168,6 +217,55 @@ it was actually hit, and when it is true every number is computed over the first
 **Under `'*'` this aggregates across tenants**, same as `series`.
 
 `200`, or `400` on a bad range.
+
+### `GET /api/breakdown`
+
+Top groups of a measure by one or two dimensions — "which models cost the most",
+"errors by release", "events by platform per week".
+
+Params: the time range, every filter, plus:
+
+| | Default | |
+|---|---|---|
+| `groupBy` | **required** | one or two dims, comma-separated — `groupBy=attr:model,field:client.platform`. Zero or three-plus is a `400`. |
+| `measure` | `count` | `count`, `sum:<metric>`, or `avg:<metric>` — the same grammar `series` speaks. |
+| `interval` | — | `hour` \| `day` \| `week` \| `month`. When set, each row also carries `at`. Anything else is a `400`. |
+| `limit` | 50 | **groups** returned, clamped to `queryLimits.breakdown`. |
+
+A dim is `attr:<key>`, `field:<path>`, `subjectType` (the type prefix of the
+first subject ref) or `actorType`. `field:` paths are an **allowlist** — `kind`,
+`name`, `severity`, `env`, `service`, `release`, `origin`, `client.platform`,
+`client.appVersion`, `usage.meter`, `usage.billedTo`, `usage.unit`, `state.key`,
+`state.to`, `error.type`, `error.handled` — and anything else, `data.*` included,
+is a `400` naming what is allowed. A `$group` over unindexed free-form content
+is an unbounded scan of user payloads, not a filter.
+
+```json
+{ "rows": [{ "dims": ["opus", "web"], "value": 412.5 }],
+  "groups": 1, "truncated": false, "bucketsTruncated": false, "dataSource": "raw" }
+```
+
+With an `interval`, each row is `{ "dims": [...], "at": "2026-07-01T00:00:00.000Z", "value": 12 }`
+and rows are ordered by `at`. A record missing the dimension groups under `null`
+rather than being dropped.
+
+Cap: `queryLimits.breakdown` (default 50) bounds the **groups returned, never the
+rows scanned** — the scan is bounded by the range and the indexes exactly as
+`series` is. `truncated` therefore means "more groups existed", and the ones you
+were given are the top by measure over the whole range. `groups` is how many came
+back.
+
+With an `interval` there is a second ceiling and a second flag:
+`bucketsTruncated` says the per-bucket pass hit `queryLimits.series` buckets per
+returned group, so a group you were given is missing periods. The two cut
+different axes — one drops groups, the other drops buckets of a group that IS
+shown — and `bucketsTruncated` is always `false` without an `interval`.
+
+**Under `'*'` this aggregates across tenants**, same as `series`: one set of
+groups with every tenant summed into them.
+
+`200`, `400` on a bad range, an unknown dim, an ungroupable path, a bad interval,
+or the wrong number of dims — with the primitive's own message.
 
 ### `GET /api/rollups`
 
@@ -311,6 +409,47 @@ the caller's to fix, not a 500 that hides it.
 `truncated: true` means the cohort read hit its cap and every number is an
 undercount.
 
+### `GET /api/values`
+
+What values a dimension actually takes. This is the endpoint that turns a
+free-text filter box into a picker, and it needs nothing declared by the host.
+
+| Param | | |
+|---|---|---|
+| `dim` | **required** | a dimension key: `attr:<key>`, `field:<path>`, `subjectType`, `actorType` — or the literal `subject` to ask a family for its subject refs. Missing ⇒ `400 dim required`. |
+| `names` | | comma-separated event names — the report's source events. Decides the raw step and narrows the other two. |
+| `from` / `to` | | **optional here**, unlike every other raw-reading route. Needed only by the raw step. |
+| `limit` | | values cap, clamped to `queryLimits.values` (default 200). |
+
+```json
+{ "values": ["opus", "sonnet"], "counts": [412, 96],
+  "source": "rollups", "via": "llm_cost", "truncated": false, "dataSource": "rollups" }
+```
+
+Four sources are tried in order and the response says which one answered:
+
+1. **`catalog`** — the dimension has a closed domain in the registry (a
+   `z.enum`, an envelope enum). Returned verbatim in schema order, with **no
+   read at all** and **no `counts`**.
+2. **`rollups`** — a family is keyed by this dimension, so every value that ever
+   hit an aggregate comes back with its summed `count` in one indexed read.
+   `via` names the family; the fewest-dims family wins, and `names` restricts to
+   families those events actually feed. The `label=` prefix rollups.ts writes is
+   stripped — subject dims keep their native `type:id`.
+3. **`raw`** — an indexed attr, or an envelope/pseudo dimension, grouped over
+   the range. Records with no value are **not** a group: "no value" is not
+   something a filter can name.
+4. **`none`** — nothing can answer it cheaply. Offer free-text equality with a
+   *scan* badge, as the FilterBar already does.
+
+**`none` is a `200`, never a `400`** — including when the dimension would need a
+range and none was given. A caller that has to catch an error to learn "you'll
+have to type it" renders an error page over a working text box.
+
+The cap is on values **returned**, never on rows scanned: the `$limit` sits
+after the `$group`, exactly as `/breakdown`'s does, so truncation keeps the top
+values by count. Memoized like `/series`.
+
 ### `GET /api/subjects/describe`
 
 | Param | |
@@ -328,6 +467,87 @@ renders raw refs — the documented fallback, not a degraded mode.
 
 ---
 
+## Reports
+
+### `GET /api/report`
+
+One route behind every chart. A **Report** says what is being counted, over what
+range, by what dimensions; the planner picks which primitive answers it —
+preferring an exact rollup read over a raw scan — and this route runs it. See
+[Reports](/guide/reports).
+
+A Report **is** this URL. Nothing is nested, nothing is a JSON blob, and
+`parseReportQuery`/`reportToQuery` are inverses, so a shared link and a saved
+view are the same thing.
+
+| Param | | |
+|---|---|---|
+| `source` | **required** | `event:<name>` \| `namespace:<ns>` \| `kind:<kind>` \| `family:<as>` |
+| `range` | | a shorthand: `1h`, `24h`, `7d`, `30d`, `90d`, or the generic `<n>h`/`<n>d` |
+| `from` `to` | | an explicit half-open ISO pair — use these *or* `range`; `range` wins if both are present |
+| `interval` | — | `hour` \| `day` \| `week` \| `month` |
+| `measure` | `count` | `count`, `sum:<metric>`, `avg:<metric>`, `p50\|p90\|p95\|p99:<metric>`, `distinct:<subjectType>`, `funnel` |
+| `groupBy` | — | one or two dims, comma-separated: `groupBy=attr:model,field:client.platform` |
+| `filter` | — | `<dim>:<op>:<value>`, **repeatable**. Op is `eq` \| `in` \| `gte` \| `lte` |
+| `excludeActors` | — | `admin,system` — the customer toggle |
+| `sort` | — | `value` \| `label` \| `time` (a rendering hint, carried through) |
+| `limit` | — | positive integer, clamped to the primitive's own cap |
+| `compare` | — | `previous` — also run the window immediately before, same length |
+| `stages` `anchor` `exits` `subjectType` | — | funnel only (`measure=funnel`); `stages`/`exits` are comma-separated family names |
+
+The dim in a `filter` may itself contain a colon (`attr:model`) and so may the
+value (`field:subject:eq:user:u_1`), so the **first** `eq`/`in`/`gte`/`lte`
+token is what ends the dim and begins the value. An `in` value is a comma list;
+`gte`/`lte` values are numbers, and only a declared metric can carry one.
+Unknown params are ignored — a URL may carry a page's own state alongside a
+Report.
+
+```
+GET /api/report?source=event:llm.completion&range=7d&interval=day
+  &measure=sum:cost_usd&groupBy=attr:gen_ai_request_model
+  &filter=attr:feature:eq:chat&compare=previous
+```
+
+```json
+{ "report": { "source": { "event": "llm.completion" }, "range": "7d", "…": "…" },
+  "plan": { "primitive": "rollups", "exactness": "exact", "via": "llm_cost",
+            "why": "family \"llm_cost\" is keyed by … maintained on write, so this is one indexed rollup read …" },
+  "result": { "rows": [{ "dims": ["opus"], "at": "2026-07-01T00:00:00.000Z", "value": 4.25 }],
+              "groups": 2, "truncated": false, "dataSource": "rollups" },
+  "previous": { "…": "…" },
+  "dataSource": "rollups" }
+```
+
+`result` is the primitive's own result — `buckets` from `series`, `items` from
+`records`, `rows` from `breakdown`, `stages` from `funnel`. The one exception is
+a `rollups` plan, which is **folded into the same row shape `breakdown` returns**,
+so a renderer never learns which store answered. `previous` is present only
+under `compare=previous`. Records are **not** redacted here: the dashboard
+viewer is already inside the tenant, and `/records` would have served the same
+rows. (The `run_report` MCP tool passes its own redactor.)
+
+`200`. `400` on a malformed param (with the param named), an invalid range, or
+a Report the planner **refuses** — the message is the refusal's `why`, which
+names the offending key and the registry change that would answer it.
+
+### `GET /api/report/plan`
+
+The dry run: the same URL, no read. Answers the `Plan` the executor would run —
+`primitive`, positional `args`, `exactness` (`exact` / `raw` / `scan`), `via`,
+and a human `why` — or `{ "unavailable": true, "why": "…" }`.
+
+```json
+{ "primitive": "breakdown", "args": ["…"], "exactness": "scan",
+  "why": "raw count by attr:route over the range — \"attr:route\" has no index behind it, so this is a collection scan bounded only by the range; add \"route\" to `indexedAttrs` to make it a lookup" }
+```
+
+**A refusal here is a `200`, not a `400`.** It is an answer: the UI greys the
+option and shows the `why` instead of offering a query that would fail. On
+`/api/report` the same refusal is a `400`, because by then the caller asked for
+data. A malformed URL is a `400` on both.
+
+---
+
 ## Views
 
 One shape, three producers. See [The dashboard](/guide/dashboard#views-one-shape-three-producers).
@@ -337,7 +557,7 @@ One shape, three producers. See [The dashboard](/guide/dashboard#views-one-shape
 ```json
 { "views": [
   { "name": "error.unhandled", "page": "errors", "origin": "derived",
-    "query": { "range": "7d", "filters": { "name": "error.unhandled" }, "display": "table" } },
+    "query": { "source": { "event": "error.unhandled" }, "range": "7d", "interval": "day" } },
   { "name": "Checkout errors", "page": "errors", "origin": "saved",
     "id": "0192…", "ownerRef": "user:u_1", "shared": false, "query": { } }
 ] }
@@ -363,12 +583,12 @@ people's saved state.
 
 ```json
 { "spec": { "name": "Checkout errors", "page": "errors",
-            "query": { "range": "24h", "filters": { "severity": "error" }, "display": "table" } },
+            "query": { "source": { "kind": "error" }, "range": "24h" } },
   "shared": false }
 ```
 
 `page` is one of `errors` `traces` `events` `journeys` `usage` `overview`
-`system`.
+`system` `explore`.
 
 ```json
 { "id": "0192…" }
@@ -409,18 +629,55 @@ Where "never drop silently" becomes visible. Not optional.
 
 ```jsonc
 {
-  "counters": { "rejected": 0, "defaulted": 0, "sampled": 0, "capped": 0,
-                "rollupSkipped": 0, "deduped": 0, "truncated": 0 },
+  "counters": {
+    "rejected": 41, "defaulted": 0, "sampled": 0, "capped": 0,
+    "rollupSkipped": 12, "deduped": 0, "truncated": 0,
+    // the same two drops, attributed
+    "rollupSkippedBy": { "screens_viewed|name": 12 },
+    "undeclaredAttrs": { "import.started|codec": 41 }
+  },
   "quarantine": [{ "at": "…", "name": "app.ping", "reason": "unregistered event", "raw": { } }],
   "indexCount": 14,
   "indexBudget": 24,
   "keys": [ /* admin only */ ],
-  "role": "admin"
+  "role": "admin",
+  "suggestions": [
+    {
+      "kind": "undeclared_attr",
+      "target": "import.started",
+      "key": "codec",
+      "count": 41,
+      "message": "`import.started` has been sent with attr `codec` 41 times — not declared",
+      "fix": "codec: z.string().max(64),"
+    },
+    {
+      "kind": "missing_dim_default",
+      "target": "screens_viewed",
+      "key": "name",
+      "count": 12,
+      "message": "`screens_viewed` skipped 12 records with no `name` — declare `dimDefault`",
+      "fix": "// on the `screens_viewed` rollup of `screen.viewed`\ndimDefault: 'unknown',"
+    }
+  ]
 }
 ```
 
 - `counters` and `quarantine` (latest 50, newest first) are served to **any**
   viewer. Every quarantine row is a write someone attempted.
+- `counters.rollupSkippedBy` (`` `${family}|${dimLabel}` ``) and
+  `counters.undeclaredAttrs` (`` `${name}|${attrKey}` ``) attribute two of the
+  scalars above. Both hold at most **1000 distinct keys**; past that new keys
+  fold into a single `(other)|(other)` bucket, because both are keyed on
+  client-controlled strings. The seven scalar counters are unchanged in name
+  and meaning.
+- `suggestions` is the loop closed the other way: the registry edits those
+  counters and the quarantine are asking for, **loudest first, capped at 50**.
+  Each carries a `message` for a human and a `fix` that is pasteable registry
+  code — the zod line (or the whole `attrs: z.object({ … })` block when the spec
+  declares none), a `dimDefault` line commented with every spec that feeds the
+  family, or a minimal stub for an unregistered name. Nothing is written; see
+  [`deriveSuggestions`](/reference/types#suggestions), which is pure, exported,
+  and derived from data already on this response.
 - `indexCount` is the live index count on the telemetry collection;
   `indexBudget` is `INDEX_BUDGET` (24).
 - `keys` is `[]` unless `role === 'admin'`. When present it is the 100 newest key
@@ -448,6 +705,15 @@ may be coarser than this one.
 Revocation takes effect within the ingest router's `keyCacheMs` (60s by default).
 
 ## Verified against
+
+Checked against the source on **2026-09-07**: every route below is one
+`api.get` / `api.post` / `api.delete` in `src/server/dashboard.ts` (19 of them),
+with parameter parsing read from `src/server/query.ts` (`RecordFilter`,
+`QueryLimits`, `breakdown`), `src/server/report.ts` (`parseReportQuery`,
+`resolveReport`), `src/server/execute.ts` (`executeReport`),
+`src/server/values.ts` (`createValues`), `src/server/views.ts`
+(`resolveViews`, `saveView`), `src/server/catalog.ts` (`deriveCatalog`,
+`projectRegistry`), and `src/server/suggest.ts` (`deriveSuggestions`).
 
 `test/dashboard.test.ts` and `test/tenancy.test.ts` pin `200`, `400`, `401`,
 `403`, `500`, and the SPA shell's `200`/`503` on these routes, including the

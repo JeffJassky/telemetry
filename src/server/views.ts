@@ -1,5 +1,7 @@
 import { Schema, type Connection, type Model } from 'mongoose';
+import { deriveCatalog, type Catalog } from './catalog.js';
 import type { Registry } from './registry.js';
+import { intervalForRange, type LegacyQuery, type Report } from './report.js';
 import { newId } from './types.js';
 
 /**
@@ -31,14 +33,14 @@ import { newId } from './types.js';
 export interface ViewSpec {
   name: string;
   icon?: string;
-  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system';
-  query: {
-    range?: string;
-    filters?: Record<string, unknown>;
-    groupBy?: string;
-    sort?: string;
-    display?: 'table' | 'series' | 'breakdown' | 'stream';
-  };
+  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system' | 'explore';
+  /**
+   * A Report (reports §4) — or the pre-Report shape, which every stored view
+   * still carries and `normalizeQuery()` lifts. `spec` is a Mixed document, so
+   * nothing has to migrate: a query with no `source` is read as legacy and a
+   * query with one is read as a Report.
+   */
+  query: Report | LegacyQuery;
 }
 
 export function buildViewModel(connection: Connection, modelName: string, collection: string): Model<any> {
@@ -70,30 +72,100 @@ const KIND_PAGE: Record<string, ViewSpec['page']> = {
 };
 
 /**
- * Derived views — generated from the registry at load, zero config. One per
- * event name (a pre-filtered page), one per rollup family (a RollupExplorer
- * preset). They exist because the registry already knows enough to write them.
+ * Derived views — generated from the registry at load, zero config, and every
+ * one of them a {@link Report} (reports §8). They exist because the registry
+ * already knows enough to write them, so five shapes fall out of it:
+ *
+ * | shape | name | what it answers |
+ * |---|---|---|
+ * | per event | `<name>` | that one name over a week |
+ * | per family | `rollup: <as>` | the family's own docs — the cheapest read there is |
+ * | per namespace | `namespace: <ns>` | `library.*` split by name over a month |
+ * | per usage event | `spend: <name>` | its `*_usd` sum per day |
+ * | per subject type | `funnel: <type>` | its lifetime milestones as a cohort funnel |
+ *
+ * The catalog is what makes the last three writable, and it is PURE — so this
+ * function keeps its one-argument signature and derives one when a caller
+ * (resolveViews, off a request) has none to hand. `createDashboard` and
+ * `createTelemetryMcp` both built theirs at boot and pass it through.
+ *
+ * Determinism matters more than it looks: these names are the sidebar, and a
+ * list that reshuffles between requests is one nobody can link into. Every loop
+ * below walks the catalog in registry order.
  */
-export function deriveViews(registry: Registry): Array<ViewSpec & { origin: 'derived' }> {
+export function deriveViews(
+  registry: Registry,
+  catalog: Catalog = deriveCatalog(registry),
+): Array<ViewSpec & { origin: 'derived' }> {
   const views: Array<ViewSpec & { origin: 'derived' }> = [];
-  const families = new Set<string>();
-  for (const [name, spec] of Object.entries(registry)) {
-    views.push({
-      origin: 'derived',
-      name,
-      page: KIND_PAGE[spec.kind] ?? 'events',
-      query: { range: '7d', filters: { name }, display: spec.kind === 'event' ? 'series' : 'table' },
-    });
-    for (const r of spec.rollups ?? []) families.add(r.as ?? name);
-  }
-  for (const as of families) {
-    views.push({
-      origin: 'derived',
-      name: `rollup: ${as}`,
-      page: 'journeys',
-      query: { range: '30d', filters: { rollup: as }, display: 'breakdown' },
+  const derived = (name: string, page: ViewSpec['page'], query: Report) =>
+    views.push({ origin: 'derived', name, page, query });
+
+  // ── one per event: the name, charted over a week ──
+  for (const [name, e] of Object.entries(catalog.events)) {
+    derived(name, KIND_PAGE[e.kind] ?? 'events', {
+      source: { event: name },
+      range: '7d',
+      interval: intervalForRange('7d'),
     });
   }
+
+  // ── one per rollup family: read the family itself, which is always exact ──
+  for (const as of Object.keys(catalog.families)) {
+    derived(`rollup: ${as}`, 'journeys', { source: { family: as }, range: '30d' });
+  }
+
+  // ── one per namespace: `library.*` broken out by name ──
+  // A namespace of one event is that event's own view under a second name, so
+  // it is skipped rather than duplicated into the sidebar.
+  for (const [ns, names] of Object.entries(catalog.namespaces)) {
+    if (names.length < 2) continue;
+    derived(`namespace: ${ns}`, 'explore', {
+      source: { namespace: ns },
+      range: '30d',
+      interval: 'day',
+      groupBy: ['field:name'],
+    });
+  }
+
+  // ── one per usage event that meters money ──
+  // `*_usd` is a formatting CONVENTION (dashboards §4), which makes it the one
+  // thing about a metric this file may read off a key. It never names one.
+  for (const [name, e] of Object.entries(catalog.events)) {
+    if (e.kind !== 'usage') continue;
+    const money = e.measures.find((m) => m.key.startsWith('sum:') && m.key.endsWith('_usd'));
+    if (!money) continue;
+    derived(`spend: ${name}`, 'usage', {
+      source: { event: name },
+      range: '30d',
+      interval: 'day',
+      measure: money.key,
+    });
+  }
+
+  // ── one funnel per subject type ──
+  // Stages are the lifetime single-subject families of that type, in registry
+  // order — the order the host typed them in, which is the only sequence a
+  // registry can claim. The UI re-orders them by observed median `firstAt`
+  // (reports §7); this default has no data to read.
+  for (const subjectType of catalog.subjectTypes) {
+    const stages = Object.values(catalog.families)
+      .filter((f) => f.lifetime && f.by.length === 1 && f.by[0] === 'subject' && f.subjectTypes.includes(subjectType))
+      .map((f) => f.as);
+    // one stage is not a funnel — it is a count, and there is already a view for it
+    if (stages.length < 2) continue;
+    derived(`funnel: ${subjectType}`, 'journeys', {
+      // any source expands; the family the funnel is anchored on is the honest one
+      source: { family: stages[0]! },
+      range: '30d',
+      interval: 'week',
+      measure: 'funnel',
+      stages,
+      anchor: stages[0]!,
+      subjectType,
+    });
+  }
+
   return views;
 }
 
@@ -108,13 +180,15 @@ export interface ResolvedView extends ViewSpec {
 export async function resolveViews(opts: {
   ViewModel: Model<any>;
   registry: Registry;
+  /** the caller's boot-time catalog, so a request does not re-derive one */
+  catalog?: Catalog;
   configured: ViewSpec[];
   /** the viewer's scope — a tenantId, or PLATFORM_SCOPE. Matched literally. */
   tenantId: string;
   viewerRef?: string;
 }): Promise<ResolvedView[]> {
   const byName = new Map<string, ResolvedView>();
-  for (const v of deriveViews(opts.registry)) byName.set(v.name, v);
+  for (const v of deriveViews(opts.registry, opts.catalog)) byName.set(v.name, v);
   for (const v of opts.configured) byName.set(v.name, { ...v, origin: 'configured' });
   const saved = await opts.ViewModel.find({
     tenantId: opts.tenantId,

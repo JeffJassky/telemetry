@@ -203,6 +203,17 @@ Erasure note: `ownerRef` is a person. `forget()` deletes that viewer's private
 views and redacts `ownerRef` on shared ones — same delete-vs-redact rule as
 schema §4.7.
 
+> **Superseded in part by [reports.md](./reports.md) §4 and §8 (shipped
+> 2026-09-07).** `ViewSpec.query` is a **Report** — the same shape the Explore
+> builder writes, `GET /api/report` parses and `run_report` executes — and the
+> `display` key above is **removed**, because the renderer is decidable from the
+> Report itself. Every stored view still parses: `spec` is Mixed and
+> `normalizeQuery()` lifts the pre-Report shape. `page` gains `'explore'` and
+> `'system'`. Derived views grew from the two shapes above to five: per event,
+> per family, per namespace, per usage meter, and one funnel per subject type.
+> The three producers and the shadowing rule are unchanged — they were already
+> the DRY line, so the report engine did not add a fourth.
+
 ---
 
 ## 4. Atoms
@@ -283,6 +294,17 @@ the registry change itself.
 | **Journeys** | cohort funnel (`funnel()`), retention, activity (RollupExplorer) + subject lookup → Journey view |
 | **Usage** | spend tiles, per-meter series, `billedTo` breakdown |
 | **System** | quarantine browser, `telemetryCounters` (rejected/capped/sampled/rollupSkipped/deduped/truncated), index budget vs 64-cap, key list + revoke. This page is where "never drop silently" becomes visible — it is not optional |
+
+> **Superseded in part by [reports.md](./reports.md) §8 (shipped 2026-09-07).**
+> There is an eighth page, **Explore** — the report builder, whose URL *is* the
+> Report — and Events is that same surface pre-sourced to `kind: 'event'`. No
+> page names a metric, an attr or a family any more: each reads the catalog and
+> hands a Report to the resolver, so the Overview's spend tile and the Usage
+> page's money measure are the first `*_usd` the catalog reports rather than a
+> literal `sum:cost_usd`, and a tile whose Report this registry cannot answer is
+> not rendered at all. Journeys' funnel takes a stage picker with an inferred
+> default order rather than every lifetime family in registry order. System
+> gains the suggestion list and a table per attributed counter map.
 
 ---
 
@@ -371,8 +393,19 @@ Checked against `standards/`:
       page joins in, and the dashboard treats it as host data.
 - [ ] **Retention curves view** — the `activity` family supports week-N curves
       (schema §5.4); needs its own FunnelSteps-adjacent rendering decision.
+      **Still open** after the report engine: a Report has no `cohort × period`
+      measure, so this is a rendering decision AND a resolver rule.
 - [ ] **Chart accessibility** — series must remain distinguishable without
-      color (dash patterns / markers) before shipping, not after.
+      color (dash patterns / markers) before shipping, not after. **Still
+      open**, and now wider than it was: `ReportView` draws up to seven series
+      on one `TimeSeries` (top six groups plus `other`), where the plan
+      originally assumed one or two.
 - [ ] **Viewer authorization granularity** — `resolveViewer` returns a role;
       whether System (keys, quarantine) needs a stricter role than Overview is
       a host decision the adapter should be able to express.
+- [x] **Report engine** — catalog, Report shape, resolver, `breakdown()`,
+      inferred funnel stages, `/values`. **Landed 2026-09-07**, steps 1–8 of
+      [reports.md](./reports.md) §12, in the working tree and unreleased. It
+      superseded the per-event `deriveViews`, the hardcoded `sum:cost_usd` on
+      Usage/Overview, and `ViewSpec.query.display`. What it left open is
+      reports.md §13, not this list.

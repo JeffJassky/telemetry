@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { COUNTER_MAP_MAX, COUNTER_OVERFLOW_KEY } from '../src/server/index.js';
 import { DROP_TRACE, KEEP_TRACE, at, buildTelemetry, startDb, stopDb } from './helpers.js';
 
 describe('emit — the two planes', () => {
@@ -101,6 +102,63 @@ describe('emit — the two planes', () => {
     expect(await t.models.telemetry.countDocuments({})).toBe(0);
     expect(await t.models.rollups.countDocuments({})).toBe(0); // the aggregate plane never saw it
     expect(await t.collections.rejects().countDocuments({})).toBe(1);
+  });
+
+  it('an undeclared attr key is COUNTED, and the record it rode in on is rejected — nothing is silently stripped', async () => {
+    // The behaviour this test exists to pin: model.ts parses attrs as
+    // `spec.attrs.strict()`, so an undeclared key is a validation failure and
+    // the whole record dies. The counter is therefore not the only trace of
+    // the drop — it is the GROUPING of it. The quarantine says "41 writes
+    // failed" one row at a time; this says "all 41 carried `codec`".
+    const t = buildTelemetry();
+    const r = await t.emit('account.signed_up', {
+      tenantId: 'tn', subjects: [{ type: 'account', id: 'a1' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { source: 'ads', codec: 'h264' } as any,
+    });
+    await t.flush();
+
+    expect(t.counters.undeclaredAttrs).toEqual({ 'account.signed_up|codec': 1 });
+    expect(t.counters.undeclaredAttrs['account.signed_up|source']).toBeUndefined(); // declared
+    // rejected, not stripped: no row, no rollup, one quarantine entry
+    expect(r.outcome).toBe('rejected');
+    expect(await t.models.telemetry.countDocuments({})).toBe(0);
+    expect(await t.models.rollups.countDocuments({})).toBe(0);
+    const rej = await t.collections.rejects().findOne({}) as any;
+    expect(String(rej.reason)).toContain('attrs invalid for "account.signed_up"');
+  });
+
+  it('dotted keys are counted the way they are STORED — a declared attr never reads as undeclared', async () => {
+    // mongoose Map keys cannot contain dots, so the writer rewrites them. A
+    // client sending `gen_ai.request.model` for a registry that declares
+    // `gen_ai_request_model` is sending a declared attr, and counting the raw
+    // key would have reported it as missing forever.
+    const t = buildTelemetry();
+    await t.emit('llm.completion', {
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o1' }],
+      traceId: 'tr_0000abcd', spanId: 's1', durationMs: 10,
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { gen_ai_system: 'anthropic', 'gen_ai.request.model': 'opus', feature: 'chat' } as any,
+      metrics: { tokens_in: 1, tokens_out: 1, cost_usd: 0.01 },
+    });
+    await t.flush();
+    expect(t.counters.undeclaredAttrs).toEqual({});
+    expect(await t.models.telemetry.countDocuments({ name: 'llm.completion' })).toBe(1);
+  });
+
+  it('the attribution map is BOUNDED — a client inventing keys folds into one bucket, never the heap', async () => {
+    // the key half is client-controlled, which makes an unbounded map a way to
+    // grow this process's memory from the outside
+    const t = buildTelemetry();
+    const attrs: Record<string, string> = {};
+    for (let i = 0; i < COUNTER_MAP_MAX + 5; i++) attrs[`k${i}`] = 'x';
+    await t.emit('dim.probe', { tenantId: 'tn', occurredAt: at('2026-07-01T00:00:00Z'), attrs });
+    await t.flush();
+
+    const map = t.counters.undeclaredAttrs;
+    expect(map[COUNTER_OVERFLOW_KEY]).toBe(5); // the total stays honest
+    expect(Object.keys(map)).toHaveLength(COUNTER_MAP_MAX + 1); // …only the attribution stops
+    expect(map['dim.probe|k0']).toBe(1);
   });
 
   it('a replayed usage row is the same money — one row, ONE rollup count, no throw (dedupe gates aggregation)', async () => {

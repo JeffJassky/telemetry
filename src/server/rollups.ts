@@ -1,6 +1,6 @@
 import { Schema, type Connection, type Model } from 'mongoose';
 import type { DimSource, Registry, RollupSpec } from './registry.js';
-import type { TelemetryCounters } from './types.js';
+import { bumpCounterMap, type TelemetryCounters } from './types.js';
 
 /**
  * One derived-aggregate primitive (schema §4.5). Group a stream of records by
@@ -122,6 +122,11 @@ export async function recordRollup(
     if (v == null || v === '') {
       if (spec.dimDefault === undefined) {
         counters.rollupSkipped++;
+        // …and WHICH family lost WHICH dim, so the scalar above becomes a
+        // `dimDefault` line the System page can name. Keyed exactly as the
+        // catalog labels a family and its dims (`label(src)` is the same `x=`
+        // prefix written into `dims`), so a reader can join the two.
+        bumpCounterMap(counters.rollupSkippedBy, `${as}|${label(src)}`);
         return;
       }
       v = spec.dimDefault;

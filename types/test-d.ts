@@ -185,6 +185,10 @@ async function reads() {
 
   const c: TelemetryCounters = t.counters;
   void (c.rejected + c.defaulted + c.sampled + c.capped + c.rollupSkipped + c.deduped + c.truncated);
+  // the same drops, attributed — `${family}|${dim}` and `${name}|${attrKey}`
+  const skippedBy: number | undefined = c.rollupSkippedBy['llm_cost|feature'];
+  const undeclared: number | undefined = c.undeclaredAttrs['llm.completion|codec'];
+  void skippedBy, undeclared;
 
   t.models.telemetry.find();
   t.models.byKind.usage.countDocuments();
@@ -412,6 +416,129 @@ async function drain() {
   await c.shutdown();
 }
 
+// ── catalog (reports §3) ──
+// Pure inference over the registry: every name a page would otherwise hardcode
+// comes back typed, with its domain and whether reading it is a lookup.
+import type {
+  Catalog, DeriveCatalogOptions, DimFacet, EventFacet, FamilyFacet, MeasureFacet,
+  RegistryProjection, RegistryProjectionEntry,
+} from './index.js';
+import { deriveCatalog, projectRegistry } from './index.js';
+
+const catalogOpts: DeriveCatalogOptions = { platforms: ['watchos'] };
+const catalog: Catalog = deriveCatalog(registry, catalogOpts);
+const facet: EventFacet = catalog.events['llm.completion']!;
+const familyFacet: FamilyFacet = catalog.families['llm_cost']!;
+const envelopeDim: DimFacet = catalog.envelope[0]!;
+const measure: MeasureFacet = facet.measures[0]!;
+const exactly: string[] = measure.exactVia;
+const grain: DimSource[] = familyFacet.by;
+const lifetime: boolean = familyFacet.lifetime;
+const domain: string[] | undefined = envelopeDim.values;
+const namespaced: string[] = catalog.namespaces['llm'] ?? [];
+const everySubject: string[] = catalog.subjectTypes;
+const projection: RegistryProjection = projectRegistry(catalog);
+const entry: RegistryProjectionEntry = projection['llm.completion']!;
+const stillAttrKeys: string[] = entry.attrKeys;
+void exactly, grain, lifetime, domain, namespaced, everySubject, stillAttrKeys;
+
+// ── suggestions (reports §9) — the same inference, run backwards ──
+import type { DeriveSuggestionsInput, Suggestion, TelemetryCounters as Counters } from './index.js';
+import { COUNTER_OVERFLOW_KEY, MAX_SUGGESTIONS, deriveSuggestions } from './index.js';
+
+declare const liveCounters: Counters;
+const suggestInput: DeriveSuggestionsInput = {
+  counters: liveCounters,
+  catalog,
+  quarantine: [{ at: new Date(), name: 'video.exported', reason: 'unregistered event' }],
+};
+const suggestions: Suggestion[] = deriveSuggestions(suggestInput);
+const suggestKind: Suggestion['kind'] = suggestions[0]?.kind ?? 'undeclared_attr';
+const pasteable: string | undefined = suggestions[0]?.fix;
+const capped: 50 = MAX_SUGGESTIONS;
+const overflow: '(other)|(other)' = COUNTER_OVERFLOW_KEY;
+void suggestKind, pasteable, capped, overflow;
+
+// ── reports (reports §4, §6) ──
+// The resolver is a value, and its return is a discriminated union: a caller
+// that forgets to check `unavailable` cannot reach `primitive`.
+import type {
+  LegacyQuery, Plan, PlanPrimitive, PlanShape, Report, ReportFilter, ReportRange,
+  ReportSource, ResolveOptions, Unavailable,
+} from './index.js';
+import type { ExecuteOptions, FoldedRollups, ReportResult, RollupDoc } from './index.js';
+import {
+  executeReport, foldRollups, intervalForRange, normalizeQuery, parseReportQuery, rangeOf,
+  reportToQuery, resolveReport,
+} from './index.js';
+
+const reportSource: ReportSource = { family: 'llm_cost' };
+const reportRange: ReportRange = { from: '2026-07-01T00:00:00Z', to: '2026-07-08T00:00:00Z' };
+const reportFilter: ReportFilter = { dim: 'attr:gen_ai_request_model', op: 'in', value: ['opus', 'sonnet'] };
+const report: Report = {
+  source: reportSource,
+  range: reportRange,
+  interval: 'day',
+  measure: 'sum:cost_usd',
+  groupBy: ['attr:gen_ai_request_model'],
+  filters: [reportFilter],
+  compare: 'previous',
+};
+const funnelReport: Report = {
+  source: { kind: 'event' },
+  range: '90d',
+  measure: 'funnel',
+  stages: ['account.signed_up', 'account.converted'],
+  anchor: 'account.signed_up',
+  exits: ['account.churned'],
+  subjectType: 'account',
+};
+const resolveOpts: ResolveOptions = { now: new Date(), limits: { breakdown: 20 } };
+const planned: Plan | Unavailable = resolveReport(report, catalog, resolveOpts);
+if ('unavailable' in planned) {
+  const refused: true = planned.unavailable;
+  const because: string = planned.why;
+  void refused, because;
+} else {
+  const primitive: PlanPrimitive = planned.primitive;
+  const planArgs: unknown[] = planned.args;
+  const exactness: 'exact' | 'raw' | 'scan' = planned.exactness;
+  const shape: PlanShape | undefined = planned.shape;
+  const previous: unknown[] | undefined = planned.previous?.args;
+  void primitive, planArgs, exactness, shape, previous;
+}
+const legacy: LegacyQuery = { range: '7d', filters: { name: 'llm.completion' }, groupBy: 'attr:feature' };
+const lifted: Report | null = normalizeQuery(legacy);
+const window: TimeRange = rangeOf('7d', new Date());
+const grainFor: 'hour' | 'day' | 'week' | 'month' = intervalForRange('90d');
+void funnelReport, lifted, window, grainFor;
+
+// a Report is a URL, and the two encoders are inverses. `filter` is the one key
+// that can repeat, which is why the query value is a union rather than a string.
+const asQuery: Record<string, string | string[]> = reportToQuery(report);
+const backAgain: Report = parseReportQuery(asQuery);
+void backAgain.source, backAgain.range;
+
+// ── the executor (reports §6) ──
+const execOpts: ExecuteOptions = {
+  now: new Date(),
+  limits: { rollups: 100 },
+  redact: (items) => items.map((r) => ({ ...r, data: '[redacted]' })),
+};
+async function runOne(q: Queries) {
+  const out: ReportResult = await executeReport(q, 'acc_9', report, catalog, execOpts);
+  const ranPlan: Plan = out.plan;
+  const store: 'raw' | 'rollups' | 'raw+rollups' = out.dataSource;
+  const before: unknown = out.previous;
+  void ranPlan, store, before, out.report, out.result;
+}
+// the fold is pure — same rows, same shape, no database
+const foldShape: PlanShape = { groupBy: ['attr:gen_ai_request_model'], labels: ['gen_ai_request_model'], measure: 'sum:cost_usd' };
+const docs: RollupDoc[] = [{ dims: ['gen_ai_request_model=opus'], count: 2, sums: { cost_usd: 4 } }];
+const folded: FoldedRollups = foldRollups(docs, foldShape, false);
+const foldedValue: number | undefined = folded.rows[0]?.value;
+void runOne, foldedValue, folded.groups, folded.truncated, folded.dataSource;
+
 // ── dashboard surface ──
 import type {
   CohortSubject,
@@ -429,12 +556,15 @@ import type {
   ResolvedView,
   SubjectAdapter,
   TimeRange,
+  Values,
+  ValuesParams,
+  ValuesResult,
   Viewer,
   ViewerAdapter,
   ViewSpec,
 } from './index.js';
 import {
-  createDashboard, createQueries, defaultSpaDir, deriveViews, findFamily,
+  createDashboard, createQueries, createValues, defaultSpaDir, deriveViews, findFamily,
   median, requireMilestoneFamily, summarizeStages, DEFAULT_LIMITS,
 } from './index.js';
 
@@ -452,7 +582,7 @@ const view: ViewSpec = {
   // the sidebar renders this when present and falls back to the origin badge
   icon: '⚑',
   page: 'errors',
-  query: { range: '24h', filters: { severity: 'error' }, display: 'table' },
+  query: { source: { kind: 'error' }, range: '24h', filters: [{ dim: 'field:severity', op: 'eq', value: 'error' }] },
 };
 const dashOpts: CreateDashboardOptions = {
   telemetry: t,
@@ -523,6 +653,24 @@ async function primitives() {
   const next: string | null = page.nextCursor;
   const ser = await q.series('acc_9', range, f, { measure: 'sum:cost_usd', interval: 'day' });
   void ser.buckets[0]?.value;
+  // the cap is on GROUPS returned, so `truncated` means "there were more top
+  // groups", not "the scan stopped early"
+  const bd = await q.breakdown('acc_9', range, f, {
+    groupBy: ['attr:gen_ai_request_model', 'field:env'],
+    measure: 'sum:cost_usd',
+    interval: 'day',
+    limit: 10,
+  });
+  const dimValue: string | null = bd.rows[0]?.dims[0] ?? null;
+  const bucketAt: Date | undefined = bd.rows[0]?.at;
+  const groupCount: number = bd.groups;
+  // two flags, two axes: groups dropped vs. buckets dropped from a group shown
+  const missingBuckets: boolean = bd.bucketsTruncated;
+  void dimValue, bucketAt, groupCount, missingBuckets, bd.truncated, caps.breakdown;
+  // a name SET is one $in, not N reads — a namespace or a family is several names
+  await q.records('acc_9', range, { name: ['llm.completion', 'billing.ai_tokens'] });
+  // a span's duration is on the envelope, and the measure grammar knows it
+  await q.series('acc_9', range, f, { measure: 'avg:durationMs' });
   // the sample is complete; the computation is capped, and says so
   const dist = await q.distribution('acc_9', range, f);
   const scanCut: boolean = dist.truncated;
@@ -575,6 +723,29 @@ async function primitives() {
   await q.journey(PLATFORM_SCOPE, 'user:u_1', range);
   await q.distinctCount(PLATFORM_SCOPE, { as: 'activity', range });
   await q.funnel(PLATFORM_SCOPE, { stages: [{ as: 'user.signed_up' }], cohort: range });
+
+  // ── values: the lookup, not a primitive (reports §5) ──
+  const values: Values = createValues({
+    catalog,
+    TelemetryModel: t.models.telemetry,
+    RollupModel: t.models.rollups,
+    limits: { values: 50 },
+  });
+  const params: ValuesParams = {
+    dim: 'attr:gen_ai_request_model',
+    names: ['llm.completion'],
+    range,
+    limit: 20,
+  };
+  const domain: ValuesResult = await values('acc_9', params);
+  const observed: string[] = domain.values;
+  // counts are absent on the catalog answer — a declared enum has no tally
+  const tally: number[] | undefined = domain.counts;
+  const answeredBy: 'catalog' | 'rollups' | 'raw' | 'none' = domain.source;
+  const readFrom: string | undefined = domain.via;
+  void observed, tally, answeredBy, readFrom, domain.truncated, domain.dataSource, caps.values;
+  // no range is not an error: the raw step drops off and `none` says so
+  await values(PLATFORM_SCOPE, { dim: 'field:client.platform' });
 }
 
 // ── the funnel math, usable without a database ──

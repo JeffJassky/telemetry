@@ -152,6 +152,33 @@ describe('rollups — one primitive, four jobs', () => {
     expect(t.counters.rollupSkipped).toBe(1);
   });
 
+  it('the skip is ATTRIBUTED — which family lost which dim, so the counter becomes a dimDefault you can declare', async () => {
+    // the global `rollupSkipped` says twelve records went missing; it does not
+    // say where to go and fix it. rollupSkippedBy does (reports §9).
+    const t = buildTelemetry();
+    await t.emit('dim.probe', { tenantId: 'tn', occurredAt: at('2026-07-01T00:00:00Z') });
+    await t.emit('dim.probe', { tenantId: 'tn', occurredAt: at('2026-07-01T01:00:00Z') });
+    await t.flush();
+    expect(t.counters.rollupSkipped).toBe(2);
+    // `${family}|${label(src)}` — the family's `as`, and the same `x=` prefix
+    // rollups.ts writes into `dims`, so the catalog can be joined to it
+    expect(t.counters.rollupSkippedBy).toEqual({ 'dim_probe|group': 2 });
+
+    // a record that resolves the dim moves neither number
+    await t.emit('dim.probe', {
+      tenantId: 'tn', occurredAt: at('2026-07-01T02:00:00Z'), attrs: { group: 'g1' },
+    });
+    await t.flush();
+    expect(t.counters.rollupSkipped).toBe(2);
+    expect(t.counters.rollupSkippedBy['dim_probe|group']).toBe(2);
+
+    // and neither does the declared fallback — a named bucket is not a drop
+    await t.emit('dim.defaulted', { tenantId: 'tn', occurredAt: at('2026-07-01T03:00:00Z') });
+    await t.flush();
+    expect(t.counters.rollupSkipped).toBe(2);
+    expect(t.counters.rollupSkippedBy['dim_defaulted|group']).toBeUndefined();
+  });
+
   it('the day-bucketed activity family writes one doc per subject per day — DAU is a count, MAU a distinct', async () => {
     const t = buildTelemetry();
     const view = (acct: string, iso: string) => ({

@@ -132,6 +132,15 @@ telemetry: "page.view" declares no attrs
 That strictness is what makes the dimension set knowable, which is what makes
 breakdowns and indexes possible.
 
+An undeclared key is therefore a **rejected record**, not a stored extra and not
+a silent strip — and because a wave of them looks like forty identical
+quarantine rows nobody reads, each one is also counted in
+`counters.undeclaredAttrs` under `` `${name}|${attrKey}` ``. The System page
+turns that count into the sentence *"`import.started` has been sent with attr
+`codec` 41 times — not declared"* and hands you the zod line to add. That is the
+usual way this rule bites in production: a shipped client is ahead of the
+server's registry, and the fix is one line in this file.
+
 ### `metrics` — numeric measures
 
 Same shape, cast to `Map<string, Number>`. These are the values rollups can
@@ -292,7 +301,10 @@ telemetry: rollup family "activity" declared with two shapes: subject|day|accoun
 
 `dimDefault` is deliberately *not* part of the shape — it changes which bucket a
 record lands in, never what a position means, so two names may feed one family
-with different fallbacks.
+with different fallbacks. Omitting one is not an error either: the record is
+skipped for that family and counted in `counters.rollupSkippedBy`, which the
+[System page](/guide/dashboard#the-system-page) renders as a suggestion naming
+the family, the dim, and every spec that feeds it.
 
 ### `retentionDays`
 

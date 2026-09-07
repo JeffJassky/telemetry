@@ -83,6 +83,24 @@ const REGISTRY = defineRegistry({
     rollups: [{ as: 'spend', by: ['attr:gen_ai_request_model'], bucket: 'day', sum: ['cost_usd'] }],
     description: 'Billable tokens',
   },
+  // a second meter, so Usage has more than one chip and the meter breakdown is
+  // a breakdown rather than a single bar
+  'billing.seats': {
+    kind: 'usage', origin: 'server', subjects: ['account'],
+    attrs: z.object({ plan: z.enum(['starter', 'team', 'scale']) }),
+    metrics: z.object({ cost_usd: z.number() }),
+    indexedAttrs: ['plan'],
+    rollups: [{ as: 'seat_spend', by: ['attr:plan'], bucket: 'day', sum: ['cost_usd'] }],
+    description: 'Monthly seat charge',
+  },
+  // a closed enum attr, so the FilterBar has a `catalog`-sourced picker to show
+  // beside the ones it has to read out of the rollups
+  'billing.plan_selected': {
+    kind: 'event', origin: 'client', subjects: ['account'],
+    attrs: z.object({ plan: z.enum(['starter', 'team', 'scale']) }),
+    indexedAttrs: ['plan'],
+    description: 'Picked a plan or started checkout',
+  },
 });
 
 const mongod = await MongoMemoryServer.create();
@@ -97,6 +115,7 @@ const day = (n, h = 12) => new Date(Date.now() - n * 864e5 + h * 36e5 - 12 * 36e
 const models = ['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'];
 const features = ['chat', 'summarize', 'extract'];
 const sources = ['organic', 'ads', 'shopify'];
+const plans = ['starter', 'team', 'scale'];
 const rand = (() => { let s = 42; return () => (s = (s * 1103515245 + 12345) % 2 ** 31) / 2 ** 31; })();
 
 for (let a = 0; a < 12; a++) {
@@ -123,14 +142,37 @@ for (let a = 0; a < 12; a++) {
       data: { route: ['/dashboard', '/reports', '/settings'][Math.floor(rand() * 3)] },
     });
   }
-  if (a < 9) {
+  // The two later milestones are SPREAD across the signup range rather than
+  // taken off its front. Both orderings drop off by the same amount, but the
+  // funnel's observed stage order is a median `firstAt` (reports §7) — and a
+  // cohort of only the earliest signups has an earlier median than the signups
+  // themselves, which would order the stages backwards for a reason that has
+  // nothing to do with the product.
+  if (a % 4 !== 3) {
     await t.emit('data.first_viewed', {
       tenantId: TENANT, subjects: acc, occurredAt: day(signup - 1, 15),
       client: { platform: 'web', appVersion: '2.1.0' }, actor: `user:u_${a}`,
       service: 'webapp', release: 'app@2.1.0',
     });
   }
-  if (a < 5) {
+  // a plan choice per account, and a monthly seat charge for the ones that paid
+  await t.emit('billing.plan_selected', {
+    tenantId: TENANT, subjects: acc, occurredAt: day(signup, 14),
+    attrs: { plan: plans[a % 3] },
+    client: { platform: 'web', appVersion: '2.1.0' }, actor: `user:u_${a}`,
+    service: 'webapp', release: 'app@2.1.0',
+  });
+  if (a % 2 === 0 && a < 10) {
+    await t.emit('billing.seats', {
+      tenantId: TENANT, subjects: acc, occurredAt: day(signup - 3, 17),
+      attrs: { plan: plans[a % 3] },
+      metrics: { cost_usd: [19, 49, 99][a % 3] },
+      usage: {
+        meter: 'seats', quantity: 1 + (a % 4), unit: 'seat',
+        idempotencyKey: `seats:acct_${a}`, billedTo: `account:acct_${a}`,
+      },
+      service: 'api', release: 'app@2.1.0',
+    });
     await t.emit('account.converted', {
       tenantId: TENANT, subjects: acc, occurredAt: day(signup - 3, 16),
       actor: 'system:stripe-webhook', service: 'api', release: 'app@2.1.0',
@@ -140,7 +182,7 @@ for (let a = 0; a < 12; a++) {
       state: { key: 'lifecycle', from: 'trial', to: 'active', previousSinceMs: 3 * 864e5 },
       actor: 'system:billing', service: 'api', release: 'app@2.1.0',
     });
-  } else if (a >= 9) {
+  } else if (a % 4 === 3) {
     await t.emit('account.lifecycle', {
       tenantId: TENANT, subjects: acc, occurredAt: day(signup - 14 > 0 ? signup - 14 : 0, 3),
       state: { key: 'lifecycle', from: 'trial', to: 'trial_expired', previousSinceMs: 14 * 864e5 },
@@ -195,6 +237,24 @@ for (let i = 0; i < 160; i++) {
     });
   }
 }
+// ── two writes that FAIL on purpose, so the System page has something to say ──
+// Nothing here is dropped silently: an attr nobody declared is counted per
+// (event, key) and the record is rejected; a name nobody registered lands in
+// the quarantine. Both come back as suggestions with the registry line that
+// would fix them (reports §9), which is the loop closed in the other direction.
+for (let i = 0; i < 3; i++) {
+  await t.emit('billing.plan_selected', {
+    tenantId: TENANT, subjects: [{ type: 'account', id: `acct_${i}` }], occurredAt: day(1, 10),
+    attrs: { plan: 'team', coupon: 'LAUNCH20' },
+    client: { platform: 'web', appVersion: '2.1.0' },
+    service: 'webapp', release: 'app@2.1.0',
+  });
+}
+await t.emit('checkout.abandoned', {
+  tenantId: TENANT, subjects: [{ type: 'account', id: 'acct_1' }], occurredAt: day(1, 11),
+  service: 'webapp', release: 'app@2.1.0',
+});
+
 await t.flush();
 console.log(`[example] seeded — counters ${JSON.stringify(t.counters)}`);
 

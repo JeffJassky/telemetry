@@ -168,6 +168,87 @@ nothing. The difference is the data, not the mood.
 
 ---
 
+## Catalog types
+
+The registry says what a host declared. The **catalog** says what a reader can
+ask, and it is inferred from the registry alone — no configuration, no second
+vocabulary. `createDashboard()` and `createTelemetryMcp()` each derive one at
+construction and serve it from `/api/registry` and `describe_telemetry`.
+
+```ts
+function deriveCatalog(registry: Registry, opts?: DeriveCatalogOptions): Catalog;
+function projectRegistry(catalog: Catalog): RegistryProjection;
+```
+
+Pure — no Mongo, no I/O — and boot-time for the same reason `validateRegistry`
+is: if the catalog cannot be built, the registry is wrong, and a request is the
+wrong place to discover that.
+
+### `Catalog`
+
+| Field | |
+|---|---|
+| `events` | `Record<string, EventFacet>` — one per registered name, in registry order |
+| `families` | `Record<string, FamilyFacet>` — one per rollup `as` |
+| `namespaces` | prefix before the first `.` → event names. An undotted name namespaces to itself. |
+| `envelope` | `DimFacet[]` — the dims every record carries, whatever its source |
+| `subjectTypes` | every subject type any spec or rollup names |
+
+### `EventFacet`
+
+`kind`, `origin`, `subjects`, `description` and `namespace` restate the spec.
+The rest is derived:
+
+| Field | |
+|---|---|
+| `dims` | one `DimFacet` per declared attr, then this kind's own discriminator fields — a usage event's dims include `field:usage.meter`, an event event's do not |
+| `measures` | `count`, then `sum:` / `avg:` / `p50:` / `p95:` / `p99:` per metric key. A span adds the four raw operators on `durationMs`, which lives on the envelope and so no registry can declare it. |
+| `families` | the rollup families this event feeds — each rollup's `as`, or the event's own name |
+| `indexedAttrs`, `indexedMetrics` | as declared |
+| `retentionDays` | the **effective** retention: the spec's override, else `RETENTION_DAYS[kind]`. `null` is immortal. |
+
+### `FamilyFacet`
+
+| Field | |
+|---|---|
+| `by` | the grain, in declared order. Pinned per family by `validateRegistry`, so the first feeder settles it. |
+| `labels` | `label(src)` per dim — the `x=` prefix `recordRollup` writes into `dims`. A `subject` dim labels to `'subject'`. |
+| `bucket` / `lifetime` | `lifetime` is `bucket === null`, and a lifetime family's `firstAt` **is** the milestone |
+| `subjectTypes` | the spec's `subjects`, when `by` has a subject dim to restrict |
+| `sums`, `capture` | union across feeders, in declaration order — neither is pinned, because a second name may accumulate another metric into the same docs |
+| `feeders` | every event name declaring this family, registry order |
+
+### `DimFacet`
+
+| Field | |
+|---|---|
+| `key` | the `DimSource` form, so it passes straight through to a rollup `by`, a groupBy, or a filter term: `attr:model`, `field:client.platform`, `subjectType`, `actorType` |
+| `label` | what `rollups.ts` writes before `=`. The two pseudo-dims label to themselves. |
+| `type` | `string` / `enum` / `number` / `boolean` / `date`, walked off the declared zod schema through `optional`, `nullable`, `default`, `catch`, `readonly` and `pipe` (input side) |
+| `values` | the closed domain when there is one: `z.enum`, `z.literal`, and the envelope's own enums |
+| `optional` | true when the walk passed through `optional`, `nullable` or `default` |
+| `indexed` | true only where a real index answers it — an `indexedAttrs` attr, or an envelope field a base index covers |
+
+Anything the walker does not recognise is `string`. That is the honest answer
+rather than a fallback: attrs are strings after Mongoose casting anyway.
+
+### `MeasureFacet`
+
+`key` is what a query takes (`count`, `sum:cost_usd`, `p95:durationMs`),
+`metric` is the bare metric name, and **`exactVia`** lists the rollup families
+whose `sum` carries it — the ones that answer without reading a raw row. Only
+`sum:` keys ever have one; everything else is `[]`, meaning raw.
+
+### `projectRegistry`
+
+Narrows a catalog back to the `registry` key `/api/registry` and
+`describe_telemetry` have always returned, so adding the catalog costs a
+shipped client nothing. `RegistryProjectionEntry` is `kind`, `origin`,
+`subjects`, `description`, `attrKeys`, `metricKeys`, `indexedAttrs`,
+`indexedMetrics`, and `rollups[{ as, by, bucket, sum, subjects }]`.
+
+---
+
 ## Envelope and kind types
 
 One collection, five discriminators, one envelope. Every kind shares the same
@@ -334,8 +415,59 @@ interface TelemetryCounters {
   deduped: number;
   /** `body` values clipped to the cap — the row survives, marked */
   truncated: number;
+  /** `${family}|${dimLabel}` → count — which family dropped which dim */
+  rollupSkippedBy: Record<string, number>;
+  /** `${name}|${attrKey}` → count — which undeclared attr key keeps arriving */
+  undeclaredAttrs: Record<string, number>;
 }
 ```
+
+The seven scalars are the shape hosts scrape; the two maps are additive, and
+they exist because a scalar says something went wrong without saying where.
+`rollupSkippedBy` turns "12 records went missing" into a `dimDefault` you can go
+and declare; `undeclaredAttrs` groups a wave of identical validation failures
+into the one zod line that would end it.
+
+Both are bounded at `COUNTER_MAP_MAX` (1000) distinct keys, after which new keys
+fold into `COUNTER_OVERFLOW_KEY` (`'(other)|(other)'`). The keys are
+client-controlled — an event name, an attr key — so an unbounded map would let a
+hostile client grow the process heap. The totals stay honest; only the
+attribution stops.
+
+## Suggestions
+
+```ts
+interface Suggestion {
+  kind: 'undeclared_attr' | 'missing_dim_default' | 'unregistered_event';
+  /** the registry entry to touch — an event name, or a rollup family name */
+  target: string;
+  /** attr key or dim label, when the suggestion is about one */
+  key?: string;
+  count: number;
+  /** one sentence a human reads */
+  message: string;
+  /** the registry change, as code */
+  fix: string;
+}
+
+declare function deriveSuggestions(input: {
+  counters: TelemetryCounters;
+  catalog: Catalog;
+  quarantine?: readonly { name?: unknown; reason?: unknown }[];
+}): Suggestion[];
+```
+
+The two maps above and the quarantine, read backwards: everywhere else the
+registry tells the data what is allowed, and here the data tells the registry
+what it is missing. `fix` is **code, not prose** — the zod line to add (or the
+whole `attrs: z.object({ … })` block when the catalog shows the spec declares
+none), the `dimDefault` line with a comment naming every spec that feeds the
+family, or a minimal registry stub for an unregistered name.
+
+Pure — no Mongo, no I/O — like `deriveCatalog` and `resolveReport`. Sorted by
+count descending and capped at `MAX_SUGGESTIONS` (50). Served on
+[`GET /api/system`](/reference/http-admin#system) and by the `telemetry_health`
+MCP tool. Nothing is written: the host still edits the registry by hand.
 
 ---
 
@@ -473,7 +605,9 @@ function createIngest(opts: CreateIngestOptions): express.Router;
 interface TimeRange { from: Date; to: Date }
 
 interface RecordFilter {
-  kind?: string; name?: string; severity?: string;
+  kind?: string; severity?: string;
+  /** one event name, or a SET of them as an `$in` — a namespace or a family is several */
+  name?: string | string[];
   env?: string; service?: string; release?: string;
   /** pin to one subject: 'user:u_1' */
   subject?: string;
@@ -485,11 +619,21 @@ interface RecordFilter {
 }
 
 interface QueryLimits {
+  // ── output caps: the most a response CONTAINS. The $limit sits after the
+  // $group/sort or rides an indexed cursor, so the work behind it is bounded
+  // by the range and the indexes, not by the number.
   records: number;   // 200
   series: number;    // 744 — a month of hourly buckets
   rollups: number;   // 500
   trace: number;     // 500
   journey: number;   // 500
+  /** distinct GROUPS breakdown() returns — the top N by measure, never a scan bound */
+  breakdown: number; // 50
+  /** distinct VALUES one /values lookup returns — the top N by count, never a scan bound */
+  values: number;    // 200
+
+  // ── scan caps: the most a primitive READS, so an answer past one is an
+  // undercount — which is why all three report `truncated`.
   /** raw docs distribution will scan before it reports an undercount */
   distribution: number; // 100_000
   /** rollup docs distinctCount will scan before it reports an undercount */
@@ -502,7 +646,7 @@ declare const DEFAULT_LIMITS: QueryLimits;
 
 ### `Queries`
 
-Eight read primitives. Everything the UI renders comes through these — kind pages
+Nine read primitives. Everything the UI renders comes through these — kind pages
 never touch Mongo, which is the seam that would let spans route to a columnar
 store later without touching a component. Every response reports `dataSource`, so
 a spliced number can always say which store answered.
@@ -514,6 +658,23 @@ interface Queries {
 
   series(scope, range, filter, opts?: { measure?; interval? }):
     Promise<{ buckets: Array<{ at: Date; value: number }>; dataSource: 'raw' }>;
+
+  /**
+   * Top groups of a measure by 1–2 dims: `attr:<key>`, an allowlisted
+   * `field:<path>`, `subjectType`, or `actorType`. Rows carry `at` only when an
+   * `interval` is given, and a record missing the dim groups under `null`.
+   *
+   * `limit` caps the GROUPS returned, never the rows scanned — truncation keeps
+   * the TOP groups by measure. 0 or 3+ dims, an unlisted path, or a bad interval
+   * throw with `status: 400`.
+   *
+   * Two flags, two axes: `truncated` = groups dropped; `bucketsTruncated` = the
+   * per-interval pass hit `limits.series` buckets per group, so a group shown is
+   * missing periods. `sum:`/`avg:durationMs` read the envelope field.
+   */
+  breakdown(scope, range, filter, opts: { groupBy: string[]; measure?; interval?; limit? }):
+    Promise<{ rows: Array<{ dims: (string | null)[]; at?: Date; value: number }>;
+              groups: number; truncated: boolean; bucketsTruncated: boolean; dataSource: 'raw' }>;
 
   /** `truncated` is always present — the scan ceiling is `limits.distribution` */
   distribution(scope, range, filter, opts?: { measure? }):
@@ -556,9 +717,9 @@ function createQueries(ctx: {
 ```
 
 The cache is per `createQueries()` call, in-process, and keyed on the primitive
-plus its arguments. It covers the four aggregating primitives — `series`,
-`distribution`, `rollups`, `distinctCount`; `records`, `trace`, `journey`, and
-`funnel` always read through. Ten minutes suits a dashboard someone is reading;
+plus its arguments. It covers the five aggregating primitives — `series`,
+`breakdown`, `distribution`, `rollups`, `distinctCount`; `records`, `trace`,
+`journey`, and `funnel` always read through. Ten minutes suits a dashboard someone is reading;
 a page that polls wants it shorter, and a failed query is never cached as the
 answer either way. `cacheSize` bounds what that costs.
 
@@ -573,20 +734,211 @@ That is a registry mistake, and a plausible wrong number is the failure mode thi
 package exists to prevent. The dashboard router turns the throw into a 400 with
 the message verbatim.
 
+### Reports
+
+A Report is one shape — what a page renders, what a saved view stores, what a URL
+hash carries, what `run_report` executes. `resolveReport()` turns one into a
+`Plan`: the cheapest primitive that answers it **exactly**, a raw plan when
+nothing can, and an `Unavailable` with a reason when nothing at all can. Pure —
+no Mongo, deterministic given `now` — so it is unit-pinned like `deriveCatalog`
+and `summarizeStages`.
+
+```ts
+type ReportSource =
+  | { event: string }        // one registered name
+  | { namespace: string }    // every event under `library.*`
+  | { kind: TelemetryKind }
+  | { family: string };      // read a rollup family directly
+
+/** a shorthand from the UI's RANGES ('7d'), or an explicit half-open ISO pair */
+type ReportRange = string | { from: string; to: string };
+
+interface ReportFilter {
+  /** a DimFacet.key: 'attr:model' | 'field:env' | 'subjectType' | 'field:name' … */
+  dim: string;
+  op: 'eq' | 'in' | 'gte' | 'lte';
+  value: string | string[] | number;
+}
+
+interface Report {
+  source: ReportSource;
+  range: ReportRange;
+  interval?: 'hour' | 'day' | 'week' | 'month';
+  /** a MeasureFacet.key. Default 'count'; also 'distinct:<subjectType>' and 'funnel' */
+  measure?: string;
+  groupBy?: string[];              // DimFacet.key[], at most two
+  filters?: ReportFilter[];
+  excludeActorTypes?: string[];
+  sort?: 'value' | 'label' | 'time';
+  limit?: number;
+  compare?: 'previous';            // same length, immediately before
+  /** funnel-only — `measure: 'funnel'` */
+  stages?: string[]; anchor?: string; exits?: string[]; subjectType?: string;
+}
+
+interface Plan {
+  primitive: 'records' | 'series' | 'breakdown' | 'distribution'
+    | 'rollups' | 'distinctCount' | 'funnel';
+  /** positional args AFTER scope — the executor is literally `q[primitive](scope, ...args)` */
+  args: unknown[];
+  exactness: 'exact' | 'raw' | 'scan';
+  /** the family that answers it, when one does */
+  via?: string;
+  /** human sentence — the UI badge and the MCP explanation */
+  why: string;
+  /** how to fold the rows a `rollups` plan returns; `labels[i]` is the `dims` prefix */
+  shape?: {
+    groupBy: string[]; labels: string[]; measure: string;
+    interval?: 'hour' | 'day' | 'week' | 'month';
+    filters?: { dim: string; label: string; op: ReportFilter['op']; value: ReportFilter['value'] }[];
+  };
+  /** present under `compare: 'previous'` — same primitive, range shifted back by its own length */
+  previous?: { args: unknown[] };
+}
+
+interface Unavailable { unavailable: true; why: string }
+
+function resolveReport(report: Report, catalog: Catalog, opts?: {
+  now?: Date; limits?: Partial<QueryLimits>;
+}): Plan | Unavailable;
+
+/** lift a stored view's legacy query onto a Report. null when nothing names a source. */
+function normalizeQuery(query: Report | LegacyQuery | null | undefined): Report | null;
+
+/** '7d' → a half-open pair ending at `now`; an ISO pair validated. Throws `status: 400`. */
+function rangeOf(range: ReportRange, now?: Date): TimeRange;
+function intervalForRange(range: ReportRange, now?: Date): 'hour' | 'day' | 'week' | 'month';
+
+/** a Report is a URL, and these are inverses. A malformed param throws `status: 400`. */
+function parseReportQuery(query: Record<string, unknown>): Report;
+function reportToQuery(report: Report): Record<string, string | string[]>;
+
+interface ExecuteOptions {
+  now?: Date;
+  limits?: Partial<QueryLimits>;
+  /** applied to a `records` plan's items before they leave */
+  redact?: (items: any[]) => any[];
+}
+
+interface ReportResult {
+  report: Report;
+  plan: Plan;
+  /** the primitive's own result — EXCEPT a `rollups` plan, which arrives folded */
+  result: unknown;
+  /** present under `compare: 'previous'` */
+  previous?: unknown;
+  dataSource: 'raw' | 'rollups' | 'raw+rollups';
+}
+
+/** what breakdown() returns, answered from the rollup store instead */
+interface FoldedRollups {
+  rows: Array<{ dims: (string | null)[]; at?: Date; value: number }>;
+  groups: number;
+  truncated: boolean;
+  dataSource: 'rollups';
+}
+
+/** the fields the fold reads off a rollup doc */
+interface RollupDoc {
+  dims: string[];
+  bucketAt?: Date | string | null;
+  count?: number;
+  sums?: Record<string, number> | Map<string, number> | null;
+}
+
+function executeReport(
+  q: Queries, scope: string, report: Report, catalog: Catalog, opts?: ExecuteOptions,
+): Promise<ReportResult>;
+
+function foldRollups(rows: readonly RollupDoc[], shape: PlanShape, truncated?: boolean): FoldedRollups;
+```
+
+`Plan.args` is the whole contract between the resolver and the primitives:
+
+```ts
+const plan = resolveReport(report, catalog);
+if ('primitive' in plan) await q[plan.primitive](scope, ...plan.args);
+```
+
+`Unavailable.why` always names the offending key or family and, where one
+exists, the registry change that would make the question answerable — a greyed
+option with a reason beats a query that 400s (reports §11.2).
+
+`executeReport` is that line plus the read, and the only thing it translates is
+a `rollups` plan: `foldRollups` turns the family's own docs into the row shape
+`breakdown()` returns, so a renderer never learns which store answered. Both
+halves — the fold and the URL encoding — are pure, and are unit-pinned without
+Mongo. An `Unavailable` reaching `executeReport` throws with `status: 400` and
+the `why` as its message; `resolveReport` itself still returns it, because a
+refusal is an answer until someone asks for data.
+
+### Values
+
+The observed domain of one dimension (reports §5) — a lookup the report builder
+makes before it names a value, not a tenth primitive. Served by
+[`GET /api/values`](/reference/http-admin#get-api-values) and the
+`dimension_values` MCP tool.
+
+```ts
+interface ValuesParams {
+  /** a DimFacet.key — or the literal 'subject', to ask a family for its refs */
+  dim: string;
+  /** the Report's source events: decides the raw step, narrows the other two */
+  names?: string[];
+  /** required by the raw step only */
+  range?: TimeRange;
+  /** values cap, clamped to limits.values (default 200) */
+  limit?: number;
+}
+
+interface ValuesResult {
+  /** catalog order for a declared enum, else by count desc then value asc */
+  values: string[];
+  /** parallel to `values` when the source can count — absent for 'catalog' */
+  counts?: number[];
+  /** which of the four answered, cheapest first */
+  source: 'catalog' | 'rollups' | 'raw' | 'none';
+  /** the family read, when source === 'rollups' */
+  via?: string;
+  truncated: boolean;
+  dataSource: 'catalog' | 'rollups' | 'raw' | 'none';
+}
+
+type Values = (scope: string, params: ValuesParams) => Promise<ValuesResult>;
+
+function createValues(ctx: {
+  catalog: Catalog;
+  TelemetryModel: Model<any>;
+  RollupModel: Model<any>;
+  limits?: Partial<QueryLimits>;
+  onSlowQuery?: (info: { op: string; ms: number; params: unknown }) => void;
+  slowMs?: number;
+  cacheTtlMs?: number;
+  cacheSize?: number;
+}): Values;
+```
+
+`source: 'none'` is an ANSWER — the caller offers free-text equality with a
+*scan* badge. It is also what a dimension that needs a range but was given none
+resolves to, rather than a throw.
+
 ### Views
 
 ```ts
 interface ViewSpec {
   name: string;
   icon?: string;
-  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system';
-  query: {
-    range?: string;
-    filters?: Record<string, unknown>;
-    groupBy?: string;
-    sort?: string;
-    display?: 'table' | 'series' | 'breakdown' | 'stream';
-  };
+  page: 'errors' | 'traces' | 'events' | 'journeys' | 'usage' | 'overview' | 'system' | 'explore';
+  /** a Report, or the pre-Report shape every stored view still carries */
+  query: Report | LegacyQuery;
+}
+
+/** @deprecated write a Report. Lifted by normalizeQuery(); `spec` is Mixed, so nothing migrates. */
+interface LegacyQuery {
+  range?: string;
+  filters?: Record<string, unknown>;
+  groupBy?: string;
+  sort?: string;
 }
 
 interface ResolvedView extends ViewSpec {
@@ -597,7 +949,7 @@ interface ResolvedView extends ViewSpec {
 }
 
 /** derived views — generated from the registry, zero config */
-function deriveViews(registry: Registry): ResolvedView[];
+function deriveViews(registry: Registry, catalog?: Catalog): ResolvedView[];
 ```
 
 ### Dashboard adapters

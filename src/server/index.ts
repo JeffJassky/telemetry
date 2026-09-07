@@ -13,7 +13,8 @@ export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
 export type { Registry, EventSpec, RollupSpec, DimSource } from './registry.js';
 export {
   TelemetryKind, LogLevel, Env, Origin,
-  BODY_MAX_CHARS, PLATFORM_SCOPE, RETENTION_DAYS, SAMPLE_RATE, SCHEMA_VERSION,
+  BODY_MAX_CHARS, COUNTER_MAP_MAX, COUNTER_OVERFLOW_KEY, PLATFORM_SCOPE, RETENTION_DAYS,
+  SAMPLE_RATE, SCHEMA_VERSION,
   isPlatformScope, newId, traceKeep, plain,
 } from './types.js';
 export type { TelemetryCounters, Logger, EntityRef } from './types.js';
@@ -30,8 +31,17 @@ export { createDashboard, defaultSpaDir } from './dashboard.js';
 export type {
   CreateDashboardOptions, SubjectAdapter, Viewer, ViewerAdapter,
 } from './dashboard.js';
+export { deriveCatalog, projectRegistry } from './catalog.js';
+export type {
+  Catalog, DeriveCatalogOptions, DimFacet, EventFacet, FamilyFacet, MeasureFacet,
+  RegistryProjection, RegistryProjectionEntry,
+} from './catalog.js';
+export { deriveSuggestions, MAX_SUGGESTIONS } from './suggest.js';
+export type { DeriveSuggestionsInput, Suggestion } from './suggest.js';
 export { createQueries, DEFAULT_LIMITS } from './query.js';
 export type { Queries, QueryLimits, RecordFilter, TimeRange } from './query.js';
+export { createValues } from './values.js';
+export type { Values, ValuesCtx, ValuesParams, ValuesResult } from './values.js';
 export { median, summarizeStages, findFamily, requireMilestoneFamily } from './funnel.js';
 export type {
   CohortSubject, FunnelCohortWindow, FunnelExitResult, FunnelParams,
@@ -39,6 +49,15 @@ export type {
 } from './funnel.js';
 export { deriveViews } from './views.js';
 export type { ResolvedView, ViewSpec } from './views.js';
+export {
+  intervalForRange, normalizeQuery, parseReportQuery, rangeOf, reportToQuery, resolveReport,
+} from './report.js';
+export type {
+  LegacyQuery, Plan, PlanPrimitive, PlanShape, Report, ReportFilter, ReportRange,
+  ReportSource, ResolveOptions, Unavailable,
+} from './report.js';
+export { executeReport, foldRollups } from './execute.js';
+export type { ExecuteOptions, FoldedRollups, ReportResult, RollupDoc } from './execute.js';
 
 export interface CreateTelemetryConfig {
   /** the host-owned event registry — see defineRegistry() */

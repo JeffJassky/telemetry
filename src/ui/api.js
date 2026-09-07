@@ -9,7 +9,12 @@ export function createApi(config) {
   async function call(path, params = {}) {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
-      if (v != null && v !== '') qs.set(k, String(v));
+      if (v == null || v === '') continue;
+      // an array APPENDS — `reportToQuery` returns `filter` as one term or
+      // several, and express parses the repeated form back into the same array.
+      // Joining them would put a comma inside a term whose value may hold one.
+      if (Array.isArray(v)) for (const one of v) { if (one != null && one !== '') qs.append(k, String(one)); }
+      else qs.set(k, String(v));
     }
     const res = await fetch(`${base}${path}${qs.size ? `?${qs}` : ''}`, {
       headers: { accept: 'application/json' },
@@ -26,11 +31,23 @@ export function createApi(config) {
 
   return {
     call,
+    /** the boot call — the projected registry AND the catalog every control reads */
     registry: () => call('/registry'),
     records: (p) => call('/records', p),
     series: (p) => call('/series', p),
     distribution: (p) => call('/distribution', p),
+    breakdown: (p) => call('/breakdown', p),
     rollups: (p) => call('/rollups', p),
+    /**
+     * The one route behind every chart. `params` is `reportToQuery(report)` —
+     * the resolver picks the primitive, so the SPA asks the question instead of
+     * choosing an endpoint per page.
+     */
+    report: (p) => call('/report', p),
+    /** the dry run: `Plan | Unavailable`, no read. A refusal is a 200 here. */
+    plan: (p) => call('/report/plan', p),
+    /** the observed domain of one dimension — what makes a filter a picker */
+    values: (p) => call('/values', p),
     funnel: (p) => call('/funnel', p),
     distinct: (p) => call('/distinct', p),
     trace: (id) => call(`/trace/${encodeURIComponent(id)}`),

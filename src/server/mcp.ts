@@ -2,6 +2,11 @@ import { z } from 'zod';
 import { createQueries, type QueryLimits, type RecordFilter, type TimeRange } from './query.js';
 import { buildViewModel, resolveViews, type ResolvedView, type ViewSpec } from './views.js';
 import { isPlatformScope } from './types.js';
+import { deriveCatalog, projectRegistry } from './catalog.js';
+import { deriveSuggestions } from './suggest.js';
+import { createValues } from './values.js';
+import { normalizeQuery, resolveReport, type Report } from './report.js';
+import { executeReport } from './execute.js';
 import type { Telemetry } from './index.js';
 // type-only — never pulls express/mongoose into the mcp bundle
 import type { SubjectAdapter, Viewer } from './dashboard.js';
@@ -88,7 +93,12 @@ const rangeArg = {
 
 const filterArg = {
   kind: z.enum(['event', 'error', 'span', 'state', 'usage']).optional(),
-  name: z.string().optional().describe('exact event name, e.g. "user.signed_up" — see describe_telemetry'),
+  name: z
+    .union([z.string(), z.array(z.string())])
+    .optional()
+    .describe(
+      'exact event name, e.g. "user.signed_up" — or several as an array, read as one $in. See describe_telemetry',
+    ),
   severity: z.string().optional(),
   env: z.string().optional().describe('prod | staging | dev'),
   service: z.string().optional(),
@@ -104,7 +114,8 @@ const filterArg = {
 
 type FilterArgs = {
   kind?: string;
-  name?: string;
+  /** one name, or a set of them — a namespace or a family is several */
+  name?: string | string[];
   severity?: string;
   env?: string;
   service?: string;
@@ -136,6 +147,62 @@ function parseRange(from?: string, to?: string): TimeRange {
 
 const INTERVAL = z.enum(['hour', 'day', 'week', 'month']);
 
+/**
+ * The inline Report an agent composes — the same shape `ViewSpec.query` stores
+ * and `GET /api/report` parses, said in zod so the tool call is checked before
+ * it reaches the planner. Every field is described in the vocabulary
+ * describe_telemetry hands back, because this is the one tool input a model
+ * fills in from scratch rather than copying out of a previous result.
+ */
+const REPORT_ARG = z.object({
+  source: z
+    .union([
+      z.object({ event: z.string() }),
+      z.object({ namespace: z.string() }),
+      z.object({ kind: z.enum(['event', 'error', 'span', 'state', 'usage']) }),
+      z.object({ family: z.string() }),
+    ])
+    .describe(
+      'what is being counted: { event: "llm.completion" } one registered name, { namespace: "billing" } every name under it, { kind: "error" }, or { family: "llm_cost" } to read a rollup family directly',
+    ),
+  range: z
+    .union([z.string(), z.object({ from: z.string(), to: z.string() })])
+    .describe('"7d" / "24h" / "90d", or an explicit half-open { from, to } ISO pair'),
+  interval: INTERVAL.optional().describe('bucket the answer over time'),
+  measure: z
+    .string()
+    .optional()
+    .describe(
+      'a measure key from the catalog: "count" (default), "sum:<metric>", "avg:<metric>", "p50|p90|p95|p99:<metric>", "distinct:<subjectType>" for exact actives, or "funnel"',
+    ),
+  groupBy: z
+    .array(z.string())
+    .max(2)
+    .optional()
+    .describe('at most two dims — "attr:<key>", "field:<path>", "subjectType", "actorType"'),
+  filters: z
+    .array(
+      z.object({
+        dim: z.string().describe('a dim key, e.g. "attr:gen_ai_request_model" or "field:env"'),
+        op: z.enum(['eq', 'in', 'gte', 'lte']).describe('gte/lte bound a declared metric only'),
+        value: z.union([z.string(), z.array(z.string()), z.number()]),
+      }),
+    )
+    .optional(),
+  excludeActorTypes: z
+    .array(z.string())
+    .optional()
+    .describe('the customer toggle, e.g. ["admin","system"] — a record with no actor always survives'),
+  sort: z.enum(['value', 'label', 'time']).optional(),
+  limit: z.number().int().positive().optional(),
+  compare: z.literal('previous').optional().describe('also run the window immediately before, same length'),
+  // ── funnel only (`measure: "funnel"`) ──
+  stages: z.array(z.string()).optional().describe("lifetime by:['subject'] rollup families, in order"),
+  anchor: z.string().optional().describe('the milestone that assigns cohort membership. Default: stages[0]'),
+  exits: z.array(z.string()).optional().describe('families counted but never staged'),
+  subjectType: z.string().optional(),
+});
+
 // ── the factory ───────────────────────────────────────────────────────────────
 
 export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescriptor[] {
@@ -163,6 +230,24 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
     TelemetryModel: t.models.telemetry,
     RollupModel: t.models.rollups,
     registry: t.registry,
+    limits: opts.limits,
+  });
+
+  // one derivation per instance, exactly as createDashboard does it — pure and
+  // boot-time, so a describe_telemetry call is a lookup rather than a walk.
+  // The `client.platform` enum is per instance and the Telemetry handle does
+  // not carry it, so it is read back off the compiled schema.
+  const catalog = deriveCatalog(t.registry, {
+    platforms: (t.models.telemetry.schema.path('client') as any)?.schema?.path('platform')?.enumValues,
+  });
+  const registry = projectRegistry(catalog);
+
+  // the observed domain of a dimension (reports §5) — catalog-aware, so it sits
+  // beside the primitives rather than inside them
+  const values = createValues({
+    catalog,
+    TelemetryModel: t.models.telemetry,
+    RollupModel: t.models.rollups,
     limits: opts.limits,
   });
 
@@ -197,6 +282,56 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
     return subjectAdapter.describe([...refs].slice(0, 100));
   }
 
+  /**
+   * One input, two doors: a NAMED report off the view menu, or an INLINE one
+   * the agent composed. Both land on the same Report, so run_report and
+   * plan_report cannot drift — plan_report's whole value is that it plans the
+   * thing run_report would actually run.
+   *
+   * The third outcome is a stored view that predates Reports and names no
+   * source. That is not a Report and normalizeQuery says so by returning null;
+   * rather than refusing a view that has worked since 0.1, the caller runs it
+   * the way the SPA always did.
+   */
+  type PickedReport =
+    | { name?: string; report: Report }
+    | { legacy: true; name: string; range: TimeRange; filters: FilterArgs };
+
+  async function pickReport(scope: string, viewer: Viewer, a: any): Promise<PickedReport> {
+    // an explicit tool range wins over the report's own, as it always has
+    const override = a.from || a.to ? parseRange(a.from, a.to) : null;
+    const withRange = (r: Report): Report =>
+      override
+        ? { ...r, range: { from: override.from.toISOString(), to: override.to.toISOString() } }
+        : r;
+
+    if (a.report) return { report: withRange(a.report as Report) };
+    if (!a.name) {
+      throw new Error('needs either `name` (a report from list_reports) or an inline `report` object');
+    }
+    const views = await resolveViews({
+      ViewModel,
+      registry: t.registry,
+      catalog,
+      configured,
+      tenantId: scope,
+      viewerRef: viewer.viewerRef,
+    });
+    const view = views.find((v) => v.name === a.name);
+    if (!view) throw new Error(`no report named "${a.name}" — call list_reports for the menu`);
+    const report = normalizeQuery(view.query);
+    if (report) return { name: view.name, report: withRange(report) };
+    const query = (view.query ?? {}) as any;
+    return {
+      legacy: true,
+      name: view.name,
+      range: override ?? rangeFromView(query.range),
+      filters: (query.filters ?? {}) as FilterArgs,
+    };
+  }
+
+  const planShaped = (report: Report) => resolveReport(report, catalog);
+
   const tool = <A>(d: ToolDescriptor<A>): ToolDescriptor<A> => d;
 
   const tools: ToolDescriptor[] = [
@@ -205,11 +340,11 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
       name: 'describe_telemetry',
       title: 'Describe telemetry schema',
       description:
-        'The vocabulary of this telemetry instance: every event name with its kind, declared attributes, metrics, indexed filters, and rollup families. CALL THIS FIRST — every other tool speaks the names it returns.',
+        'The vocabulary of this telemetry instance: every event name with its kind, declared attributes, metrics, indexed filters, and rollup families. CALL THIS FIRST — every other tool speaks the names it returns. Prefer the `catalog` half of the answer over `registry`: it types every dimension, gives the closed value domain of the ones that have one, marks which are indexed (cheap) rather than a scan, lists the measures each event can be aggregated by, and says which rollup family answers a sum exactly.',
       inputSchema: z.object({}),
       async handler(_args, ctx) {
         await resolve(ctx); // gate even the schema — an unauthorized agent learns nothing
-        return { registry: registryProjection(t), kinds: ['event', 'error', 'span', 'state', 'usage'] };
+        return { registry, catalog, kinds: ['event', 'error', 'span', 'state', 'usage'] };
       },
     }),
 
@@ -292,6 +427,39 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
     }),
 
     tool({
+      name: 'event_breakdown',
+      title: 'Breakdown by dimension',
+      description:
+        "Top groups of a measure by one or two dimensions — 'which models cost the most', 'errors by release', 'events by platform per week'. groupBy takes attr:<key>, field:<path>, subjectType, actorType; see describe_telemetry for the keys. Reports `truncated` when more groups existed than were returned.",
+      inputSchema: z.object({
+        ...filterArg,
+        ...rangeArg,
+        ...tenantArg,
+        groupBy: z
+          .array(z.string())
+          .min(1)
+          .max(2)
+          .describe('one or two dimensions, e.g. ["attr:gen_ai_request_model"] or ["attr:feature","field:env"]'),
+        measure: z
+          .string()
+          .optional()
+          .describe('"count" (default), or "sum:<metric>" / "avg:<metric>", e.g. "sum:cost_usd"'),
+        interval: INTERVAL.optional().describe('also split each group by time bucket; rows then carry `at`'),
+        limit: z.number().int().positive().optional().describe('groups returned, not rows scanned'),
+      }),
+      async handler(a: any, ctx) {
+        const viewer = await resolve(ctx);
+        const scope = pickScope(viewer, a.tenant);
+        return q.breakdown(scope, parseRange(a.from, a.to), toFilter(a), {
+          groupBy: a.groupBy,
+          measure: a.measure,
+          interval: a.interval,
+          limit: a.limit,
+        });
+      },
+    }),
+
+    tool({
       name: 'metric_distribution',
       title: 'Metric distribution (percentiles)',
       description:
@@ -337,6 +505,37 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
           subjectType: a.subjectType,
           on: a.on,
           sort: a.sort,
+          range: a.from || a.to ? parseRange(a.from, a.to) : undefined,
+          limit: a.limit,
+        });
+      },
+    }),
+
+    tool({
+      name: 'dimension_values',
+      title: 'Dimension values',
+      description:
+        "The values a dimension actually takes — from the registry's enum when it has one, else from what the rollups have seen, else from a raw scan over a range. Use before filtering or grouping so you name a value that exists. `source` says where the answer came from.",
+      inputSchema: z.object({
+        dim: z
+          .string()
+          .describe('a dimension key from describe_telemetry: "attr:<key>", "field:<path>", "subjectType" or "actorType"'),
+        names: z
+          .array(z.string())
+          .optional()
+          .describe('restrict to these event names — required for the raw scan, a narrowing hint otherwise'),
+        ...rangeArg,
+        ...tenantArg,
+        limit: z.number().int().positive().optional(),
+      }),
+      async handler(a: any, ctx) {
+        const viewer = await resolve(ctx);
+        const scope = pickScope(viewer, a.tenant);
+        return values(scope, {
+          dim: a.dim,
+          names: a.names,
+          // no range is not an error here: it just means the raw step is off
+          // the table, and `source: 'none'` says so
           range: a.from || a.to ? parseRange(a.from, a.to) : undefined,
           limit: a.limit,
         });
@@ -453,6 +652,7 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
         const views = await resolveViews({
           ViewModel,
           registry: t.registry,
+          catalog,
           configured,
           tenantId: scope,
           viewerRef: viewer.viewerRef,
@@ -463,27 +663,62 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
 
     tool({
       name: 'run_report',
-      title: 'Run a saved report',
+      title: 'Run a report',
       description:
-        'Execute one named report from list_reports and return its result. Read-only: the report is a stored filter/range that dispatches to the same query the dashboard would run.',
+        'Execute a report and return its answer. Two ways in: `name`, one of the reports list_reports offers, or `report`, an inline Report you compose yourself — the general "ask telemetry a question" tool. A Report says WHAT is counted (`source`), over what range, sliced by which dimensions (`groupBy`) and by what measure; the planner then picks the primitive that answers it, preferring a pre-aggregated rollup family (exact, one indexed read) over a raw scan. The answer carries the `plan` it ran, including `exactness` (exact / raw / scan) and a `why` sentence — read them, and prefer an `exact` plan when one exists. If you are unsure a report is answerable or affordable, call plan_report first: it returns the same plan without doing the read. Names and dimensions come from describe_telemetry; `from`/`to` override the report\'s own range. Raw records are redacted like search_events.',
       inputSchema: z.object({
-        name: z.string().describe('the report name from list_reports'),
+        name: z.string().optional().describe('a report name from list_reports — or pass `report` instead'),
+        report: REPORT_ARG.optional().describe('an inline Report, composed from describe_telemetry\'s catalog'),
         ...rangeArg,
         ...tenantArg,
       }),
       async handler(a: any, ctx) {
         const viewer = await resolve(ctx);
         const scope = pickScope(viewer, a.tenant);
-        const views = await resolveViews({
-          ViewModel,
-          registry: t.registry,
-          configured,
-          tenantId: scope,
-          viewerRef: viewer.viewerRef,
-        });
-        const view = views.find((v) => v.name === a.name);
-        if (!view) throw new Error(`no report named "${a.name}" — call list_reports for the menu`);
-        return runReport(q, scope, view, a.from, a.to, redactAll);
+        const picked = await pickReport(scope, viewer, a);
+        if ('legacy' in picked) {
+          // a stored view that names no source is not a Report — it is a page's
+          // default. Run it the way the SPA always has rather than refusing a
+          // view that has worked for a year.
+          const res = await q.records(scope, picked.range, toFilter(picked.filters), { limit: 200 });
+          return {
+            name: picked.name,
+            legacy: true,
+            result: { ...res, items: redactAll(res.items as any[]) },
+            dataSource: 'raw' as const,
+          };
+        }
+        const out = await executeReport(q, scope, picked.report, catalog, { redact: redactAll });
+        return picked.name ? { name: picked.name, ...out } : out;
+      },
+    }),
+
+    tool({
+      name: 'plan_report',
+      title: 'Plan a report (dry run)',
+      description:
+        'Ask what a report WOULD cost before you spend the read. Same input as run_report, no query: it returns the plan — which primitive answers it, with what arguments, and `exactness` (`exact` = maintained rollup docs, `raw` = an indexed scan of records, `scan` = a dimension with no index behind it) — or `{ unavailable: true, why }` when nothing can answer it. A refusal is an answer, not an error: the `why` names the offending key and the registry change that would make the question answerable, so use it to pick a different measure or dimension rather than retrying the same one.',
+      inputSchema: z.object({
+        name: z.string().optional().describe('a report name from list_reports — or pass `report` instead'),
+        report: REPORT_ARG.optional().describe('an inline Report, composed from describe_telemetry\'s catalog'),
+        ...rangeArg,
+        ...tenantArg,
+      }),
+      async handler(a: any, ctx) {
+        const viewer = await resolve(ctx);
+        const scope = pickScope(viewer, a.tenant);
+        const picked = await pickReport(scope, viewer, a);
+        if ('legacy' in picked) {
+          return {
+            unavailable: true,
+            why:
+              `the stored report "${picked.name}" is a pre-Report view whose query names no source, so there ` +
+              'is nothing to plan — run_report reads its records directly. Compose an inline `report` to plan one',
+          };
+        }
+        return picked.name
+          ? { name: picked.name, ...planShaped(picked.report) }
+          : planShaped(picked.report);
       },
     }),
 
@@ -535,7 +770,7 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
       name: 'telemetry_health',
       title: 'Telemetry health',
       description:
-        'The health of the telemetry pipeline itself: drop/default/cap counters, quarantined failed writes, and the index budget. Answers "are we silently dropping events?".',
+        'The health of the telemetry pipeline itself: drop/default/cap counters, quarantined failed writes, and the index budget. Answers "are we silently dropping events?" — and what the data says the registry is missing.',
       inputSchema: z.object({ ...tenantArg }),
       async handler(a: any, ctx) {
         const viewer = await resolve(ctx);
@@ -546,7 +781,16 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
           .toArray()
           .catch(() => []);
         const indexes = await t.models.telemetry.collection.indexes().catch(() => []);
-        return { counters: t.counters, quarantine, indexCount: indexes.length };
+        // `counters` carries the two attributed maps (rollupSkippedBy,
+        // undeclaredAttrs); `suggestions` is those plus the quarantine read
+        // back as registry lines, so an agent can propose the edit rather than
+        // describe the symptom. Derived, never written (reports §9).
+        return {
+          counters: t.counters,
+          quarantine,
+          indexCount: indexes.length,
+          suggestions: deriveSuggestions({ counters: t.counters, catalog, quarantine }),
+        };
       },
     }),
   ];
@@ -559,65 +803,21 @@ export const toJsonSchema = (tool: ToolDescriptor) => z.toJSONSchema(tool.inputS
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/** the registry as a plain, LLM-legible projection — keys, not zod objects */
-function registryProjection(t: Telemetry) {
-  return Object.fromEntries(
-    Object.entries(t.registry).map(([name, spec]) => [
-      name,
-      {
-        kind: spec.kind,
-        description: spec.description,
-        attrKeys: spec.attrs ? Object.keys(spec.attrs.shape) : [],
-        metricKeys: spec.metrics ? Object.keys(spec.metrics.shape) : [],
-        indexedAttrs: spec.indexedAttrs ?? [],
-        indexedMetrics: spec.indexedMetrics ?? [],
-        rollups: (spec.rollups ?? []).map((r) => ({
-          as: r.as ?? name,
-          by: r.by,
-          bucket: r.bucket ?? null,
-        })),
-      },
-    ]),
-  );
-}
-
+/**
+ * A menu entry. `source` is the Report's own source when the stored query lifts
+ * to one — which is what tells an agent what a name actually reads before it
+ * spends a call on it. `display` is gone: it was a rendering hint for a
+ * renderer, and nothing on the server branches on it any more.
+ */
 function reportSummary(v: ResolvedView) {
+  const report = normalizeQuery(v.query);
   return {
     name: v.name,
     origin: v.origin,
     page: v.page,
     shared: v.shared,
-    display: (v.query as any)?.display,
+    ...(report ? { source: report.source } : {}),
   };
-}
-
-/**
- * Dispatch a saved view's stored query to the matching primitive. A view is a
- * `{ range, filters, display }` spec (dashboards §11.6); this reads it the way
- * the SPA would, so run_report invents no query of its own. Unknown shapes
- * return the resolved spec rather than guessing.
- */
-async function runReport(
-  q: ReturnType<typeof createQueries>,
-  scope: string,
-  view: ResolvedView,
-  from: string | undefined,
-  to: string | undefined,
-  redactAll: (items: any[]) => any[],
-): Promise<unknown> {
-  const query = (view.query ?? {}) as any;
-  const filters = (query.filters ?? {}) as FilterArgs & { rollup?: string };
-  // an explicit tool range wins; else fall back to the view's own textual range
-  const range = from || to ? parseRange(from, to) : rangeFromView(query.range);
-
-  if (filters.rollup) {
-    return { report: view.name, result: await q.rollups(scope, { as: filters.rollup, range }) };
-  }
-  if (query.display === 'series') {
-    return { report: view.name, result: await q.series(scope, range, toFilter(filters)) };
-  }
-  const res = await q.records(scope, range, toFilter(filters), { limit: 200 });
-  return { report: view.name, result: { ...res, items: redactAll(res.items as any[]) } };
 }
 
 /** '7d' / '30d' / '24h' → a half-open range ending now. Default 7 days. */

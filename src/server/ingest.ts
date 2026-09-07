@@ -2,6 +2,7 @@ import express from 'express';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { TelemetryKind, RESERVED_TENANT_MESSAGE, isPlatformScope, plain } from './types.js';
 import { KeyKind, TenantMode, parseKeyString, verifySecret } from './keys.js';
+import { noteUndeclaredAttrs } from './emit.js';
 import { recordRollup } from './rollups.js';
 import type { Telemetry } from './index.js';
 
@@ -316,6 +317,13 @@ export function createIngest(opts: CreateIngestOptions): Router {
           o && typeof o === 'object'
             ? new Map(Object.entries(o as Record<string, unknown>).map(([k, v]) => [k.replace(/\./g, '_'), v]))
             : new Map();
+
+        // The wire is where a stale client's undeclared attr actually shows up
+        // — a shipped desktop build sending a key the server's registry does
+        // not know yet. Counted here for the same reason emit() counts it: the
+        // strict parse below rejects the whole record, and the quarantine says
+        // so one row at a time.
+        noteUndeclaredAttrs(t.counters, name, spec, rec.attrs);
 
         const Model = t.models.byKind[spec.kind as TelemetryKind];
         const d = new Model({

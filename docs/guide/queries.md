@@ -1,6 +1,6 @@
 # Queries & funnels
 
-Everything the [dashboard](/guide/dashboard) renders comes through eight read
+Everything the [dashboard](/guide/dashboard) renders comes through nine read
 primitives. Kind pages never touch Mongo — that seam is what would let `span` and
 `event` route to a columnar store later without touching a component.
 
@@ -44,12 +44,13 @@ For raw model access there is `t.scoped(tenantId)`, whose isolation guarantee is
 unconditional: it does not understand `'*'`, so `scoped('*')` matches the literal
 string, which is to say nothing.
 
-## The eight primitives
+## The nine primitives
 
 | Primitive | Answers | Time range | Cap | `dataSource` |
 |---|---|---|---|---|
 | `records` | "show me the rows" — tables, lists, detail drawers | **required** | 200 rows (`limits.records`), keyset cursor | `raw` |
 | `series` | "how many per hour/day/week/month" | **required** | 744 buckets (`limits.series`) | `raw` |
+| `breakdown` | "which values of X are the biggest" — by one or two dims | **required** | 50 **groups** (`limits.breakdown`) + `truncated` | `raw` |
 | `distribution` | "what does the latency/cost spread look like" | **required** | 100,000 documents (`limits.distribution`) + `truncated` | `raw` |
 | `rollups` | "read a family" — issues, spend, activity, milestones | optional | 500 docs (`limits.rollups`) + `truncated` | `rollups` |
 | `trace` | "one trace, every kind, one time axis" | **none** | 500 rows (`limits.trace`) | `raw` |
@@ -62,12 +63,19 @@ Every cap is config (`queryLimits` on `createDashboard`, `limits` on
 being applied to a materialised result. `DEFAULT_LIMITS` is exported if you want
 to reason about the shipped numbers.
 
+Two kinds of cap hide behind that one word. `records`, `series`, `rollups`,
+`trace`, `journey` and `breakdown` carry **output** caps: the `$limit` sits after
+the `$group`/sort or rides an indexed cursor, so what was read to produce the
+answer is bounded by the range and the indexes, not by the number. `distribution`,
+`distinct` and `funnel` carry **scan** caps — past those the answer is genuinely
+an undercount, which is why all three report `truncated`.
+
 Two entries in that table deserve their exceptions stated plainly rather than
 buried: `trace()` takes no range at all — it is pinned by `traceId`, which is
 indexed and bounded by the trace itself — and `rollups()`'s range is optional
 because a lifetime family has no time axis to filter on.
 
-`series`, `distribution`, `rollups` and `distinctCount` are memoized in process
+`series`, `breakdown`, `distribution`, `rollups` and `distinctCount` are memoized in process
 for 10 minutes (60 entries, LRU by age; a rejected promise is evicted rather than
 cached as the answer). `records`, `trace`, `journey` and `funnel` are not. Expect
 a chart to lag a write by up to that window.
@@ -107,6 +115,57 @@ correctly if sampling is ever turned on. While every rate sits at 1 the two are
 identical — the machinery is there so the number stays honest the day one drops.
 Note that `forceKeep` rows are stamped `sampleRate: 1` and are therefore *not* a
 representative sample of anything.
+
+### `breakdown`
+
+```ts
+q.breakdown(scope, { from, to }, filter, { groupBy, measure?, interval?, limit? })
+  → { rows: [{ dims, at?, value }], groups, truncated, bucketsTruncated, dataSource: 'raw' }
+```
+
+The top groups of a measure by one or two dimensions — "which models cost the
+most", "errors by release", "events by platform per week". `measure` is the same
+grammar `series` speaks (`count` / `sum:<metric>` / `avg:<metric>`, `count`
+extrapolating by `1/sampleRate`), and with an `interval` each row also carries an
+`at`.
+
+`groupBy` takes one or two of:
+
+| dim | groups on |
+|---|---|
+| `attr:<key>` | `attrs.<key>` — any declared attr |
+| `field:<path>` | an **allowlisted** envelope path: `kind`, `name`, `severity`, `env`, `service`, `release`, `origin`, `client.platform`, `client.appVersion`, `usage.meter`, `usage.billedTo`, `usage.unit`, `state.key`, `state.to`, `error.type`, `error.handled` |
+| `subjectType` | the type prefix of the first `subjectKeys` entry — `user:u_1` → `user` |
+| `actorType` | the type prefix of `actor`, `null` when there is none |
+
+Zero or three-plus dims, an unlisted path, or an unknown interval all throw with
+`status: 400` — the dashboard router answers with the message verbatim. The
+allowlist is the point: `data.*`, `body` and arbitrary paths are refused because
+a `$group` over unindexed free-form content is an unbounded scan of exactly the
+payloads the rest of this package works to keep out of aggregates.
+
+A record missing the dimension groups under **`null`** rather than being
+dropped — the raw-side analogue of a family's `dimDefault`, rendered as "none".
+
+**The cap is on groups returned, never on rows scanned.** `limit` (clamped to
+`limits.breakdown`, default 50) is the number of distinct groups; the scan behind
+them is bounded by the range, the filters and the indexes, exactly as `series` is.
+Truncation therefore keeps the **top** groups by measure, which is what a
+breakdown table means — a cap on documents read would return an arbitrary prefix
+and call it the top.
+
+With an `interval` there is a second ceiling: the per-bucket pass returns at most
+`limits.series` buckets per returned group, and `bucketsTruncated` says when it
+was reached. `truncated` and `bucketsTruncated` cut different axes — one drops
+groups entirely, the other drops periods of a group you were given — so they are
+two flags rather than one. `bucketsTruncated` is always `false` with no interval.
+
+`sum:durationMs` and `avg:durationMs` read the **envelope** `durationMs` a span
+carries, not `metrics.durationMs`. A duration is not a declared metric, and
+resolving it to a path no record has would have reported a confident `0`.
+
+Under `'*'` it aggregates **across** tenants, like `series`: one set of groups
+with every tenant summed into them.
 
 ### `distribution`
 
@@ -321,15 +380,102 @@ Each returns one row with a subject count, zeros included.
 
 ### Truncation is reported, not implied
 
-All four capped primitives — `rollups`, `distribution`, `distinctCount` and
-`funnel` — set `truncated` by reading one more document than the cap and
-observing the overflow. When it is true, **every number in that result is an
-undercount** — render that, do not smooth it. The alternative is a short funnel,
-or a p95 off the first slice of the range, that looks like the real one.
+All five capped primitives — `rollups`, `distribution`, `distinctCount`,
+`funnel` and `breakdown` — set `truncated` by reading one more document than the
+cap and observing the overflow. When it is true, **every number in that result is
+an undercount** — render that, do not smooth it. The alternative is a short
+funnel, or a p95 off the first slice of the range, that looks like the real one.
+
+`breakdown` is the one exception to that last sentence, and only because its cap
+is a different kind: it truncates on **groups**, not on rows scanned, so the
+numbers it does return are complete for their groups. What `truncated` means
+there is "more groups existed" — and the ones you were given are the **top** ones
+by measure over the whole range, not the first ones Mongo happened to reach.
 
 `distribution` was the exception until recently: it carried the same hard scan
 ceiling and reported nothing, which is the silent cap this package refuses
 everywhere else.
+## Reports — the planner over the primitives
+
+A **Report** is one shape that says what is being counted, over what range, by
+what dimensions — and `resolveReport(report, catalog)` is the pure function that
+picks which of the nine primitives answers it. It is a planner, not an executor:
+it returns a `Plan` naming a primitive and its positional arguments, so the call
+is always the same one line.
+
+```ts
+const plan = resolveReport(report, deriveCatalog(registry));
+if ('unavailable' in plan) return { error: plan.why };
+const result = await q[plan.primitive](scope, ...plan.args);
+```
+
+**[Reports](/guide/reports) is the page for all of this** — the catalog the
+resolver reads, the Report shape and its URL encoding, `executeReport()` and the
+rollups fold, the Explore page, and the funnel picker. What belongs here is only
+the part that concerns the primitives: which one a Report reaches, and how
+exact its answer is.
+
+The rules run in preference order — an exact rollup read beats a raw scan, and a
+refusal with a reason beats a query that 400s at the database:
+
+| Report | Plan | `exactness` |
+|---|---|---|
+| `measure: 'funnel'` | `funnel` — every stage a lifetime `by: ['subject']` family of one subject type | `exact` |
+| `measure: 'distinct:<subjectType>'` | `distinctCount` — a bucketed single-subject family whose feeders cover the source | `exact` |
+| `groupBy` ⊆ a family's dims, bucket no coarser than `interval`, measure `count` or one of its `sum`s | `rollups`, folded by `plan.shape`. Fewest dims wins | `exact` |
+| `groupBy`, measure `count` / `sum:` / `avg:` | `breakdown` | `raw`, or `scan` when a dim it touches has no index |
+| no `groupBy`, an explicit measure or interval | `series` | `raw` / `scan` |
+| `measure: 'p50\|p95\|p99:<metric>'` | `distribution` (no `groupBy` — per-group percentiles are an open item) | `raw` / `scan` |
+| no measure, no groupBy, no interval | `records` | `raw` / `scan` |
+| anything else | `{ unavailable: true, why }` | — |
+
+`exactness` is rendered, never inferred: `exact` came off maintained rollup docs,
+`raw` off an indexed scan of records, and `scan` means a dimension the read
+touches has no index behind it — the `why` names it. Ranges accept the UI's
+shorthands (`'7d'`) or an explicit ISO pair; `rangeOf()` resolves either and
+refuses an unknown shorthand or an inverted pair with a 400.
+
+Every refusal names the offending key or family, and the registry change that
+would make it answerable — "no bucketed `by: ['subject']` family covers
+`account.signed_up`…" reads as an instruction, not a rejection.
+
+### values
+
+`createValues({ catalog, TelemetryModel, RollupModel })` answers "what values
+does this dimension actually take" — the lookup a report builder makes *before*
+it names a value in a filter.
+
+It is **not a tenth primitive.** The primitives read records and rollups and
+know nothing about the registry; this reads the catalog first and only touches
+Mongo when the catalog cannot answer. That is also why it lives beside
+`createQueries` rather than inside it.
+
+```ts
+const values = createValues({ catalog: deriveCatalog(registry), TelemetryModel, RollupModel });
+await values(scope, { dim: 'attr:gen_ai_request_model', names: ['llm.completion'], range });
+// → { values: ['opus','sonnet'], counts: [412, 96], source: 'rollups', via: 'llm_cost', truncated: false }
+```
+
+Four sources, tried in order, and the answer says which one it used:
+
+| `source` | when | reads |
+|---|---|---|
+| `catalog` | the dimension has a closed domain — a `z.enum`, an envelope enum | nothing |
+| `rollups` | a family is keyed by the dimension. Fewest dims wins; `names` restricts to families those events feed | one `$group` on the `{tenantId, as, dims, …}` index |
+| `raw` | an indexed attr, or an envelope/pseudo dim, **and** a range | one `$group` over the range |
+| `none` | nothing above applies — offer free text with a *scan* badge | nothing |
+
+`catalog` returns the declared order and no `counts`; the other two sort by
+count descending. The `label=` prefix rollups.ts writes is stripped, and a
+subject dim keeps its native `type:id`. Records missing the dimension are not a
+value — the null group `breakdown()` reports is real, but it is not something a
+filter can name.
+
+**`none` is an answer, not an error.** A dimension that would need a range and
+was given none resolves to `none` rather than throwing: the caller's fallback is
+a text box, and a thrown error would replace it with an error page. The cap
+(`limits.values`, default 200) bounds the values returned, never the rows
+scanned, and `truncated` says when it bit.
 
 ## Slow reads
 
@@ -339,6 +485,7 @@ everywhere else.
 
 ## Where to go next
 
+- [Reports](/guide/reports) — the catalog, the Report shape, and the executor over these primitives
 - [Rollups](/guide/rollups) — declaring the families these primitives read
 - [The dashboard](/guide/dashboard) — the same primitives over HTTP, behind a viewer
 - [Public API](/reference/http-public) and [Admin API](/reference/http-admin)

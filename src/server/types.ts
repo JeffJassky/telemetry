@@ -103,12 +103,56 @@ export interface TelemetryCounters {
   deduped: number;
   /** a `body` clipped to bodyMax — the row survives, marked */
   truncated: number;
+  /**
+   * `rollupSkipped`, attributed: `${family}|${dimLabel}` → count. Which family
+   * dropped which dim — the difference between "12 records went missing" and
+   * "`screens_viewed` has no `dimDefault` for `name`", which is a registry line
+   * you can go and write. The scalar above is unchanged and still counts every
+   * skip; this is additive.
+   */
+  rollupSkippedBy: Record<string, number>;
+  /**
+   * attrs keys seen on a record that its spec does not declare:
+   * `${name}|${key}` → count. See noteUndeclaredAttrs() in emit.ts for what
+   * happens to those records (they are rejected, not stripped).
+   */
+  undeclaredAttrs: Record<string, number>;
 }
 
 export const newCounters = (): TelemetryCounters => ({
   rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0,
-  deduped: 0, truncated: 0,
+  deduped: 0, truncated: 0, rollupSkippedBy: {}, undeclaredAttrs: {},
 });
+
+/**
+ * Distinct keys either attributed counter map will hold. Both are keyed on
+ * data a CLIENT controls — an event name, an attr key — so an unbounded map is
+ * a way to grow this process's heap from the outside. Past the cap every new
+ * key folds into one `(other)` bucket: the total stays honest, only the
+ * attribution stops. A host seeing `(other)` climbing has either a hostile
+ * client or a registry that is very far behind.
+ */
+export const COUNTER_MAP_MAX = 1000;
+
+/** the fold-here bucket, shaped like a real key so readers can split it the same way */
+export const COUNTER_OVERFLOW_KEY = '(other)|(other)';
+
+/** `map[key]++`, bounded. Names no registry entry once it folds — see COUNTER_MAP_MAX. */
+export const bumpCounterMap = (map: Record<string, number>, key: string): void => {
+  const seen = map[key];
+  if (seen !== undefined) {
+    map[key] = seen + 1;
+    return;
+  }
+  // The size check is O(n) and runs only on a key never seen before; once the
+  // overflow bucket exists the map is known full, so it short-circuits and a
+  // storm of distinct keys stays O(1) per record.
+  if (map[COUNTER_OVERFLOW_KEY] !== undefined || Object.keys(map).length >= COUNTER_MAP_MAX) {
+    map[COUNTER_OVERFLOW_KEY] = (map[COUNTER_OVERFLOW_KEY] ?? 0) + 1;
+    return;
+  }
+  map[key] = 1;
+};
 
 /**
  * Consistent probability sampling — deterministic per trace, no propagation

@@ -75,11 +75,28 @@ On a fresh clone with no build, the shell route answers **503** with a plain-tex
 line telling you to run `npm run build`. `dist/` is not committed, so that is the
 normal state of a checkout, not a bug.
 
+## The pages
+
+Eight, and none of them names a metric, an attr or a family — each reads the
+[catalog](/guide/reports#the-catalog) and hands a Report to the resolver.
+
+| Page | What it shows |
+|---|---|
+| **Overview** | cross-kind stat tiles — errors, events, p95, active subjects, spend. Each tile is a Report, and a tile whose Report this registry cannot answer is **not rendered** rather than filled from a wider read |
+| **Explore** | the [report builder](/guide/reports#the-explore-page): source → measure → group by → interval → compare, every option pre-checked by the resolver. Its URL *is* the Report |
+| **Events** | Explore, pre-sourced to `kind: 'event'` |
+| **Errors** | issue list → issue detail, off the family derived from `field:error.*` |
+| **Traces** | recent traces → waterfall |
+| **Journeys** | the rollup explorer over any family, the cohort funnel with its [stage picker](/guide/reports#the-funnel-picker), and subject lookup → journey view |
+| **Usage** | one series per observed `usage.meter`, with the first `*_usd` measure the catalog reports — never a literal key |
+| **System** | counters, suggestions, quarantine, index budget, keys |
+
 ## Views: one shape, three producers
 
-A view is nothing but **named query state** — a page, a range, some filters, a
-display mode. That is the whole model, and it is why three very different things
-can produce one:
+A view is nothing but **named query state** — a page and a
+[Report](/guide/reports): a source, a range, a measure, some filters. `ViewSpec
+.query` **is** a `Report`, which is the whole model, and it is why three very
+different things can produce one:
 
 | Origin | Comes from | Lives in |
 |---|---|---|
@@ -88,10 +105,28 @@ can produce one:
 | `saved` | a user pressing save in the UI | `<collection>_views` |
 
 **Derived views exist because the registry already knows enough to write them.**
-Every event name gets a pre-filtered page (routed by kind: errors → Errors,
-spans → Traces, states → Journeys, usage → Usage, events → Events). Every rollup
-family gets a `rollup: <family>` preset. Zero configuration, and they stay
-correct as the registry changes, because they *are* the registry.
+`deriveViews(registry, catalog?)` writes five shapes, all zero configuration, and
+they stay correct as the registry changes because they *are* the registry:
+
+| shape | name | what it answers |
+|---|---|---|
+| per event | `<name>` | that one name over a week, on the page its kind routes to (errors → Errors, spans → Traces, states → Journeys, usage → Usage, events → Events) |
+| per rollup family | `rollup: <as>` | the family's own docs — the cheapest read there is |
+| per namespace | `namespace: <ns>` | every name under `billing.*`, broken out by name |
+| per usage event | `spend: <name>` | its `*_usd` sum per day |
+| per subject type | `funnel: <type>` | that type's lifetime milestones as a cohort funnel |
+
+The last three exist because the catalog made them writable. A namespace holding
+one event is skipped, and so is a subject type with fewer than two milestone
+families — both would be a second name for a view that already exists.
+
+**Every view saved before Reports existed still parses.** `spec` is a Mixed
+document and `normalizeQuery()` lifts the old `{ range, filters, groupBy, sort }`
+shape onto a Report. The one key that is gone is `display`: it was a
+rendering hint no page read, and the renderer now decides from the Report itself
+— `groupBy` + `interval` is a stacked series, `groupBy` alone a breakdown table,
+`interval` alone a series, neither a stat tile. A stored view still carrying it
+keeps parsing; the key is ignored.
 
 Configured views are the ones you want in git — the four charts your ops team
 opens every morning, reviewed like code.
@@ -189,10 +224,47 @@ never shows them has not solved anything.
 These are per-process, in-memory counters. Scrape them onto your own `/metrics`
 too — the page is for a human noticing, not for alerting.
 
+**Attribution** — two maps beside the seven numbers, because a scalar tells you
+something went wrong and not where:
+
+| | |
+|---|---|
+| `rollupSkippedBy` | `` `${family}\|${dimLabel}` `` → count. Which family dropped which dim. |
+| `undeclaredAttrs` | `` `${name}\|${attrKey}` `` → count. Which attr key keeps arriving undeclared. |
+
+Both are bounded at 1000 distinct keys; past that, new keys fold into one
+`(other)|(other)` bucket. The keys are client-controlled — an event name, an
+attr key — so an unbounded map would be a way to grow the process heap from
+outside. The totals stay honest; only the attribution stops.
+
 **Quarantine** — the latest 50 rejects, with timestamp, event name, and reason.
 Every row is a write someone attempted and the package refused. This is the first
 place to look after a deploy: a wave of `unregistered event` means a client is
 ahead of (or behind) the server's registry.
+
+**Suggestions** — those same three sources, read the other way round. Everywhere
+else the registry tells the data what is allowed; here the data tells the
+registry what it is missing, and it can, because nothing was ever dropped
+silently:
+
+| `kind` | from | the suggestion |
+|---|---|---|
+| `undeclared_attr` | `counters.undeclaredAttrs` | *"`import.started` has been sent with attr `codec` 41 times — not declared"* |
+| `missing_dim_default` | `counters.rollupSkippedBy` | *"`screens_viewed` skipped 12 records with no `name` — declare `dimDefault`"* |
+| `unregistered_event` | the quarantine, grouped by name | *"`video.exported` was rejected 3 times — not in the registry"* |
+
+Each carries a `fix` that is **code, not prose**: the zod line to add (or the
+whole `attrs: z.object({ … })` block when the spec declares none), the
+`dimDefault` line with a comment naming every spec that feeds the family, or a
+minimal registry stub for the missing name. Loudest first, capped at 50.
+
+Nothing here writes anything. The host still edits the registry by hand; the
+package just stops making it guess. The derivation
+([`deriveSuggestions`](/reference/types#suggestions)) is pure and runs over the
+counters and quarantine rows the page already fetched, so it costs no extra
+read — and it is exported, if you would rather render it somewhere else. The
+`telemetry_health` MCP tool returns the same list, so an agent asked why a chart
+is missing data answers with the edit rather than the symptom.
 
 **Index budget** — the live index count on the telemetry collection against
 `INDEX_BUDGET` (24 payload indexes). Mongo caps a collection at 64; the base
@@ -243,7 +315,7 @@ At most 100 refs per call.
 Every read primitive carries its `$limit` inside the pipeline — an unbounded read
 is unreachable by construction, not by convention. Most also require a time
 range; the two exceptions are stated in
-[Queries](/guide/queries#the-eight-primitives) rather than glossed over.
+[Queries](/guide/queries#the-nine-primitives) rather than glossed over.
 Override the caps with `queryLimits`, and get told when a read is slow:
 
 ```js
@@ -265,6 +337,7 @@ lower bound as though it were the number.
 
 ## See also
 
+- [Reports](/guide/reports) — the catalog, the Report shape, and the resolver behind every page
 - [Admin HTTP API](/reference/http-admin) — every route, parameter, and status code
 - [`createDashboard`](/reference/routers#createdashboardoptions) — every option
 - [Queries & funnels](/guide/queries) — what the primitives actually compute

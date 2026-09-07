@@ -71,7 +71,9 @@ app.use('/telemetry', createDashboard({
 }));
 ```
 
-Then `open http://localhost:3000/telemetry`.
+Then `open http://localhost:3000/telemetry`. The dashboard derives its report
+builder from the registry you just wrote, so a new event or rollup family is a
+new chart with no UI code — see [Reports](https://jeffjassky.github.io/telemetry/guide/reports).
 
 ## The three things to get right
 

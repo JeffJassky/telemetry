@@ -39,7 +39,7 @@ features:
     linkText: Erase a subject
   - title: A dashboard you mount
     icon: 🎛️
-    details: 'A React SPA plus six query primitives behind one express Router, served from your own domain at any mount path. No redirect to a vendor, no SSO handshake, no data leaving your database. Your `viewerAdapter` is the entire access boundary.'
+    details: 'A React SPA plus nine query primitives behind one express Router, served from your own domain at any mount path — including a report builder derived from your registry, so a new event or rollup family is a new chart with no UI code. No redirect to a vendor, no SSO handshake, no data leaving your database. Your `viewerAdapter` is the entire access boundary.'
     link: /guide/dashboard
     linkText: Mount the dashboard
   - title: Typed SDKs, everywhere

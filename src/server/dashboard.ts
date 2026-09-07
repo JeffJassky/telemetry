@@ -5,7 +5,12 @@ import { fileURLToPath } from 'node:url';
 import type { NextFunction, Request, Response, Router } from 'express';
 import { INDEX_BUDGET } from './indexes.js';
 import { isPlatformScope } from './types.js';
+import { deriveCatalog, projectRegistry } from './catalog.js';
+import { deriveSuggestions } from './suggest.js';
 import { createQueries, type QueryLimits, type RecordFilter, type TimeRange } from './query.js';
+import { createValues } from './values.js';
+import { parseReportQuery, resolveReport } from './report.js';
+import { executeReport } from './execute.js';
 import { buildViewModel, resolveViews, saveView, type ViewSpec } from './views.js';
 import type { Telemetry } from './index.js';
 
@@ -107,6 +112,15 @@ const parseFilter = (q: Record<string, unknown>): RecordFilter => {
   for (const k of ['kind', 'name', 'severity', 'env', 'service', 'release', 'subject', 'traceId'] as const) {
     if (typeof q[k] === 'string' && q[k]) (f as any)[k] = q[k];
   }
+  // `name=a,b` is the name-SET term — a namespace or a rollup family is several
+  // event names, and reading them as one `$in` is what makes that read exact
+  // instead of "every record of that kind". Names never contain a comma
+  // (validateRegistry), so the split is unambiguous, and one name stays a
+  // string so every URL that exists keeps its shape.
+  if (typeof q.name === 'string' && q.name.includes(',')) {
+    const names = q.name.split(',').map((s) => s.trim()).filter(Boolean);
+    if (names.length) f.name = names.length === 1 ? names[0] : names;
+  }
   if (typeof q.attrs === 'string' && q.attrs) {
     // attrs=format:pdf,route:/reports
     f.attrs = Object.fromEntries(
@@ -163,32 +177,6 @@ const parseDims = (v: unknown): string | string[] | undefined => {
   return v.length ? (v as string[]) : undefined;
 };
 
-/** the registry, projected for the UI — names and shapes, never zod objects */
-function registryProjection(t: Telemetry) {
-  return Object.fromEntries(
-    Object.entries(t.registry).map(([name, spec]) => [
-      name,
-      {
-        kind: spec.kind,
-        origin: spec.origin,
-        subjects: spec.subjects,
-        description: spec.description,
-        attrKeys: spec.attrs ? Object.keys(spec.attrs.shape) : [],
-        metricKeys: spec.metrics ? Object.keys(spec.metrics.shape) : [],
-        indexedAttrs: spec.indexedAttrs ?? [],
-        indexedMetrics: spec.indexedMetrics ?? [],
-        rollups: (spec.rollups ?? []).map((r) => ({
-          as: r.as ?? name,
-          by: r.by,
-          bucket: r.bucket ?? null,
-          sum: r.sum ?? [],
-          subjects: r.subjects ?? [],
-        })),
-      },
-    ]),
-  );
-}
-
 export function createDashboard(opts: CreateDashboardOptions): Router {
   const { telemetry: t, viewerAdapter, subjectAdapter, views: configured = [] } = opts;
   if (!viewerAdapter?.resolveViewer) {
@@ -222,6 +210,31 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     cacheSize: opts.cacheSize,
   });
 
+  // Derived once, here, for the same reason validateRegistry runs at boot: if
+  // the catalog cannot be built the registry is wrong, and a request is the
+  // wrong place to find that out. The `client.platform` enum is per instance
+  // (CreateTelemetryConfig.platforms extends the builtin list) and the
+  // Telemetry handle does not carry it, so it is read back off the compiled
+  // schema — the same closed domain the writer enforces.
+  const catalog = deriveCatalog(t.registry, {
+    platforms: (t.models.telemetry.schema.path('client') as any)?.schema?.path('platform')?.enumValues,
+  });
+  const registry = projectRegistry(catalog);
+
+  // the observed domain of a dimension (reports §5). Built here rather than
+  // inside createQueries because it reads the CATALOG — it is the lookup the
+  // report builder makes before it names a value, not a tenth primitive.
+  const values = createValues({
+    catalog,
+    TelemetryModel: t.models.telemetry,
+    RollupModel: t.models.rollups,
+    limits: opts.queryLimits,
+    onSlowQuery: opts.onSlowQuery,
+    slowMs: opts.slowMs,
+    cacheTtlMs: opts.cacheTtlMs,
+    cacheSize: opts.cacheSize,
+  });
+
   const api = express.Router();
   api.use(express.json({ limit: '64kb' }));
 
@@ -248,7 +261,8 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
   // the SPA's one boot call — it learns its scope here, because a cross-tenant
   // number that cannot say which tenant it came from is unusable
   api.get('/registry', h(async (req) => ({
-    registry: registryProjection(t),
+    registry,
+    catalog,
     kinds: ['event', 'error', 'span', 'state', 'usage'],
     role: req.viewer!.role,
     scope: req.viewer!.tenantId,
@@ -272,6 +286,22 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
   api.get('/distribution', h(async (req) =>
     q.distribution(req.viewer!.tenantId, parseRange(req.query), parseFilter(req.query), {
       measure: typeof req.query.measure === 'string' ? req.query.measure : undefined,
+    }),
+  ));
+
+  /**
+   * `?groupBy=attr:model,field:client.platform` — comma-separated so a
+   * breakdown stays a URL, like the funnel's `stages`. The primitive owns the
+   * vocabulary: an unknown dim, a refused path, three dims or a bad interval
+   * all throw with `status: 400` and their own message, which the error
+   * middleware surfaces verbatim rather than flattening into 'bad_request'.
+   */
+  api.get('/breakdown', h(async (req) =>
+    q.breakdown(req.viewer!.tenantId, parseRange(req.query), parseFilter(req.query), {
+      groupBy: String(req.query.groupBy ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+      measure: typeof req.query.measure === 'string' ? req.query.measure : undefined,
+      interval: (req.query.interval as any) || undefined,
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
     }),
   ));
 
@@ -363,17 +393,71 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     }));
   }));
 
+  /**
+   * The observed domain of one dimension — what turns the FilterBar's
+   * `window.prompt` into a picker (reports §5). `names` is the Report's source
+   * events, comma-separated so this stays a URL like everything else.
+   *
+   * The range is OPTIONAL here, unlike every raw-reading route: a dim the
+   * catalog or the rollups can answer needs no window, and a dim that would
+   * need one answers `source: 'none'` rather than 400 — the caller's fallback
+   * is a text box, not an error.
+   */
+  api.get('/values', h(async (req) => {
+    const dim = typeof req.query.dim === 'string' ? req.query.dim.trim() : '';
+    if (!dim) {
+      throw Object.assign(new Error('dim required'), { status: 400 });
+    }
+    const names = String(req.query.names ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    return values(req.viewer!.tenantId, {
+      dim,
+      names: names.length ? names : undefined,
+      range: req.query.from || req.query.to ? parseRange(req.query) : undefined,
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
+    });
+  }));
+
   api.get('/subjects/describe', h(async (req) => {
     const refs = String(req.query.refs ?? '').split(',').filter(Boolean).slice(0, 100);
     if (!subjectAdapter) return { refs: {} }; // refs render raw — the documented fallback
     return { refs: await subjectAdapter.describe(refs) };
   }));
 
+  /**
+   * ── the Report, over HTTP (reports §4, §6) ──
+   *
+   * A Report IS this URL: `?source=event:llm.completion&range=7d&measure=sum:cost_usd
+   * &groupBy=attr:gen_ai_request_model&filter=attr:feature:eq:chat`. One route
+   * behind every chart, because the resolver picks the primitive — so the SPA
+   * stops choosing an endpoint per page and asks the question instead.
+   * `parseReportQuery`/`reportToQuery` are inverses and util.js speaks the same
+   * grammar, which is what keeps a shared link and a saved view the same thing.
+   */
+  api.get('/report', h(async (req) =>
+    badRequest(() =>
+      executeReport(q, req.viewer!.tenantId, parseReportQuery(req.query as Record<string, unknown>), catalog),
+    ),
+  ));
+
+  /**
+   * The dry run. Same URL, no read: it answers `Plan | Unavailable` with a 200,
+   * because a refusal is an ANSWER here — the UI greys the option and shows the
+   * `why`, and an agent learns the cost of a question before paying it. (An
+   * Unavailable on `/report` itself IS a 400: by then the caller asked for
+   * data.) A malformed URL is still a 400 either way.
+   */
+  api.get('/report/plan', h(async (req) =>
+    badRequest(async () =>
+      resolveReport(parseReportQuery(req.query as Record<string, unknown>), catalog),
+    ),
+  ));
+
   // ── views: one shape, three producers ──
   api.get('/views', h(async (req) => ({
     views: await resolveViews({
       ViewModel,
       registry: t.registry,
+      catalog,
       configured,
       tenantId: req.viewer!.tenantId,
       viewerRef: req.viewer!.viewerRef,
@@ -436,6 +520,12 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
       indexBudget: INDEX_BUDGET,
       keys,
       role: req.viewer!.role,
+      // The same three sources, read the other way round: what the data says
+      // the registry is missing, each with the line that would fix it. Derived
+      // from the counters and the quarantine ALREADY fetched above, so the
+      // page costs no extra read. Nothing is written — the host still edits
+      // the registry by hand (reports §9).
+      suggestions: deriveSuggestions({ counters: t.counters, catalog, quarantine }),
     };
   }));
 
