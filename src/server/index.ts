@@ -6,6 +6,7 @@ import { buildRollupModel } from './rollups.js';
 import { buildCheckpointModel, createCheckpointFactory } from './checkpoint.js';
 import { createEmitter, createSubjectLinking, type EmitInput, type SubjectLinker } from './emit.js';
 import { createForget } from './forget.js';
+import { createRelink } from './relink.js';
 import { createSyncIndexes } from './indexes.js';
 import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
 
@@ -21,6 +22,8 @@ export type { TelemetryCounters, Logger, EntityRef } from './types.js';
 export { INDEX_BUDGET } from './indexes.js';
 export { truncate, resolveDim } from './rollups.js';
 export type { ForgetResult } from './forget.js';
+export { RELINK_BATCH_SIZE } from './relink.js';
+export type { RelinkOptions, RelinkResult } from './relink.js';
 export type { Checkpoint } from './checkpoint.js';
 export { SUBJECT_MAX, SUBJECT_LINK_TIMEOUT_MS } from './emit.js';
 export type { EmitInput, EmitResult, LinkSubjects, SubjectLinker } from './emit.js';
@@ -208,6 +211,14 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     globalSubjectRefs: () => config.globalSubjectRefs === true,
   });
 
+  // The BACKFILL half of subject linking, and it takes the same `linkSubjects`
+  // the write path uses rather than a merge of its own — see relink.ts for why
+  // a second copy of those rules would be unreconcilable rather than merely
+  // duplicated.
+  const relink = createRelink({
+    registry, TelemetryModel, RollupModel, counters, logger, linkSubjects,
+  });
+
   const syncIndexes = createSyncIndexes({
     registry,
     TelemetryModel,
@@ -220,6 +231,21 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     emit,
     /** erasure: delete sole-party rows, redact shared ones, rekey rollups, drop aliases */
     forget,
+    /**
+     * Backfill: re-ask the `subjectLinker` about records ALREADY on disk, and
+     * replay the rollups the new subjects reach.
+     *
+     * Linking happens at write time, so configuring it fixes the future and
+     * nothing else — a lifetime `by:['subject']` family is keyed on the subject
+     * the record was written with, and a read-time join cannot reach back into
+     * it. This is how a host catches up the backlog it adopted the hook with.
+     *
+     * DRY RUN BY DEFAULT: it rewrites historical aggregates, so the short call
+     * reports and the writing call says `{ dryRun: false }`. Idempotent by
+     * construction — a row that already carries the linked subject yields
+     * nothing new, so a second run is a no-op.
+     */
+    relink,
     /**
      * Tenant scope is not optional — force every read through here. The five
      * dashboard query primitives (records/series/distribution/rollups/journey)

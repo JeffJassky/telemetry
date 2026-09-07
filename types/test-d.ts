@@ -33,6 +33,8 @@ import type {
   Logger,
   MetricsOf,
   Registry,
+  RelinkOptions,
+  RelinkResult,
   RollupSpec,
   LinkSubjects,
   Scoped,
@@ -60,6 +62,7 @@ import {
   LogLevel,
   Origin,
   PLATFORM_SCOPE,
+  RELINK_BATCH_SIZE,
   RETENTION_DAYS,
   SAMPLE_RATE,
   SCHEMA_VERSION,
@@ -195,6 +198,21 @@ async function reads() {
 
   const gone: ForgetResult = await t.forget('acc_9', 'user:u_1');
   void (gone.deleted + gone.redacted + gone.rollups + gone.aliases);
+
+  // relink() — the backfill for subjectLinker. Dry run by DEFAULT, so the
+  // no-argument call is the safe one and writing is opted into.
+  const preview: RelinkResult = await t.relink();
+  const opts: RelinkOptions = {
+    names: ['user.signed_up'],
+    since: new Date('2026-01-01T00:00:00Z'),
+    limit: 10_000,
+    dryRun: false,
+    batchSize: RELINK_BATCH_SIZE,
+    onProgress: (p) => void p.examined,
+  };
+  const done: RelinkResult = await t.relink(opts);
+  void (preview.examined + done.linked + done.subjects + done.rollups
+    + done.misses + done.errors + done.skipped);
 
   const cp: Checkpoint = t.checkpoint('mailery-bridge');
   const mark: Date | null = await cp.get();

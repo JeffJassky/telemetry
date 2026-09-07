@@ -7,6 +7,86 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.6.0]
+
+### Added
+- **`t.relink()` — the backfill for write-time subject linking, so a host that
+  adopts `subjectLinker` late is not left with a backlog its aggregates cannot
+  see.** 0.5.0 links at WRITE time, and that is not an implementation detail: a
+  lifetime `by:['subject']` rollup is keyed on the subject the record was
+  written with, permanently, which is exactly why read-time joining could not do
+  the job — and exactly why the day the hook is configured splits a collection
+  in two. Records after it carry `user:u_1` on the row and in every
+  `subjects:['user']` family. Records before it carry `machine:<installId>` and
+  nothing else, so the family has no member for any of them: a lifetime
+  milestone is missing the whole backlog, and a cohort funnel anchored on `user`
+  reads **zero** for every stage those events feed, while the events sit there,
+  real and correctly timestamped. Nothing at read time closes that, because the
+  aggregate is already written. The rows have to be relinked and the affected
+  rollups replayed.
+
+  `t.relink(opts?)` streams the stored records with a cursor, re-asks the
+  linker, updates each row's `subjects` **and** its derived `subjectKeys` — the
+  fan-out reads `subjectKeys` and only `subjectKeys`, so a row updated without
+  it relinks and still aggregates to nothing — and replays the rollups the new
+  subjects reach. Returns `{ examined, linked, subjects, rollups, misses,
+  errors, skipped }`.
+
+  **`dryRun` defaults to `true`, and that default is the API.** It rewrites
+  historical aggregates, so the short call has to be the one that cannot hurt
+  you and writing is opted into with `{ dryRun: false }`. The preview is exact
+  rather than estimated: `recordRollup` now builds its fan-out and reports its
+  size without sending it, so the number a dry run prints is produced by the
+  code that would have written it. A dry run still asks the host's linker —
+  there is no other way to know what would link — so the six linking counters
+  move; nothing on disk does.
+
+  **Idempotent by construction, not by bookkeeping.** No watermark, no marker
+  field. A row that already carries the linked subject offers it to the SAME
+  merge `emit()` and `ingest.ts` use, the merge dedupes on `type:id`, nothing is
+  new — so nothing is written and nothing is replayed. That matters more here
+  than anywhere else in the package: `recordRollup` `$add`s 1 per call, so a
+  replay that runs twice inflates a historical `count`, and an aggregate that is
+  1.3× too big is indistinguishable from a real one. An aggregate that is SHORT
+  announces itself against the rows it came from, which is why the row is
+  updated **before** its rollups are replayed — interrupted, the operation fails
+  toward short and never toward long, and the next run resumes.
+
+  **Only the affected families are replayed.** A family that does not group by
+  `subject` counted the record once at write time and cannot gain a group from a
+  new one; a `subjects:['machine']` family was already satisfied by the ref the
+  record arrived with. Both are left untouched, and the fan-out is handed the
+  NEW refs only, so a spec whose filter admits none of them writes nothing.
+
+  **It never throws for host reasons.** A linker that throws, rejects, hangs or
+  answers garbage costs that row its link and moves `errors`, exactly as on the
+  write path; the sweep continues. An `onProgress` that throws is ignored. No
+  `subjectLinker` configured returns `{ skipped: 1 }` having read nothing. The
+  one deliberate throw is a `names` entry the registry does not declare, before
+  any I/O — a typo that relinks nothing looks exactly like a clean run.
+
+  `names` / `since` / `limit` / `batchSize` / `onProgress` bound the sweep;
+  `limit` caps records **examined**, not linked, and `limit: 0` examines nothing
+  (Mongo reads a zero limit as NO limit). The scan is pinned to the `_id` index,
+  because the cursor updates the documents it is walking and the multikey index
+  on `subjectKeys` is one a relink would move them within.
+
+  No new indexes, no envelope change, no index-budget movement, and nothing
+  changes for a host that never calls it.
+
+### Changed
+- `recordRollup()` returns the number of rollup documents it touched, and takes
+  an internal `{ dryRun }` that builds the fan-out without sending it. `emit()`
+  and the ingest router ignore the return; `relink()` reports it. Internal —
+  `recordRollup` is not exported from the package entry point.
+
+### Fixed
+- The `SubjectLinker` doc comment in `types/index.d.ts` and the `subjectLinker`
+  trap note in `docs/guide/configuration.md` still said an undeclared linked
+  type is **refused**. It has been written-and-reported since 0.5.0, and the
+  advice they gave — declare the type — is the one thing that guide's own
+  warning says will quarantine your pre-activation rows.
+
 ## [0.5.0]
 
 ### Added

@@ -696,6 +696,59 @@ export interface ForgetResult {
   views: number;
 }
 
+export interface RelinkOptions {
+  /**
+   * Restrict to these event names. Default: every stored record, whatever its
+   * name. A name the registry does not declare THROWS, before any I/O — a typo
+   * that silently relinks nothing looks exactly like a clean run.
+   */
+  names?: string[];
+  /** only records at/after this instant (`occurredAt`) */
+  since?: Date;
+  /**
+   * Stop after this many records are EXAMINED — not linked. A budget for the
+   * scan, so a huge collection can be probed cheaply. Default unbounded.
+   */
+  limit?: number;
+  /**
+   * Report what would change and write NOTHING. **Defaults to `true`**, because
+   * this rewrites historical aggregates and the short call has to be the safe
+   * one. A dry run still asks the host's linker, so the linking counters move;
+   * nothing on disk does.
+   */
+  dryRun?: boolean;
+  /** records fetched per batch, and the `onProgress` cadence. Default 500. */
+  batchSize?: number;
+  /** cumulative counts after each batch, for progress output. Guarded: a
+   *  printer that throws does not kill the backfill. */
+  onProgress?: (r: RelinkResult) => void;
+}
+
+export interface RelinkResult {
+  /** rows read */
+  examined: number;
+  /** rows that gained at least one subject */
+  linked: number;
+  /** subjects added in total — two links on one row count twice */
+  subjects: number;
+  /** rollup documents written, or under `dryRun` that would have been */
+  rollups: number;
+  /** rows where the linker answered `[]`. On a backfill this is the expected
+   *  answer for most rows, and it is not a failure. */
+  misses: number;
+  /** rows where the linker threw, rejected, timed out or answered garbage —
+   *  once per ROW however many ways it went wrong. `counters.subjectLinkErrors`
+   *  and `subjectLinkTimeouts` keep the finer split. */
+  errors: number;
+  /** rows the run declined to offer the linker (a stored name the registry no
+   *  longer declares, so its rollup families are unknowable), plus one standing
+   *  for a call with no `subjectLinker` configured, which reads nothing. */
+  skipped: number;
+}
+
+/** records fetched per batch by `relink()`, and how often `onProgress` fires */
+export declare const RELINK_BATCH_SIZE: 500;
+
 export interface Scoped {
   find(q?: Record<string, unknown>): Query<any[], any>;
   aggregate(stages: Record<string, unknown>[]): Aggregate<any[]>;
@@ -760,7 +813,9 @@ export interface SubjectLinker {
    * Runs once per record on the write path, so it must answer from a cache.
    * The package bounds it rather than trusting it: past `subjectLinkTimeoutMs`,
    * or on a throw, the record is written unlinked and counted. A linked subject
-   * whose `type` the event does not declare is refused, not written.
+   * whose `type` the event does not declare is written ANYWAY and counted in
+   * `counters.subjectLinkUndeclared` — refusing it could only ever be obeyed by
+   * losing rows, because `EventSpec.subjects` is a required list.
    */
   link(
     subjects: SubjectInput[],
@@ -802,6 +857,25 @@ export interface Telemetry<R extends Registry = Registry> {
    * platform-scoped saved views only when `globalSubjectRefs` is set.
    */
   forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>;
+  /**
+   * Backfill for `subjectLinker`: re-ask it about records ALREADY on disk, and
+   * replay the rollups the new subjects reach.
+   *
+   * Linking happens at write time, so configuring the hook fixes the future and
+   * nothing else — a lifetime `by:['subject']` family is keyed on the subject
+   * the record was written with, permanently, and no read-time join can reach
+   * back into it. A host that adopts linking on a Tuesday therefore has a
+   * backlog whose rows carry only `machine:<installId>` and whose user-keyed
+   * families have no member for any of them. This is how it catches up.
+   *
+   * **Dry run by default.** It rewrites historical aggregates, so `t.relink()`
+   * reports and `t.relink({ dryRun: false })` writes. Idempotent by
+   * construction: a row that already carries the linked subject yields nothing
+   * new, so a second run writes nothing and replays nothing. Returns
+   * `{ skipped: 1 }` rather than throwing when no `subjectLinker` is
+   * configured.
+   */
+  relink(opts?: RelinkOptions): Promise<RelinkResult>;
   /**
    * Tenant scope is not optional — every read goes through here. Unconditional
    * on purpose: it does not understand PLATFORM_SCOPE, so `scoped('*')` scopes

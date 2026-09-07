@@ -239,10 +239,17 @@ move a counter. Six of those counters exist, and the five failure ones are the
 difference between *"nothing links"* and *"the link is broken"*.
 
 One trap is worth reading before you configure it: a linked subject whose type
-the event does not declare is **refused**, and `EventSpec.subjects` is a
-REQUIRED list — so declaring the type to let the link land also makes it
-mandatory for that event. Full semantics, merge order and counters are on
+the event does not declare is **written anyway** and reported in
+`counters.subjectLinkUndeclared`. Do not "fix" that by declaring the type —
+`EventSpec.subjects` is a REQUIRED list, so declaring `user` on a desktop event
+makes it mandatory and quarantines every record from a machine nobody has
+activated yet. Full semantics, merge order and counters are on
 [Adapters](/guide/adapters#subjectlinker).
+
+And one thing to plan for: linking runs at **write time**, so switching it on
+does nothing for the records you already have — their user-keyed rollups have no
+member for any of them. [`t.relink()`](/guide/adapters#relink) is the backfill,
+and it is a dry run unless you pass `{ dryRun: false }`.
 
 ## `subjectLinkTimeoutMs`
 

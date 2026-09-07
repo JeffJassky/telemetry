@@ -296,10 +296,78 @@ silence. They surface on `t.counters`, on the dashboard's System page and in
 **When it is absent:** nothing is called, nothing is counted, and the write path
 is exactly the one that shipped before it existed. `t.linkSubjects` is `null`.
 
-**Linking is not retroactive.** It runs at write time, so it fixes the rows and
-rollups written *after* you configure it. Records already on disk keep the
-subjects they were written with — backfilling those is a host migration over
-`t.scoped()`, not something this hook can reach.
+### Linking is not retroactive — `t.relink()` is how you catch up {#relink}
+
+`subjectLinker` runs at **write time**, so configuring it fixes the future and
+nothing else. That is not a limitation to work around, it is the same fact the
+hook exists for, seen from the other side: a lifetime `by:['subject']` rollup is
+keyed on the subject the record was written with, *permanently*, which is exactly
+why read-time joining could not do this job — and exactly why the day you turn
+the hook on splits your collection in two.
+
+Records after that day carry `user:u_1` on the row and in every
+`subjects:['user']` family. Records before it carry `machine:m1` and nothing
+else. The family has no member for any of them, so a lifetime milestone is
+missing the whole backlog and a cohort funnel anchored on `user` reads **zero**
+for every stage those events feed — while the events sit there, real, correctly
+timestamped, and unreachable. Nothing you do at read time closes that, because
+the aggregate is already written.
+
+`t.relink()` re-asks your linker about the records already on disk, updates the
+rows, and replays the rollups the new subjects reach.
+
+```ts
+// DRY RUN by default — this is the safe call, and it writes nothing
+const preview = await t.relink();
+// { examined: 412_009, linked: 388_140, subjects: 388_140,
+//   rollups: 388_140, misses: 23_869, errors: 0, skipped: 0 }
+
+// then, having read that
+await t.relink({ dryRun: false, onProgress: (p) => log.info('relink', p) });
+```
+
+| option | |
+|---|---|
+| `names` | restrict to these event names. Default: every stored record. A name the registry does not declare **throws**, before any I/O — a typo that relinks nothing looks exactly like a clean run |
+| `since` | only records at/after this `occurredAt` |
+| `limit` | stop after this many records are **examined** — a budget for the scan, not for the writes |
+| `dryRun` | **defaults to `true`** |
+| `batchSize` | records per batch, and the `onProgress` cadence. Default 500 |
+| `onProgress` | cumulative counts after each batch. A printer that throws does not kill the backfill |
+
+**`dryRun` defaults to `true`, and that default is the API.** This rewrites
+historical aggregates. The short call has to be the one that cannot hurt you, so
+writing is the thing you opt into. A dry run still asks your linker — there is no
+other way to know what would link — so the six linking counters move; nothing on
+disk does. Everything else it reports, including `rollups`, is produced by the
+same code path that would have written it, so the preview is exact rather than
+estimated.
+
+**It is idempotent by construction, not by bookkeeping.** There is no watermark
+and no marker field. A row that already carries the linked subject offers it to
+the same merge `emit()` uses, the merge dedupes it, nothing is new — so nothing
+is written and nothing is replayed. Run it twice, run it after a crash, run it
+from cron: the second run reports `linked: 0` and changes nothing.
+
+That property is load-bearing here in a way it is not elsewhere in the package.
+`recordRollup` adds **1** per call, so a replay that happens twice inflates a
+historical `count` — and an aggregate that is 1.3× too big is indistinguishable
+from a real one. (An aggregate that is *short* announces itself against the rows
+it came from, which is why the operation updates the row **before** replaying its
+rollups: interrupted, it fails toward short, never toward long.)
+
+**What it does not replay.** Only families that group by `subject` and whose
+`subjects` filter admits one of the **new** refs. A family keyed on
+`attr:feature` counted the record once at write time and cannot gain a group from
+a new subject; a `subjects:['machine']` family was already satisfied by the ref
+the record arrived with. Both are left exactly as they are.
+
+**When there is no `subjectLinker`:** it returns `{ skipped: 1 }` and reads
+nothing, rather than throwing — a host may call this from a boot path that does
+not know how the instance was configured. And a stored row whose `name` the
+registry no longer declares is skipped too, counted in the same field: its rollup
+families are unknowable, so relinking the row would leave the row and its
+aggregates disagreeing, which is the bug this whole operation exists to fix.
 
 ---
 
@@ -392,6 +460,7 @@ sink, and both already have a universal shape in every host.
 
 - [Ingest & keys](/guide/ingest) — `contextAdapter` in its three key modes
 - [Emitting records](/guide/emit) — where `subjectLinker` sits in the write path
+- [`t.relink()`](#relink) — the backfill for records written before you configured it
 - [The dashboard](/guide/dashboard) — mounting behind `viewerAdapter`
 - [Erasure](/guide/erasure) — the outbound direction in full
 - [Configuration](/guide/configuration) — everything else on the factory

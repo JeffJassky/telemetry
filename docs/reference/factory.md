@@ -92,6 +92,28 @@ the person's platform-scoped saved views only when `globalSubjectRefs` is set.
 
 Throws without a pepper.
 
+### `relink(opts?)`
+
+```ts
+relink(opts?: RelinkOptions): Promise<RelinkResult>
+```
+
+The backfill for [`subjectLinker`](/guide/adapters#subjectlinker). Re-asks the
+linker about records **already on disk**, updates the rows (subjects *and* the
+derived `subjectKeys`, which is what the rollup fan-out reads), and replays the
+rollup families the new subjects reach. Returns
+`{ examined, linked, subjects, rollups, misses, errors, skipped }`.
+
+**`dryRun` defaults to `true`** — it rewrites historical aggregates, so the short
+call reports and `{ dryRun: false }` writes. Idempotent by construction: a row
+that already carries the linked subject yields nothing new, so a second run
+writes nothing. Streams with a cursor; `limit` caps records **examined**, not
+linked. Returns `{ skipped: 1 }` rather than throwing when no `subjectLinker` is
+configured.
+
+Full option table and the reasoning behind the defaults:
+[Adapters → linking is not retroactive](/guide/adapters#relink).
+
 ### `scoped(tenantId)`
 
 ```ts

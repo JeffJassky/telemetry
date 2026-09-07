@@ -88,6 +88,13 @@ on the document before it. So a redelivered record asks the linker and then
 writes nothing — it aggregates nothing either, exactly as before. The cost of a
 duplicate is one cached lookup.
 
+And because it happens here — on the way to disk — it happens for records
+written from here on, and for no others. Everything already stored keeps the
+subjects it arrived with, in the row and in every rollup built from it.
+[`t.relink()`](/guide/adapters#relink) is the operation that catches that backlog
+up: same merge, same counters, replaying only the families the new subjects
+reach, and a dry run unless you ask it to write.
+
 ## The inversion, and the single rule behind it
 
 The plane order above reverses for two cases, and both are the same rule:

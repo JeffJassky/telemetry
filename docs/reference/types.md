@@ -63,6 +63,7 @@ defineRegistry({
 | `PLATFORM_SCOPE` | `'*'` | The dashboard's cross-tenant read scope, and a **reserved** tenant token on every write path. |
 | `SUBJECT_MAX` | `8` | Total subjects one record may carry once `subjectLinker` has run. Every subject is a multikey index term and one more fan-out per `by:['subject']` family, so the array is bounded. Overflow is dropped and counted. |
 | `SUBJECT_LINK_TIMEOUT_MS` | `50` | Default `subjectLinkTimeoutMs`. Past it the record is written **unlinked** rather than waiting. |
+| `RELINK_BATCH_SIZE` | `500` | Records `relink()` fetches per batch, and how often its `onProgress` fires. |
 | `DEFAULT_LIMITS` | see [Query and view types](#query-and-view-types) | `QueryLimits`. |
 
 ### Helpers
@@ -521,6 +522,8 @@ type LinkSubjects = (
 interface Telemetry<R extends Registry = Registry> {
   emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<EmitResult>;
   forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>;
+  /** backfill for `subjectLinker` — DRY RUN by default */
+  relink(opts?: RelinkOptions): Promise<RelinkResult>;
   scoped(tenantId: string): Scoped;
   checkpoint(key: string): Checkpoint;
   syncIndexes(): Promise<void>;
@@ -557,6 +560,22 @@ interface Checkpoint {
 interface ForgetResult {
   deleted: number; redacted: number; rollups: number; aliases: number; views: number;
 }
+
+interface RelinkOptions {
+  names?: string[];               // default: every stored record. Unknown name throws.
+  since?: Date;                   // occurredAt floor
+  limit?: number;                 // records EXAMINED, not linked
+  dryRun?: boolean;               // DEFAULTS TO TRUE
+  batchSize?: number;             // default 500; also the onProgress cadence
+  onProgress?: (r: RelinkResult) => void;
+}
+
+interface RelinkResult {
+  examined: number; linked: number; subjects: number; rollups: number;
+  misses: number;   // the linker answered [] — an answer, not a failure
+  errors: number;   // threw / rejected / timed out / garbage, once per ROW
+  skipped: number;  // name no longer in the registry; or 1 for "no subjectLinker"
+}
 ```
 
 See [`createTelemetry`](/reference/factory) for the behaviour of each.
@@ -566,6 +585,10 @@ deliberately not `subjectAdapter` under another name: that one labels refs on a
 screen, this one changes what is stored. It is bounded by
 `subjectLinkTimeoutMs`, guarded against throws, and can never fail a write. Full
 semantics on [Adapters](/guide/adapters#subjectlinker).
+
+Because it links at **write** time, it reaches nothing already on disk —
+`relink()` is the backfill, and it is a dry run unless you say otherwise. See
+[Adapters → linking is not retroactive](/guide/adapters#relink).
 
 `t.linkSubjects` is that hook after the package has wrapped it — exposed the way
 `registry` and `models` are, because the ingest router does not call `emit()`

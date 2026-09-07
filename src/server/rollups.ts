@@ -85,11 +85,35 @@ export const truncate = (d: Date, b?: RollupSpec['bucket']): Date | undefined =>
   return new Date(day.getTime() - ((day.getUTCDay() + 6) % 7) * 864e5);
 };
 
+/** what recordRollup does INSTEAD of writing, for a caller that only wants the count */
+export interface RecordRollupOptions {
+  /**
+   * Build the fan-out and return its size without touching the collection.
+   *
+   * relink()'s dry run needs to report exactly what a real run would write, and
+   * the only way for that number to be exactly right is for the SAME function
+   * to produce it — every gate below (the actor allowlist, a missing dim with
+   * no `dimDefault`, a `subjects` filter that admits nothing) changes the count,
+   * and a caller that modelled them separately would be a second copy of this
+   * file's rules, drifting.
+   *
+   * The two counters below are suppressed under it for the same reason: a dry
+   * run that moved `rollupSkipped` would double it on the real run that
+   * follows, and report a drop that never happened.
+   */
+  dryRun?: boolean;
+}
+
 /**
  * Update-pipeline upsert so late/backfilled events correct EVERYTHING, not
  * just the boundaries. `$setOnInsert` for firstCapture/firstTraceId would pin
  * the cohort dimensions to whichever record LANDED first rather than whichever
  * OCCURRED first — silently wrong for offline clients, backfills, and retries.
+ *
+ * Returns the number of rollup DOCUMENTS this record touched — one per subject
+ * the fan-out admitted, or one for a spec that does not fan out, or zero when a
+ * gate declined. `emit()` and `ingest.ts` ignore it; relink() reports it, which
+ * is the only reason it is not `void`.
  */
 export async function recordRollup(
   RollupModel: Model<any>,
@@ -97,12 +121,15 @@ export async function recordRollup(
   name: string,
   spec: RollupSpec,
   counters: TelemetryCounters,
-): Promise<void> {
+  opts?: RecordRollupOptions,
+): Promise<number> {
+  const dry = opts?.dryRun === true;
+
   // aggregate-plane actor gate: admin support browsing must never move a
   // customer aggregate; the raw row is untouched (RollupSpec.actors)
   if (spec.actors && doc.actor) {
     const actorType = String(doc.actor).split(':')[0];
-    if (!spec.actors.includes(actorType)) return;
+    if (!spec.actors.includes(actorType)) return 0;
   }
 
   const as = spec.as ?? name;
@@ -121,13 +148,15 @@ export async function recordRollup(
     let v = resolveDim(src, doc);
     if (v == null || v === '') {
       if (spec.dimDefault === undefined) {
-        counters.rollupSkipped++;
-        // …and WHICH family lost WHICH dim, so the scalar above becomes a
-        // `dimDefault` line the System page can name. Keyed exactly as the
-        // catalog labels a family and its dims (`label(src)` is the same `x=`
-        // prefix written into `dims`), so a reader can join the two.
-        bumpCounterMap(counters.rollupSkippedBy, `${as}|${label(src)}`);
-        return;
+        if (!dry) {
+          counters.rollupSkipped++;
+          // …and WHICH family lost WHICH dim, so the scalar above becomes a
+          // `dimDefault` line the System page can name. Keyed exactly as the
+          // catalog labels a family and its dims (`label(src)` is the same `x=`
+          // prefix written into `dims`), so a reader can join the two.
+          bumpCounterMap(counters.rollupSkippedBy, `${as}|${label(src)}`);
+        }
+        return 0;
       }
       v = spec.dimDefault;
     }
@@ -147,7 +176,7 @@ export async function recordRollup(
         (r: string) => !spec.subjects || spec.subjects.includes(r.split(':')[0]!),
       )
     : [null];
-  if (!refs.length) return;
+  if (!refs.length) return 0;
 
   const firstCapture = Object.fromEntries(
     (spec.capture ?? [])
@@ -159,45 +188,49 @@ export async function recordRollup(
   const expiresAt =
     spec.retentionDays != null ? new Date(at.getTime() + spec.retentionDays * 864e5) : undefined;
 
-  await RollupModel.bulkWrite(
-    refs.map((ref) => {
-      const dims = spec.by.map((src) => (src === 'subject' ? ref! : fixed.get(src)!));
-      /** true when this record becomes the new earliest occurrence */
-      const isNewFirst = {
-        $or: [{ $eq: [{ $type: '$firstAt' }, 'missing'] }, { $lt: [at, '$firstAt'] }],
-      };
-      const sums = Object.fromEntries(
-        (spec.sum ?? [])
-          .map((k) => [k, doc.metrics?.get(k)] as const)
-          .filter(([, v]) => typeof v === 'number')
-          .map(([k, v]) => [`sums.${k}`, { $add: [{ $ifNull: [`$sums.${k}`, 0] }, v] }]),
-      );
-      return {
-        updateOne: {
-          filter: { _id: `${doc.tenantId}|${as}|${dims.join('|')}|${bucketKey}` },
-          update: [
-            {
-              $set: {
-                tenantId: doc.tenantId,
-                as,
-                dims,
-                ...(ref ? { subjectType: ref.split(':')[0] } : {}),
-                ...(bucketAt ? { bucketAt } : {}),
-                ...(expiresAt ? { expiresAt } : {}),
-                // aggregation $min/$max ignore missing, so correct on insert too
-                firstAt: { $min: ['$firstAt', at] },
-                lastAt: { $max: ['$lastAt', at] },
-                count: { $add: [{ $ifNull: ['$count', 0] }, 1] },
-                ...sums,
-                firstTraceId: { $cond: [isNewFirst, doc.traceId ?? null, '$firstTraceId'] },
-                firstCapture: { $cond: [isNewFirst, { $literal: firstCapture }, '$firstCapture'] },
-              },
+  const ops = refs.map((ref) => {
+    const dims = spec.by.map((src) => (src === 'subject' ? ref! : fixed.get(src)!));
+    /** true when this record becomes the new earliest occurrence */
+    const isNewFirst = {
+      $or: [{ $eq: [{ $type: '$firstAt' }, 'missing'] }, { $lt: [at, '$firstAt'] }],
+    };
+    const sums = Object.fromEntries(
+      (spec.sum ?? [])
+        .map((k) => [k, doc.metrics?.get(k)] as const)
+        .filter(([, v]) => typeof v === 'number')
+        .map(([k, v]) => [`sums.${k}`, { $add: [{ $ifNull: [`$sums.${k}`, 0] }, v] }]),
+    );
+    return {
+      updateOne: {
+        filter: { _id: `${doc.tenantId}|${as}|${dims.join('|')}|${bucketKey}` },
+        update: [
+          {
+            $set: {
+              tenantId: doc.tenantId,
+              as,
+              dims,
+              ...(ref ? { subjectType: ref.split(':')[0] } : {}),
+              ...(bucketAt ? { bucketAt } : {}),
+              ...(expiresAt ? { expiresAt } : {}),
+              // aggregation $min/$max ignore missing, so correct on insert too
+              firstAt: { $min: ['$firstAt', at] },
+              lastAt: { $max: ['$lastAt', at] },
+              count: { $add: [{ $ifNull: ['$count', 0] }, 1] },
+              ...sums,
+              firstTraceId: { $cond: [isNewFirst, doc.traceId ?? null, '$firstTraceId'] },
+              firstCapture: { $cond: [isNewFirst, { $literal: firstCapture }, '$firstCapture'] },
             },
-          ],
-          upsert: true,
-        },
-      };
-    }),
-    { ordered: false },
-  );
+          },
+        ],
+        upsert: true,
+      },
+    };
+  });
+
+  // The dry run stops HERE, with the fan-out built and nothing sent. Everything
+  // above this line is a decision; only this line is a write.
+  if (dry) return ops.length;
+
+  await RollupModel.bulkWrite(ops, { ordered: false });
+  return ops.length;
 }
