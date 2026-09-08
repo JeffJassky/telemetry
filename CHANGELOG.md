@@ -7,6 +7,21 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.6.1]
+
+### Fixed
+
+- **A funnel stage that happens before the one above it now says so.** The
+  step rate is still rendered verbatim — it is arithmetic, and cohort-math
+  R3/R4 depends on `FunnelSteps` not recomputing what the server returned —
+  but a rate over 100%, or a negative median, is now labelled `out of order`.
+  Both mean the same thing: subjects reached this stage earlier than the stage
+  its rate is divided by, so that rate is measured against the wrong
+  denominator. Read without the label, a real funnel showing `account.converted`
+  at `411%` above `account.paid` looks like a broken report rather than what it
+  is — two stages listed in the wrong order, on a product where people convert
+  about two weeks before their first payment.
+
 ## [0.6.0]
 
 ### Added

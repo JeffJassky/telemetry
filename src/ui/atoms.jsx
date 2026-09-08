@@ -490,6 +490,18 @@ export function StreamList({ items, markers = [], onSelect }) {
  *
  * `count` is accepted as an alias for `subjects` so a host feeding plain
  * {label, count} rows still gets bars. */
+/**
+ * A stage subjects reach before the stage above it. Either signal alone is
+ * enough: a rate over 100% means more subjects arrived here than at the step
+ * it is divided by, and a negative median says outright that they arrived
+ * earlier. Never true of the anchor, which has nothing above it.
+ */
+function isOutOfOrder(s, i) {
+  if (i === 0) return false;
+  return (s.pctOfPrevious != null && s.pctOfPrevious > 100)
+    || (s.medianDaysFromPrevious != null && s.medianDaysFromPrevious < 0);
+}
+
 export function FunnelSteps({ steps }) {
   if (!steps?.length) return <div className="empty">No funnel data</div>;
   const n = (s) => s.subjects ?? s.count ?? 0;
@@ -509,6 +521,26 @@ export function FunnelSteps({ steps }) {
             )}
             {s.medianDaysFromPrevious != null && (
               <span className="dwell">{fmtDays(s.medianDaysFromPrevious)} median</span>
+            )}
+            {/*
+             * A rate over 100% or a NEGATIVE median both say the same thing:
+             * subjects reached this stage BEFORE the one above it, so the
+             * stages are in the wrong order and every rate below here is
+             * measured against the wrong denominator.
+             *
+             * The numbers stay on screen — they are arithmetic, not errors,
+             * and cohort-math R3/R4 depends on this component not recomputing
+             * them. What was missing is that nothing said the order was
+             * wrong, so "411%" read as a broken funnel rather than as
+             * "account.converted belongs above account.paid". The median is
+             * the crisper of the two signals: people convert ~14 days before
+             * they first pay, and it says so with a minus sign.
+             */}
+            {isOutOfOrder(s, i) && (
+              <span
+                className="pill amber"
+                title="This stage happens BEFORE the one above it, so its rate is measured against the wrong previous step. Reorder the stages."
+              >out of order</span>
             )}
           </span>
         </div>
