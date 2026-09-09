@@ -92,7 +92,11 @@ describe('forget — erasure, actually implemented', () => {
   });
 
   it('erases quarantined raw payloads too — rejects are inside the erasure boundary', async () => {
-    const t = buildTelemetry();
+    // `validation: 'strict'` because this test is about ERASURE, not about
+    // validation policy: it needs a quarantine entry to exist, and strict is
+    // the documented way to guarantee one. Under the lenient default the same
+    // record would be stripped and written instead of quarantined.
+    const t = buildTelemetry({ validation: 'strict' });
     await t.syncIndexes();
     // an invalid emit lands the raw payload (with subjects) in quarantine
     await t.emit('report.shared', {

@@ -113,10 +113,29 @@ export interface TelemetryCounters {
   rollupSkippedBy: Record<string, number>;
   /**
    * attrs keys seen on a record that its spec does not declare:
-   * `${name}|${key}` → count. See noteUndeclaredAttrs() in emit.ts for what
-   * happens to those records (they are rejected, not stripped).
+   * `${name}|${key}` → count. Under the default `validation: 'lenient'` those
+   * keys are STRIPPED and the record is written (see attrsDropped below);
+   * under `'strict'` the record is rejected. Either way this is the map that
+   * names the registry line you are missing — suggest.ts turns it into zod.
    */
   undeclaredAttrs: Record<string, number>;
+  /**
+   * `${name}|${key}` → count: an attr REMOVED so the record could still be
+   * written, under `validation: 'lenient'`. Two causes, one number, because
+   * the fix is the same registry line either way: the key is undeclared, or
+   * its value fell outside the declared schema (a client shipped a sixth
+   * enum member the registry still lists five of).
+   *
+   * `${name}|(missing)` means stripping could not rescue the object — a
+   * REQUIRED attr was absent — and the record was written without it anyway.
+   * That one is an emitter bug, not registry drift.
+   *
+   * A non-zero value here is not an incident: it is the vocabulary drifting,
+   * visible, while the events keep landing. Zero under `'strict'`.
+   */
+  attrsDropped: Record<string, number>;
+  /** metrics keys removed for the same reasons — see attrsDropped. */
+  metricsDropped: Record<string, number>;
   /**
    * Write-time subject linking (createSubjectLinking() in emit.ts). All six are
    * zero for a host with no `subjectLinker`, and they exist because linking is
@@ -141,6 +160,7 @@ export interface TelemetryCounters {
 export const newCounters = (): TelemetryCounters => ({
   rejected: 0, defaulted: 0, sampled: 0, capped: 0, rollupSkipped: 0,
   deduped: 0, truncated: 0, rollupSkippedBy: {}, undeclaredAttrs: {},
+  attrsDropped: {}, metricsDropped: {},
   subjectsLinked: 0, subjectLinkMisses: 0, subjectLinkErrors: 0,
   subjectLinkTimeouts: 0, subjectLinkUndeclared: 0, subjectLinkCapped: 0,
 });
@@ -153,6 +173,30 @@ export const newCounters = (): TelemetryCounters => ({
  * attribution stops. A host seeing `(other)` climbing has either a hostile
  * client or a registry that is very far behind.
  */
+/**
+ * What a record does when its attrs or metrics do not match the registry.
+ *
+ * `'lenient'` (the default): strip the offending keys, count them, and WRITE
+ * the record. `'strict'`: reject the whole record into the quarantine.
+ *
+ * The default is lenient because the strict failure mode is the expensive one
+ * and it is silent. A registry is a vocabulary maintained in one repo about
+ * events emitted from another; the day a client ships a sixth value for a
+ * five-value enum, strict mode throws away the WHOLE record — its name, its
+ * subject, its metrics, its place in a funnel — to punish one attr. And it
+ * does so behind a 202, so nothing surfaces at the emitter. Losing
+ * `export.completed` because `outputs` gained an option is not validation
+ * working; it is a schema mismatch deleting the evidence a product decision
+ * would have been made from.
+ *
+ * What strictness legitimately protects is unchanged: `data` is still parsed
+ * strictly (it is the one free-text corner, so it is a privacy boundary, not a
+ * vocabulary one), a missing REQUIRED SUBJECT is still a hard reject (that is
+ * structural, not drift), and rollup dimension cardinality is still bounded —
+ * a stripped attr simply resolves to the family's `dimDefault`.
+ */
+export type ValidationPolicy = 'lenient' | 'strict';
+
 export const COUNTER_MAP_MAX = 1000;
 
 /** the fold-here bucket, shaped like a real key so readers can split it the same way */

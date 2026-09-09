@@ -1,8 +1,8 @@
 import { Schema, type Connection, type Model } from 'mongoose';
 import {
   TelemetryKind, LogLevel, Env, Origin,
-  BODY_MAX_CHARS, RETENTION_DAYS, SCHEMA_VERSION, UNKNOWN, newId,
-  type TelemetryCounters,
+  BODY_MAX_CHARS, RETENTION_DAYS, SCHEMA_VERSION, UNKNOWN, newId, bumpCounterMap,
+  type TelemetryCounters, type ValidationPolicy,
 } from './types.js';
 import type { Registry } from './registry.js';
 
@@ -125,8 +125,9 @@ function buildBaseSchema(
   collection: string,
   registry: Registry,
   counters: TelemetryCounters,
-  opts: { platforms: readonly string[]; bodyMax: number },
+  opts: { platforms: readonly string[]; bodyMax: number; validation: ValidationPolicy },
 ) {
+  const validation = opts.validation;
   const schema = new Schema(
     {
       /** UUIDv7 — sortable, insertion-local, replaces the ObjectId */
@@ -308,15 +309,72 @@ function buildBaseSchema(
       throw new Error('telemetry: state requires state.to');
     }
 
-    const check = (label: string, m: Map<string, unknown> | undefined, zschema?: any) => {
+    /**
+     * Validate attrs/metrics against the spec.
+     *
+     * Under `validation: 'strict'` this throws and the whole record is
+     * quarantined — the behaviour every version before 0.7.0 had, and the one
+     * that quietly deletes an `export.completed` because its `outputs` enum
+     * grew a sixth member in another repo.
+     *
+     * Under `'lenient'` (the default) the offending KEYS are removed, counted
+     * by name, and the record is written with whatever survived. The record is
+     * the valuable part: its name, its subject, its timestamp, its metrics and
+     * its place in a funnel do not become wrong because one attr drifted.
+     *
+     * The Map is mutated rather than the parsed object returned, because the
+     * Map is what mongoose persists — the success path here has never written
+     * `r.data` back, and this must not start coercing values that used to pass
+     * through untouched.
+     */
+    const check = (
+      label: 'attrs' | 'metrics',
+      m: Map<string, unknown> | undefined,
+      zschema?: any,
+    ) => {
       const obj = Object.fromEntries(m ?? []);
+      const dropped = label === 'attrs' ? counters.attrsDropped : counters.metricsDropped;
+      const note = (key: string) => bumpCounterMap(dropped, `${this.name}|${key}`);
+
       if (!zschema) {
-        if (Object.keys(obj).length) throw new Error(`telemetry: "${this.name}" declares no ${label}`);
+        if (!Object.keys(obj).length) return;
+        if (validation === 'strict') throw new Error(`telemetry: "${this.name}" declares no ${label}`);
+        for (const key of Object.keys(obj)) {
+          note(key);
+          m?.delete(key);
+        }
         return;
       }
+
       const s = zschema.strict?.() ?? zschema;
       const r = s.safeParse(obj);
-      if (!r.success) throw new Error(`telemetry: ${label} invalid for "${this.name}": ${r.error.message}`);
+      if (r.success) return;
+      if (validation === 'strict') {
+        throw new Error(`telemetry: ${label} invalid for "${this.name}": ${r.error.message}`);
+      }
+
+      // Which keys did zod object to? `unrecognized_keys` names them directly;
+      // every other issue is attributed to the head of its path.
+      const bad = new Set<string>();
+      for (const issue of r.error.issues as any[]) {
+        if (issue.code === 'unrecognized_keys' && Array.isArray(issue.keys)) {
+          for (const k of issue.keys) bad.add(String(k));
+        } else if (Array.isArray(issue.path) && issue.path.length) {
+          bad.add(String(issue.path[0]));
+        }
+      }
+
+      for (const key of bad) {
+        // A key zod named but the record does not carry is a REQUIRED attr the
+        // emitter omitted. Nothing to strip; count it under its own label so it
+        // reads as the emitter bug it is rather than as registry drift.
+        if (m?.has(key)) {
+          note(key);
+          m.delete(key);
+        } else {
+          note('(missing)');
+        }
+      }
     };
     check('attrs', this.attrs, spec.attrs);
     check('metrics', this.metrics, spec.metrics);
@@ -366,6 +424,8 @@ export function buildTelemetryModels(opts: {
   /** host additions to the builtin platform enum — union, never replacement */
   platforms?: readonly string[];
   bodyMax?: number;
+  /** what a vocabulary mismatch costs — see ValidationPolicy. Default 'lenient'. */
+  validation?: ValidationPolicy;
 }): TelemetryModels {
   const { connection, registry, counters, modelName, collection } = opts;
   const platforms = [...new Set([...BUILTIN_PLATFORMS, ...(opts.platforms ?? [])])];
@@ -381,7 +441,11 @@ export function buildTelemetryModels(opts: {
     };
   }
 
-  const base = buildBaseSchema(collection, registry, counters, { platforms, bodyMax });
+  const base = buildBaseSchema(collection, registry, counters, {
+    platforms,
+    bodyMax,
+    validation: opts.validation ?? 'lenient',
+  });
   const TelemetryModel = connection.model(modelName, base);
 
   const disc = (kind: TelemetryKind, build: () => Schema) =>

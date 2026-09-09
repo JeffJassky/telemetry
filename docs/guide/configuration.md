@@ -14,6 +14,7 @@ interface CreateTelemetryConfig<R extends Registry = Registry> {
   pepper?: string;
   platforms?: readonly string[];
   bodyMax?: number;
+  validation?: 'lenient' | 'strict';
   globalSubjectRefs?: boolean;
   subjectLinker?: SubjectLinker;
   subjectLinkTimeoutMs?: number;
@@ -177,6 +178,54 @@ write path is covered — `emit()`, ingest, and direct model use alike.
 ceiling than the document limit (lower it). Note it is per instance, not per
 event.
 
+## `validation`
+
+**Default: `'lenient'`.** What a vocabulary mismatch costs.
+
+`'lenient'` — an attr or metric the registry does not accept is **stripped**,
+its removal counted by name in `counters.attrsDropped` / `counters.metricsDropped`,
+and the record is **written** with whatever survived.
+
+`'strict'` — the record is quarantined whole, which is what every version
+before 0.7.0 did unconditionally.
+
+**Why the default moved.** A registry is a vocabulary maintained in one repo
+about events emitted from another. The day a client ships a sixth value for a
+five-value enum, strict mode throws away the WHOLE record — its name, its
+subject, its metrics, its place in a funnel — to punish one attr. It does so
+behind a `202`, so nothing surfaces at the emitter, and the loss is discovered
+by reading the quarantine, which nobody does. Losing `export.completed` because
+`outputs` gained an option is not validation working; it is a schema mismatch
+deleting the evidence a product decision would have been made from.
+
+Stripping keeps the honest part of the record and puts the drift in a counter
+you can act on — the same trade `data` has always made, where an undeclared
+payload is dropped and the row survives.
+
+**What is NOT relaxed**, because these are not vocabulary problems:
+
+| Still a hard reject | Why |
+|---|---|
+| a missing required **subject** | structural — a record about nobody cannot be aggregated by subject |
+| `data` failing its schema | the one free-text corner, so it is a privacy boundary |
+| span without `traceId`/`spanId`/`durationMs`, state without `state.to` | the kind's own contract |
+| an unregistered event **name** | there is no spec to strip against |
+
+Rollup cardinality is unaffected: a stripped attr simply resolves to the
+family's [`dimDefault`](/guide/registry#dimdefault), exactly as an absent one
+always did.
+
+**Set `'strict'` when** a partial record is worse than no record — a billing or
+audit domain where a row with a missing dimension would be read as fact. Money
+already has a stronger guarantee (`kind: 'usage'` is insert-gated on
+`idempotencyKey`), so this is rarer than it sounds.
+
+**Watch `counters.attrsDropped`.** Under the lenient default it is the only
+warning you get that a client has outrun the registry — there is no quarantine
+row to notice any more, by design. It names the event and the key, which is the
+zod line you are missing; the System page renders it, and `suggest.ts` turns it
+into the line itself.
+
 ## `globalSubjectRefs`
 
 **Default: `false`.** The host asserting that a subject ref (`type:id`) names
@@ -305,6 +354,8 @@ app.get('/metrics', (req, res) => res.json(t.counters));
 | `rollupSkipped` | a rollup dimension resolved empty and had no `dimDefault` |
 | `deduped` | an insert-gated write lost to an existing `dedupeKey` / `usage.idempotencyKey` |
 | `truncated` | a `body` was clipped to `bodyMax` |
+| `attrsDropped` | an attr removed so the record could be written — undeclared, or a value outside the schema. Zero under `validation: 'strict'` |
+| `metricsDropped` | the same, for metrics |
 | `subjectsLinked` | a `subjectLinker` added a subject to a record — counted per subject |
 | `subjectLinkMisses` | the linker answered `[]` — no link exists |
 | `subjectLinkErrors` | the linker threw, rejected, or answered with something that is not a list of refs |

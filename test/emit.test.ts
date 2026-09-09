@@ -91,12 +91,17 @@ describe('emit — the two planes', () => {
     expect(row._id).not.toBe('attacker-chosen');
   });
 
-  it('an invalid record reaches NO plane — no rollup, no row, quarantined once', async () => {
+  it('a STRUCTURALLY invalid record reaches NO plane — no rollup, no row, quarantined once', async () => {
+    // Vocabulary drift is stripped now (see the 0.7.0 policy tests below), but
+    // a record that is malformed rather than merely out of date still dies:
+    // `account.signed_up` declares subject `account`, and a record about
+    // nobody cannot be aggregated by subject at all. That is structural, so it
+    // stays a hard reject even under the lenient default.
     const t = buildTelemetry();
     await t.emit('account.signed_up', {
-      tenantId: 'tn', subjects: [{ type: 'account', id: 'a1' }],
+      tenantId: 'tn', subjects: [{ type: 'org', id: 'o1' }], // no `account` subject
       occurredAt: at('2026-07-01T00:00:00Z'),
-      attrs: { source: 'ads', smuggled: 'x' } as any, // strict-rejected
+      attrs: { source: 'ads' },
     });
     await t.flush();
     expect(await t.models.telemetry.countDocuments({})).toBe(0);
@@ -104,12 +109,10 @@ describe('emit — the two planes', () => {
     expect(await t.collections.rejects().countDocuments({})).toBe(1);
   });
 
-  it('an undeclared attr key is COUNTED, and the record it rode in on is rejected — nothing is silently stripped', async () => {
-    // The behaviour this test exists to pin: model.ts parses attrs as
-    // `spec.attrs.strict()`, so an undeclared key is a validation failure and
-    // the whole record dies. The counter is therefore not the only trace of
-    // the drop — it is the GROUPING of it. The quarantine says "41 writes
-    // failed" one row at a time; this says "all 41 carried `codec`".
+  it('an undeclared attr key is COUNTED and STRIPPED, and the record still lands', async () => {
+    // The 0.7.0 policy. `undeclaredAttrs` still groups the drift — the
+    // quarantine said "41 writes failed" one row at a time, this says "all 41
+    // carried `codec`" — but the record is no longer the price of learning it.
     const t = buildTelemetry();
     const r = await t.emit('account.signed_up', {
       tenantId: 'tn', subjects: [{ type: 'account', id: 'a1' }],
@@ -119,13 +122,55 @@ describe('emit — the two planes', () => {
     await t.flush();
 
     expect(t.counters.undeclaredAttrs).toEqual({ 'account.signed_up|codec': 1 });
-    expect(t.counters.undeclaredAttrs['account.signed_up|source']).toBeUndefined(); // declared
-    // rejected, not stripped: no row, no rollup, one quarantine entry
+    expect(t.counters.attrsDropped).toEqual({ 'account.signed_up|codec': 1 });
+    expect(r.outcome).not.toBe('rejected');
+    expect(await t.collections.rejects().countDocuments({})).toBe(0);
+
+    const row = await t.models.telemetry.findOne({ name: 'account.signed_up' }) as any;
+    expect(row).toBeTruthy();
+    // the declared attr survives; only the undeclared one is gone
+    expect(row.attrs.get('source')).toBe('ads');
+    expect(row.attrs.get('codec')).toBeUndefined();
+    // and the aggregate plane saw it, which is the whole point
+    expect(await t.models.rollups.countDocuments({})).toBeGreaterThan(0);
+  });
+
+  it("validation: 'strict' restores the pre-0.7.0 quarantine", async () => {
+    // The escape hatch, pinned. A host that would rather lose the record than
+    // store a partial one can still say so.
+    const t = buildTelemetry({ validation: 'strict' });
+    const r = await t.emit('account.signed_up', {
+      tenantId: 'tn', subjects: [{ type: 'account', id: 'a1' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { source: 'ads', codec: 'h264' } as any,
+    });
+    await t.flush();
+
     expect(r.outcome).toBe('rejected');
     expect(await t.models.telemetry.countDocuments({})).toBe(0);
     expect(await t.models.rollups.countDocuments({})).toBe(0);
+    expect(t.counters.attrsDropped).toEqual({});
     const rej = await t.collections.rejects().findOne({}) as any;
     expect(String(rej.reason)).toContain('attrs invalid for "account.signed_up"');
+  });
+
+  it('an attr VALUE outside the declared schema is stripped, not fatal — the drift case', async () => {
+    // The failure this default exists for: a client ships a value the registry
+    // does not accept — a sixth member of a five-member enum, or here a string
+    // past its bound — and every record carrying it disappears. Now the record
+    // lands without the attr, and the counter names the line needing widening.
+    const t = buildTelemetry();
+    await t.emit('account.signed_up', {
+      tenantId: 'tn', subjects: [{ type: 'account', id: 'a1' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { source: 'x'.repeat(200) } as any, // declared max(64)
+    });
+    await t.flush();
+
+    const row = await t.models.telemetry.findOne({ name: 'account.signed_up' }) as any;
+    expect(row).toBeTruthy();
+    expect(row.attrs.get('source')).toBeUndefined();
+    expect(t.counters.attrsDropped['account.signed_up|source']).toBe(1);
   });
 
   it('dotted keys are counted the way they are STORED — a declared attr never reads as undeclared', async () => {

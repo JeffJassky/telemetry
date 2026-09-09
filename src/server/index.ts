@@ -18,7 +18,8 @@ export {
   SAMPLE_RATE, SCHEMA_VERSION,
   isPlatformScope, newId, traceKeep, plain,
 } from './types.js';
-export type { TelemetryCounters, Logger, EntityRef } from './types.js';
+export type { TelemetryCounters, Logger, EntityRef, ValidationPolicy } from './types.js';
+import type { ValidationPolicy } from './types.js';
 export { INDEX_BUDGET } from './indexes.js';
 export { truncate, resolveDim } from './rollups.js';
 export type { ForgetResult } from './forget.js';
@@ -86,6 +87,14 @@ export interface CreateTelemetryConfig {
   platforms?: readonly string[];
   /** override BODY_MAX_CHARS for this instance */
   bodyMax?: number;
+  /**
+   * What a vocabulary mismatch costs. Default `'lenient'`: an attr or metric
+   * the registry does not accept is stripped, counted by name in
+   * `counters.attrsDropped` / `counters.metricsDropped`, and the record is
+   * written. `'strict'` restores the pre-0.7.0 behaviour of quarantining the
+   * whole record. See ValidationPolicy in types.ts for why the default moved.
+   */
+  validation?: ValidationPolicy;
   /**
    * Declares that a subject ref (`type:id`) names the same party in EVERY
    * tenant. The package cannot verify that, so it is asserted rather than
@@ -161,7 +170,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   const counters = newCounters();
   const { TelemetryModel, byKind } = buildTelemetryModels({
     connection: conn, registry, counters, modelName, collection,
-    platforms: config.platforms, bodyMax: config.bodyMax,
+    platforms: config.platforms, bodyMax: config.bodyMax, validation: config.validation,
   });
   const RollupModel = buildRollupModel(conn, `${modelName}Rollup`, `${collection}_rollups`);
   const CheckpointModel = buildCheckpointModel(conn, `${modelName}Checkpoint`, `${collection}_checkpoints`);

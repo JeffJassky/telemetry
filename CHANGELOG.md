@@ -7,6 +7,52 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.7.0]
+
+### Changed
+- **A record whose attrs or metrics do not match its spec is now STRIPPED and
+  written, not quarantined whole.** `createTelemetry({ validation })` takes
+  `'lenient'` (the new default) or `'strict'` (every prior version's
+  behaviour).
+
+  The strict failure mode is the expensive one and it is silent. A registry is
+  a vocabulary maintained in one repo about events emitted from another, so it
+  is *structurally* behind: the day a client ships a sixth value for a
+  five-value enum, or adds a metric, strict mode throws away the WHOLE record —
+  its name, its subject, its metrics, its place in a funnel — to punish one
+  field. It does so behind a `202`, so nothing surfaces at the emitter, and the
+  loss is only discoverable by reading the quarantine, which nobody does.
+
+  This was not hypothetical. It cost a production host 36% of one funnel
+  stage's events for five days, on the stage that best predicted conversion,
+  because a desktop build added two export formats that its server's registry
+  had never heard of. Nobody noticed until the quarantine was read for an
+  unrelated reason.
+
+  Stripping keeps the honest part of the record and moves the drift into a
+  counter you can act on — the same trade `data` has always made, where an
+  undeclared payload is dropped and the row survives.
+
+  **Not relaxed**, because none of these are vocabulary problems: a missing
+  required subject, `data` failing its schema (a privacy boundary, not a
+  naming one), a span without `traceId`/`spanId`/`durationMs`, a state without
+  `state.to`, and an unregistered event name — there is no spec to strip
+  against. Rollup cardinality is unaffected: a stripped attr resolves to the
+  family's `dimDefault`, exactly as an absent one always did.
+
+### Added
+- `counters.attrsDropped` and `counters.metricsDropped` — `${name}|${key}` →
+  count, naming the event and field that drifted. Under the lenient default
+  this is the ONLY warning that a client has outrun the registry, since there
+  is no longer a quarantine row to notice; both render on the System page.
+  `${name}|(missing)` records the other direction — a REQUIRED field the
+  emitter omitted, which stripping cannot rescue and which is an emitter bug
+  rather than registry drift.
+
+### Fixed
+- `noteUndeclaredAttrs()`'s contract comment and the System page's "Undeclared
+  attrs" caption both still said the record was "rejected, not stripped".
+
 ## [0.6.1]
 
 ### Fixed

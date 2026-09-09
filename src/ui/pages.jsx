@@ -1300,9 +1300,21 @@ export function System({ api }) {
         />
         <CounterMap
           title="Undeclared attrs"
-          sub="sent, not declared — the record was rejected, not stripped"
+          sub="sent, not declared — the key was stripped and the record kept"
           map={counters.undeclaredAttrs}
           columns={['event', 'attr']}
+        />
+        <CounterMap
+          title="Dropped attrs"
+          sub="removed so the record could be written — undeclared, or a value outside the schema"
+          map={counters.attrsDropped}
+          columns={['event', 'attr']}
+        />
+        <CounterMap
+          title="Dropped metrics"
+          sub="same, for metrics — a non-zero row here is the registry drifting behind a client"
+          map={counters.metricsDropped}
+          columns={['event', 'metric']}
         />
       </div>
 

@@ -80,15 +80,17 @@ export interface EmitResult {
  * them.
  *
  * What actually happens to those keys, so nobody has to guess: model.ts's
- * pre('validate') hook parses `attrs` as `spec.attrs.strict()`, so an
- * undeclared key is a validation FAILURE — the whole record is quarantined and
- * counted in `rejected`. Nothing is silently stripped, and a spec declaring no
- * `attrs` at all refuses any attrs the same way (`"x" declares no attrs`).
+ * pre('validate') hook parses `attrs` as `spec.attrs.strict()`. Under the
+ * default `validation: 'lenient'` (0.7.0) an undeclared key is STRIPPED, its
+ * removal counted in `attrsDropped`, and the record is written without it.
+ * Under `'strict'` the whole record is quarantined and counted in `rejected`,
+ * which is what every version before 0.7.0 did unconditionally.
  *
- * So this counter is not the only trace of the drop; it is the GROUPING of it.
- * The quarantine lists 41 failed writes one row at a time and a human reads
- * none of them; this says "all 41 carried `codec`", which is a zod line the
- * System page can hand you (see suggest.ts).
+ * Either way this counter is the GROUPING of the drift, and under the lenient
+ * default it is the ONLY warning you get — there is no quarantine row to
+ * notice any more, by design. The quarantine listed 41 failed writes one at a
+ * time and a human read none of them; this says "all 41 carried `codec`",
+ * which is a zod line the System page can hand you (see suggest.ts).
  *
  * Keys are sanitized the way the writer sanitizes them (dots → underscores, as
  * mongoose Map keys demand), or a client's `gen_ai.model` would read as

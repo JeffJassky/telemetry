@@ -113,8 +113,26 @@ describe('envelope', () => {
     expect(await t.models.telemetry.countDocuments({})).toBe(0);
   });
 
-  it('rejects undeclared attr keys — zod strict, not silent stripping', async () => {
+  it('strips undeclared attr keys and keeps the row — the same rule `data` has always had', async () => {
+    // 0.7.0. Note the symmetry with the `data` test below, which has always
+    // dropped the undeclared part and kept the row: attrs now answer an
+    // undeclared key the same way, rather than taking the record down with it.
     const t = buildTelemetry();
+    await t.emit('account.signed_up', {
+      tenantId: 'a', subjects: [{ type: 'account', id: 'acc' }],
+      occurredAt: at('2026-07-01T00:00:00Z'),
+      attrs: { source: 'ads', smuggled: 'x' } as any,
+    });
+    await t.flush();
+    const row = await t.models.telemetry.findOne({}).lean() as any;
+    expect(row).toBeTruthy();
+    expect(row.attrs.source).toBe('ads');
+    expect(row.attrs.smuggled).toBeUndefined();
+    expect(t.counters.attrsDropped).toEqual({ 'account.signed_up|smuggled': 1 });
+  });
+
+  it("validation: 'strict' still refuses the whole record", async () => {
+    const t = buildTelemetry({ validation: 'strict' });
     await t.emit('account.signed_up', {
       tenantId: 'a', subjects: [{ type: 'account', id: 'acc' }],
       occurredAt: at('2026-07-01T00:00:00Z'),
