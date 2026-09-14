@@ -902,6 +902,12 @@ export interface Telemetry<R extends Registry = Registry> {
    */
   linkSubjects: LinkSubjects | null;
   logger: Logger;
+  /**
+   * Sourcemaps for minified clients. Server-side only — there is no HTTP
+   * route. The dashboard translates error frames at read time against the
+   * map registered for the record's (tenantId, service, release, file).
+   */
+  sourcemaps: Sourcemaps;
   /** mint an ingest key against this instance's key collection */
   createKey(input: CreateKeyInput): Promise<{ key: string; id: string }>;
   models: {
@@ -915,6 +921,45 @@ export interface Telemetry<R extends Registry = Registry> {
     rejects(): Collection;
     aliases(): Collection;
   };
+}
+
+// ── sourcemaps ──────────────────────────────────────────────────────────────
+
+export interface SourcemapFile {
+  /** the bundle's file name as a frame's `filename` ends with it: `chunk-vendors.f18c196e.js` */
+  file: string;
+  /** the map, as JSON text or a parsed object */
+  map: string | Record<string, unknown>;
+}
+
+export interface RegisterSourcemapsInput {
+  tenantId: string;
+  service: string;
+  /** must equal the client's `release`; `'unknown'` is refused */
+  release: string;
+  files: SourcemapFile[];
+}
+
+export interface OriginalPosition {
+  source: string;
+  line: number;
+  column: number;
+  name?: string;
+  /** the original source line, trimmed and capped */
+  context?: string;
+}
+
+export interface Sourcemaps {
+  ensureIndexes(): Promise<void>;
+  /** idempotent per release — call it on every boot; refreshes retention */
+  register(input: RegisterSourcemapsInput): Promise<{ stored: number; skipped: string[] }>;
+  resolve(
+    where: { tenantId: string; service: string; release: string; filename: string },
+    lineno: number,
+    colno: number,
+  ): Promise<OriginalPosition | null>;
+  /** a copy of an error record with `original` on each translatable frame; never throws */
+  symbolicate<T extends Record<string, any>>(record: T): Promise<T>;
 }
 
 export declare function createTelemetry<const R extends Registry>(

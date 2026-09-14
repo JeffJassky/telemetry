@@ -1,6 +1,6 @@
 {
   "name": "@jeffjassky/telemetry",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Unified telemetry — product events, errors, traces, state transitions, and billable usage in one Mongo envelope, with typed SDKs and a mountable dashboard.",
   "license": "MIT",
   "author": "Jeff Jassky <jeff@jeffjassky.com>",
@@ -104,12 +104,21 @@
     "vue": "^3.0.0"
   },
   "peerDependenciesMeta": {
-    "express": { "optional": true },
-    "mongoose": { "optional": true },
-    "react": { "optional": true },
-    "vue": { "optional": true }
+    "express": {
+      "optional": true
+    },
+    "mongoose": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "vue": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@jridgewell/gen-mapping": "^0.3.13",
     "@types/express": "^5.0.6",
     "@types/node": "^22.7.0",
     "@types/react": "^18.3.0",
@@ -130,6 +139,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31",
     "uuidv7": "^1.2.1",
     "zod": "^4.4.3"
   }

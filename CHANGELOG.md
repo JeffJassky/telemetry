@@ -7,6 +7,26 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.8.0]
+
+### Added
+- **Sourcemaps: error frames from a minified client now read as source.**
+  `telemetry.sourcemaps.register({ tenantId, service, release, files })`
+  stores a release's maps in `<collection>_sourcemaps` (90-day TTL, refreshed
+  on every re-register — call it on boot). The dashboard's `/records`
+  translates each error frame at READ time against the map for the record's
+  (tenant, service, release, file) and sets `frame.original = { source, line,
+  column, name, context }`; the minified location is kept alongside.
+
+  Read time rather than write time so a map registered after the errors
+  arrived still translates them, and ingest never parses a 2MB map.
+  Server-side registration rather than an upload route so a host can stop
+  serving its maps publicly — a map is the application's source. Release
+  `'unknown'` is refused: every unversioned build would share it.
+
+  `syncIndexes()` now also creates the sourcemap indexes.
+  New dependency: `@jridgewell/trace-mapping`.
+
 ## [0.7.0]
 
 ### Changed

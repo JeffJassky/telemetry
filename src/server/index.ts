@@ -8,6 +8,7 @@ import { createEmitter, createSubjectLinking, type EmitInput, type SubjectLinker
 import { createForget } from './forget.js';
 import { createRelink } from './relink.js';
 import { createSyncIndexes } from './indexes.js';
+import { createSourcemaps } from './sourcemaps.js';
 import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
 
 export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
@@ -228,12 +229,20 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     registry, TelemetryModel, RollupModel, counters, logger, linkSubjects,
   });
 
-  const syncIndexes = createSyncIndexes({
+  const syncModelIndexes = createSyncIndexes({
     registry,
     TelemetryModel,
     models: [TelemetryModel, ...Object.values(byKind), RollupModel, CheckpointModel, KeyModel],
     rejects: rejects as () => Collection,
   });
+
+  const sourcemaps = createSourcemaps({ connection: conn, collection: `${collection}_sourcemaps`, logger });
+
+  const syncIndexes: typeof syncModelIndexes = async (...args) => {
+    const result = await syncModelIndexes(...args);
+    await sourcemaps.ensureIndexes();
+    return result;
+  };
 
   return {
     /** write — the only write */
@@ -305,6 +314,13 @@ export function createTelemetry(config: CreateTelemetryConfig) {
      */
     linkSubjects,
     logger,
+    /**
+     * Sourcemaps for minified clients. `register()` stores a release's maps
+     * (server-side only — there is no HTTP route); the dashboard translates
+     * error frames against them at read time, so errors recorded before the
+     * maps were registered are translated too. See sourcemaps.ts.
+     */
+    sourcemaps,
     /** mint an ingest key; the full key string is returned once, never again */
     createKey: (input: CreateKeyInput) => createKey(KeyModel, input),
     /** the models, exposed for hosts and the router factories */

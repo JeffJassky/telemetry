@@ -269,12 +269,17 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     platform: isPlatformScope(req.viewer!.tenantId),
   })));
 
-  api.get('/records', h(async (req) =>
-    q.records(req.viewer!.tenantId, parseRange(req.query), parseFilter(req.query), {
+  api.get('/records', h(async (req) => {
+    const page = await q.records(req.viewer!.tenantId, parseRange(req.query), parseFilter(req.query), {
       limit: req.query.limit ? Number(req.query.limit) : undefined,
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
-    }),
-  ));
+    });
+    // Error frames are translated here, at read, against whatever map is
+    // registered for the record's release — see sourcemaps.ts. A copy: the
+    // query layer's cached page is never mutated.
+    if (!t.sourcemaps || !page?.items?.some((r: any) => r?.kind === 'error')) return page;
+    return { ...page, items: await Promise.all(page.items.map((r: any) => t.sourcemaps.symbolicate(r))) };
+  }));
 
   api.get('/series', h(async (req) =>
     q.series(req.viewer!.tenantId, parseRange(req.query), parseFilter(req.query), {

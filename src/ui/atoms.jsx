@@ -339,12 +339,25 @@ export function StackTrace({ frames }) {
   if (!frames?.length) return <div className="subtle text-xs">no frames captured</div>;
   return (
     <div className="frames">
-      {frames.map((f, i) => (
-        <div key={i} className={`frame ${f.inApp ? 'in-app' : ''}`}>
-          <span className="fn">{f.fn ?? '<anonymous>'}</span>{' '}
-          <span className="loc">{f.filename}:{f.lineno}:{f.colno}</span>
-        </div>
-      ))}
+      {frames.map((f, i) => {
+        // `original` is set server-side when a sourcemap is registered for the
+        // record's release; the minified location stays visible underneath
+        const o = f.original;
+        return (
+          <div key={i} className={`frame ${f.inApp || (o && !o.source.includes('node_modules')) ? 'in-app' : ''}`}>
+            <span className="fn">{o?.name ?? f.fn ?? '<anonymous>'}</span>{' '}
+            {o ? (
+              <>
+                <span className="loc">{o.source}:{o.line}:{o.column}</span>
+                {o.context && <div className="mono text-xs">{o.context}</div>}
+                <div className="subtle text-xs">{f.filename}:{f.lineno}:{f.colno}</div>
+              </>
+            ) : (
+              <span className="loc">{f.filename}:{f.lineno}:{f.colno}</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
