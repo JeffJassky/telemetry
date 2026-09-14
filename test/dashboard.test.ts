@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import {
-  PLATFORM_SCOPE, createDashboard, createQueries, deriveCatalog, resolveReport,
+  PLATFORM_SCOPE, createDashboard, createQueries, defineRegistry, deriveCatalog, resolveReport,
   type Report,
 } from '../src/server/index.js';
 import { CLIENT, at, buildTelemetry, startDb, stopDb } from './helpers.js';
@@ -532,11 +532,60 @@ describe('dashboard', () => {
       expect(byTuple['solo/ios']).toBeUndefined();
       expect(res.body.groups).toBe(9);
 
-      // subjectType reads the type prefix off the first subject ref
+      // subjectType reads the type prefix off the most specific subject ref
       const st = await request(app).get(
         `/telemetry/api/breakdown?${RANGE}&kind=span&groupBy=subjectType`,
       );
       expect(st.body.rows.map((r: any) => [r.dims[0], r.value])).toEqual([['org', 4]]);
+    });
+
+    // Every client SDK puts `anon` and `session` FIRST. Grouping on the first
+    // key filed every desktop record under `anon` — 93% of machine-subject
+    // records were invisible under subjectType=machine, which read as "the
+    // desktop app sends nothing".
+    it('groups subjectType by the most specific subject, not the SDK-prepended anon', async () => {
+      const t = buildTelemetry({
+        registry: defineRegistry({
+          'desktop.opened': {
+            kind: 'event', origin: 'any', subjects: ['anon', 'session', 'machine'],
+            description: 'desktop client record — anon/session prepended by the SDK',
+          },
+          'web.viewed': {
+            kind: 'event', origin: 'any', subjects: ['anon', 'session'],
+            description: 'pre-identity web record — nothing more specific than anon',
+          },
+          'user.acted': {
+            kind: 'event', origin: 'any', subjects: ['user'],
+            description: 'a single-subject record',
+          },
+        }),
+      });
+      await t.syncIndexes();
+      const generic = (n: number) => [{ type: 'anon', id: `an${n}` }, { type: 'session', id: `se${n}` }];
+      const when = at('2026-07-01T10:00:00Z');
+      for (let i = 0; i < 3; i++) {
+        await t.emit('desktop.opened', {
+          tenantId: 'tn', subjects: [...generic(i), { type: 'machine', id: `m${i}` }], occurredAt: when,
+        });
+      }
+      for (let i = 0; i < 2; i++) {
+        await t.emit('web.viewed', { tenantId: 'tn', subjects: generic(10 + i), occurredAt: when });
+      }
+      await t.emit('user.acted', { tenantId: 'tn', subjects: [{ type: 'user', id: 'u1' }], occurredAt: when });
+      // another tenant's machines — must not leak into tn's machine group
+      for (let i = 0; i < 5; i++) {
+        await t.emit('desktop.opened', {
+          tenantId: 'other', subjects: [...generic(20 + i), { type: 'machine', id: `x${i}` }], occurredAt: when,
+        });
+      }
+      await t.flush();
+
+      const { app } = buildApp(t);
+      const res = await request(app).get(`/telemetry/api/breakdown?${RANGE}&groupBy=subjectType`);
+      expect(res.status).toBe(200);
+      expect(res.body.rows.map((r: any) => [r.dims[0], r.value])).toEqual([
+        ['machine', 3], ['anon', 2], ['user', 1],
+      ]);
     });
 
     it('sums and averages a metric — $sum treats a missing one as 0, $avg ignores the row', async () => {

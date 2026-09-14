@@ -232,6 +232,45 @@ const BREAKDOWN_FIELDS: readonly string[] = [
   'error.type', 'error.handled',
 ];
 
+/**
+ * Subject types every client SDK attaches to every record, ahead of the subject
+ * the record is actually about (src/client/core.ts puts `anon` first, then
+ * `session`). They say which browser or tab sent it, never which party it
+ * describes, so a type-level question skips past them.
+ */
+export const GENERIC_SUBJECT_TYPES: readonly string[] = ['anon', 'session'];
+
+/**
+ * The subject ref a record is ABOUT: the first key whose type is not generic,
+ * or the first key when every key is generic (a pre-identity web record is
+ * honestly `anon`). Plain `subjectKeys[0]` grouped every desktop record —
+ * [anon, session, machine] — under `anon`, hiding the machine subject.
+ */
+const mostSpecificSubject = {
+  $let: {
+    vars: { keys: { $ifNull: ['$subjectKeys', []] } },
+    in: {
+      $ifNull: [
+        {
+          $arrayElemAt: [
+            {
+              $filter: {
+                input: '$$keys',
+                as: 'k',
+                cond: {
+                  $not: [{ $in: [{ $arrayElemAt: [{ $split: ['$$k', ':'] }, 0] }, GENERIC_SUBJECT_TYPES] }],
+                },
+              },
+            },
+            0,
+          ],
+        },
+        { $arrayElemAt: ['$$keys', 0] },
+      ],
+    },
+  },
+};
+
 /** 'user:u_1' → 'user'; null for an absent ref, never a thrown $split */
 const typePrefix = (ref: unknown) => ({
   $let: {
@@ -272,7 +311,7 @@ export function dimExpression(dim: string): unknown {
     }
     return { $ifNull: [`$${path}`, null] };
   }
-  if (dim === 'subjectType') return typePrefix({ $arrayElemAt: ['$subjectKeys', 0] });
+  if (dim === 'subjectType') return typePrefix(mostSpecificSubject);
   if (dim === 'actorType') return typePrefix('$actor');
   throw badRequest(
     `"${dim}" is not a dimension. Use "attr:<key>", "field:<path>", "subjectType" or "actorType".`,
