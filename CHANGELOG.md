@@ -7,6 +7,23 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.8.1]
+
+### Fixed
+- **`subjectType` now groups a record by its most specific subject, not its
+  first.** The pseudo-dim took `subjectKeys[0]`, but every client SDK puts
+  `anon` and `session` first — so a desktop record carrying
+  `[anon, session, machine]` was grouped as `anon`. In production that hid 93%
+  of machine-subject records (4,906 of 5,268) from `subjectType=machine`, which
+  read as the desktop app sending nothing at all.
+
+  It now resolves to the first subject whose type is not generic
+  (`GENERIC_SUBJECT_TYPES`: `anon`, `session`), falling back to the first
+  subject when every one is generic — a pre-identity web record is still
+  honestly `anon`. This applies wherever the dim is read: breakdown `groupBy`
+  and the `/values` picker. Rollups were never affected; they fan out over
+  every subject.
+
 ## [0.8.0]
 
 ### Added
