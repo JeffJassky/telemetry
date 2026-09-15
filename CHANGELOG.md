@@ -40,6 +40,14 @@ real if CI runs the matrix. See standards/traps.md #10.
     error spec to keep them — lenient validation strips what a spec does not
     declare.
 
+### Fixed
+- `t.flush()` now also awaits the ingest router's quarantine writes. They were
+  fired with a bare `void`, so a graceful shutdown — or a test — could read
+  the rejects collection before the row landed.
+- Test suite runs files in parallel with mongod's dbPath on RAM
+  (`test/global-setup.ts`): 171s → ~20s locally. `TELEMETRY_TEST_RAMDISK=0`
+  opts out (and back to serial files).
+
 ### Changed
 - **Fingerprints normalise UUIDs and 24-hex ids as well as digits.** A
   `CastError` for two different ObjectIds was two issues; it is one. Existing

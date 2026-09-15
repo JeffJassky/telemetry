@@ -4,12 +4,15 @@ import { boundedMeta, createTelemetry, defineRegistry } from '../src/server/inde
 
 // The mongod itself is booted once for the whole run by test/global-setup.ts
 // (12 suites booting their own mongod, serialized by singleFork, was paying a
-// boot tax on every file — see that file for why). Each suite just connects
-// mongoose to the shared instance.
+// boot tax on every file — see that file for why). Each suite connects
+// mongoose to the shared instance but gets its OWN database, named by the
+// fork's pid: suites run in parallel (vitest.config.js, pool 'forks', one
+// file per fork), and a shared database would let one suite's collections
+// and TTL indexes bleed into another's listings and counts.
 export async function startDb() {
   const uri = process.env.TELEMETRY_TEST_MONGO_URI;
   if (!uri) throw new Error('TELEMETRY_TEST_MONGO_URI not set — global-setup did not run');
-  await mongoose.connect(uri, { dbName: 'telemetry-test' });
+  await mongoose.connect(uri, { dbName: `telemetry-test-${process.pid}` });
   // Force one real round-trip HERE, in the hook. connect() resolving is not the
   // same as the connection being usable: mongoose buffers operations while it
   // settles, and across a sequential run that buffering landed on whichever
@@ -19,6 +22,11 @@ export async function startDb() {
 }
 
 export async function stopDb() {
+  // Drop this suite's database so the in-memory mongod does not keep every
+  // suite's data around for the rest of the run.
+  if (mongoose.connection.readyState === 1) {
+    await mongoose.connection.db!.dropDatabase();
+  }
   await mongoose.disconnect();
 }
 
@@ -180,7 +188,9 @@ let n = 0;
  * other's collections.
  */
 export function buildTelemetry(overrides: Record<string, unknown> = {}) {
-  const id = `t${Date.now().toString(36)}${(n++).toString(36)}`;
+  // pid in the id: suites run in parallel forks, and two forks can hit the
+  // same millisecond with the same counter.
+  const id = `t${process.pid.toString(36)}${Date.now().toString(36)}${(n++).toString(36)}`;
   return createTelemetry({
     registry: paperRegistry(),
     connection: mongoose,

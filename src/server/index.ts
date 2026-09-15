@@ -328,6 +328,12 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     async flush() {
       while (inFlight.size) await Promise.allSettled([...inFlight]);
     },
+    /**
+     * Register a fire-and-forget write so flush() awaits it. For the router
+     * factories (ingest quarantine); a host emitting through emit() never
+     * needs it.
+     */
+    track,
     /** drop/default/cap counts — surface on /metrics so drops are never silent */
     counters,
     /** the registry, exposed for the router factories — hosts should import their own */

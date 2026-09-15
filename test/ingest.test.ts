@@ -123,6 +123,7 @@ describe('ingest — the wire contract', () => {
     expect(res.status).toBe(202);
     expect(res.body).toEqual({ accepted: 0, rejected: 3 });
     expect(await t.models.telemetry.countDocuments({})).toBe(0);
+    await t.flush(); // the quarantine row is fire-and-forget behind the 202
     expect(await t.collections.rejects().countDocuments({})).toBe(3);
   });
 

@@ -948,6 +948,11 @@ export interface Telemetry<R extends Registry = Registry> {
   syncIndexes(): Promise<void>;
   /** await in-flight fire-and-forget writes (tests, graceful shutdown) */
   flush(): Promise<void>;
+  /**
+   * Register a fire-and-forget write so flush() awaits it. For the router
+   * factories (ingest quarantine); a host emitting through emit() never needs it.
+   */
+  track(p: Promise<unknown>): void;
   /** drop/default/cap counts — surface on /metrics so drops are never silent */
   counters: TelemetryCounters;
   /** the registry this instance validates against */

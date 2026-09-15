@@ -82,11 +82,17 @@ export function createIngest(opts: CreateIngestOptions): Router {
     return doc ?? null;
   };
 
+  // Fire-and-forget, but TRACKED: the response never waits on the quarantine
+  // row, yet t.flush() (tests, graceful shutdown) must still see it — a bare
+  // `void` here let a shutdown race the write and lose the only evidence of
+  // a rejected record.
   const quarantine = (name: string, reason: string, raw: unknown) => {
     t.counters.rejected++;
-    void t.collections.rejects()
-      .insertOne({ at: new Date(), name, reason, raw: plain(raw) })
-      .catch(() => {});
+    t.track(
+      t.collections.rejects()
+        .insertOne({ at: new Date(), name, reason, raw: plain(raw) })
+        .catch(() => {}),
+    );
   };
 
   const router = express.Router();
