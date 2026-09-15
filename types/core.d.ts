@@ -81,6 +81,10 @@ export interface CreateClientOptions {
   consent?: () => boolean;
   /** registry name used by captureError. Convention: 'error.unhandled'. */
   errorName?: string;
+  /** attrs stamped on EVERY error record, under the call site's own — the adapters put `process` here */
+  errorAttrs?: Record<string, string>;
+  /** drop error records by message — strings match by substring, RegExp by test; applies to every captureError */
+  ignoreErrors?: readonly IgnorePattern[];
   /**
    * Last gate before a record joins the queue — every kind passes through it.
    * Return the record to keep it, a modified copy to redact it, `null` to drop
@@ -130,3 +134,40 @@ export interface TelemetryClient<R extends Registry = Registry> {
 export declare function createClient<R extends Registry = Registry>(
   options: CreateClientOptions,
 ): TelemetryClient<R>;
+
+/**
+ * `process.on('uncaughtException' | 'unhandledRejection')` → `captureError`
+ * with `handled: false` and `attrs.source`. For any Node process that is not
+ * Electron main. A no-op outside Node. Returns the uninstaller.
+ */
+export declare function installProcessErrorHandlers(client: TelemetryClient<any>): () => void;
+
+// ── error shaping, shared with the server's captureError ──
+
+export type IgnorePattern = string | RegExp;
+
+export interface ErrorFrame {
+  fn?: string;
+  filename: string;
+  lineno: number;
+  colno: number;
+}
+
+export interface ErrorDetail {
+  type: string;
+  message: string;
+  handled: boolean;
+  fingerprint: string;
+  frames: ErrorFrame[];
+}
+
+/** up to 20 `at fn (file:line:col)` frames off a stack string */
+export declare function parseFrames(stack: string | undefined): ErrorFrame[];
+/** the message with UUIDs, 24-hex ids and digits flattened, capped at 200 chars */
+export declare function normalizeMessage(message: string): string;
+/** stable grouping key: `type | normalized message | top frame filename` */
+export declare function fingerprint(type: string, message: string, frame: string): string;
+/** whatever was thrown, as an Error — an object is described by its constructor, never serialised */
+export declare function coerceError(err: unknown): Error;
+/** the `error` envelope for a thrown value */
+export declare function describeError(err: unknown, handled: boolean): ErrorDetail;

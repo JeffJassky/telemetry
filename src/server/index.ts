@@ -8,6 +8,7 @@ import { createEmitter, createSubjectLinking, type EmitInput, type SubjectLinker
 import { createForget } from './forget.js';
 import { createRelink } from './relink.js';
 import { createSyncIndexes } from './indexes.js';
+import { createCaptureError } from './capture-error.js';
 import { createSourcemaps } from './sourcemaps.js';
 import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
 
@@ -29,6 +30,9 @@ export type { RelinkOptions, RelinkResult } from './relink.js';
 export type { Checkpoint } from './checkpoint.js';
 export { SUBJECT_MAX, SUBJECT_LINK_TIMEOUT_MS } from './emit.js';
 export type { EmitInput, EmitResult, LinkSubjects, SubjectLinker } from './emit.js';
+export type { CaptureErrorOptions } from './capture-error.js';
+export { parseFrames, fingerprint, normalizeMessage, describeError, coerceError } from '../client/errors.js';
+export type { ErrorDetail, ErrorFrame } from '../client/errors.js';
 export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
 export type { CreateKeyInput, ParsedKey } from './keys.js';
 export { createIngest } from './ingest.js';
@@ -123,6 +127,18 @@ export interface CreateTelemetryConfig {
    * telemetry rather than stalling ingest behind it.
    */
   subjectLinkTimeoutMs?: number;
+  /**
+   * Server-side `captureError()` defaults. `errorName` is the registry name it
+   * writes (default `'error.unhandled'`); `errorAttrs` is stamped under every
+   * call's attrs, e.g. `{ process: 'api' }`; `redact` runs on every string —
+   * message, frame filenames, attr values — before the write, and a throwing
+   * redact drops the record rather than shipping it unredacted.
+   */
+  captureError?: {
+    errorName?: string;
+    errorAttrs?: Record<string, string>;
+    redact?: (text: string) => string;
+  };
   logger?: Logger;
 }
 
@@ -236,6 +252,14 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     rejects: rejects as () => Collection,
   });
 
+  const captureError = createCaptureError({
+    emit: (name, doc) => emit(name, doc),
+    errorName: config.captureError?.errorName,
+    errorAttrs: config.captureError?.errorAttrs,
+    redact: config.captureError?.redact,
+    logger,
+  });
+
   const sourcemaps = createSourcemaps({ connection: conn, collection: `${collection}_sourcemaps`, logger });
 
   const syncIndexes: typeof syncModelIndexes = async (...args) => {
@@ -247,6 +271,12 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   return {
     /** write — the only write */
     emit,
+    /**
+     * A thrown value → an `error`-kind record through `emit()`, shaped by the
+     * same frame parser and fingerprint every client uses. Trusted caller:
+     * names its tenant, service, subjects. See capture-error.ts.
+     */
+    captureError,
     /** erasure: delete sole-party rows, redact shared ones, rekey rollups, drop aliases */
     forget,
     /**

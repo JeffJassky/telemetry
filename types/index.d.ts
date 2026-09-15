@@ -72,6 +72,33 @@ export declare function isPlatformScope(tenantId: unknown): boolean;
 /** UUIDv7 — sortable, insertion-local. Never substitute crypto.randomUUID (v4). */
 export declare function newId(): string;
 
+// ── error shaping, the one algorithm clients and captureError() share ──
+// Declared here rather than re-exported from core.d.ts: the export checker
+// reads each contract file on its own, and a re-export is not a declaration.
+export interface ErrorFrame {
+  fn?: string;
+  filename: string;
+  lineno: number;
+  colno: number;
+}
+export interface ErrorDetail {
+  type: string;
+  message: string;
+  handled: boolean;
+  fingerprint: string;
+  frames: ErrorFrame[];
+}
+/** up to 20 `at fn (file:line:col)` frames off a stack string */
+export declare function parseFrames(stack: string | undefined): ErrorFrame[];
+/** the message with UUIDs, 24-hex ids and digits flattened, capped at 200 chars */
+export declare function normalizeMessage(message: string): string;
+/** stable grouping key: `type | normalized message | top frame filename` */
+export declare function fingerprint(type: string, message: string, frame: string): string;
+/** whatever was thrown, as an Error — an object is described by its constructor, never serialised */
+export declare function coerceError(err: unknown): Error;
+/** the `error` envelope for a thrown value */
+export declare function describeError(err: unknown, handled: boolean): ErrorDetail;
+
 /** Consistent per-trace sampling verdict. Throws in dev on an unsampleable traceId. */
 export declare function traceKeep(traceId: string | undefined, rate: number): boolean;
 
@@ -792,7 +819,33 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
    * UNLINKED and counts a timeout. Default 50.
    */
   subjectLinkTimeoutMs?: number;
+  /**
+   * Server-side `captureError()` defaults: the registry name it writes
+   * (default `'error.unhandled'`), attrs stamped under every call's own, and a
+   * `redact` applied to every string before the write — fail-closed.
+   */
+  captureError?: {
+    errorName?: string;
+    errorAttrs?: Record<string, string>;
+    redact?: (text: string) => string;
+  };
   logger?: Logger;
+}
+
+/** what a server-side captureError() call names — trusted, so tenant and subjects are explicit */
+export interface CaptureErrorOptions {
+  tenantId: string;
+  /** registry name; default from `captureError.errorName` */
+  name?: string;
+  service?: string;
+  release?: string;
+  env?: Env;
+  subjects?: SubjectInput[];
+  attrs?: Record<string, string>;
+  /** false for an uncaught exception / unhandled rejection; default true */
+  handled?: boolean;
+  dedupeKey?: string;
+  occurredAt?: Date;
 }
 
 /**
@@ -850,6 +903,12 @@ export declare const SUBJECT_LINK_TIMEOUT_MS: 50;
 export interface Telemetry<R extends Registry = Registry> {
   /** write — the only write. The result says what actually happened to the row. */
   emit<N extends keyof R & string>(name: N, doc: EmitInput<R, N>): Promise<EmitResult>;
+  /**
+   * A thrown value → an `error`-kind record through `emit()`, shaped by the
+   * same frame parser and fingerprint every client uses. `null` when the
+   * host's `redact` threw (fail-closed).
+   */
+  captureError(err: unknown, opts: CaptureErrorOptions): Promise<EmitResult | null>;
   /**
    * Erasure: delete sole-party rows, redact shared ones, rekey rollups, drop
    * aliases. Tenant-scoped — rejects PLATFORM_SCOPE, so a platform-wide erasure

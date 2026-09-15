@@ -1,4 +1,4 @@
-import type { CreateClientOptions, Registry, TelemetryClient } from './core.js';
+import type { CreateClientOptions, IgnorePattern, Registry, TelemetryClient } from './core.js';
 
 export { createClient } from './core.js';
 export type { TelemetryClient } from './core.js';
@@ -13,7 +13,7 @@ export interface WebTelemetryOptions extends Omit<CreateClientOptions, 'storage'
   captureGlobalErrors?: boolean;
   /** drop error records by message — strings match by substring, RegExp by test.
    *  ADDED to `BENIGN_BROWSER_ERRORS`, not replacing it. */
-  ignoreErrors?: Array<string | RegExp>;
+  ignoreErrors?: readonly IgnorePattern[];
   /** keep the `BENIGN_BROWSER_ERRORS` records instead of dropping them */
   captureBenignErrors?: boolean;
 }

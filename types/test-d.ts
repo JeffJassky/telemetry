@@ -20,7 +20,10 @@
 import { z } from 'zod';
 import type {
   AttrsOf,
+  CaptureErrorOptions,
   Checkpoint,
+  ErrorDetail,
+  ErrorFrame,
   ClientContext,
   CreateTelemetryConfig,
   DimSource,
@@ -50,6 +53,11 @@ import {
   createTelemetry,
   defineRegistry,
   newId,
+  parseFrames,
+  normalizeMessage,
+  fingerprint,
+  coerceError,
+  describeError,
   plain,
   resolveDim,
   traceKeep,
@@ -373,12 +381,27 @@ import type {
   TransportResult,
   WireRecord,
 } from './core.js';
+import type { ErrorDetail as CoreErrorDetail, ErrorFrame as CoreErrorFrame, IgnorePattern } from './core.js';
 import {
   createClient as createCoreClient,
   newId as coreNewId,
   defineRegistry as coreDefineRegistry,
   boundedMeta as coreBoundedMeta,
+  installProcessErrorHandlers,
+  parseFrames as coreParseFrames,
+  fingerprint as coreFingerprint,
+  normalizeMessage as coreNormalizeMessage,
+  describeError as coreDescribeError,
+  coerceError as coreCoerceError,
 } from './core.js';
+
+// error shaping is a value export on /core AND the server entry — same algorithm
+const frames: CoreErrorFrame[] = coreParseFrames(new Error('x').stack);
+const detail: CoreErrorDetail = coreDescribeError(new Error('x'), false);
+const fp: string = coreFingerprint('TypeError', coreNormalizeMessage('id 65f3aa11bb22cc33dd44ee55'), frames[0]?.filename ?? '');
+const coerced: Error = coreCoerceError({ not: 'an error' });
+const ignore: IgnorePattern[] = ['a', /b/];
+void detail, fp, coerced, ignore;
 
 // /core re-exports the isomorphic registry surface so a host's registry module
 // imports from here and stays mongoose-free
@@ -411,6 +434,8 @@ const clientOpts: CreateClientOptions = {
   clientContext: ctxInput,
   consent: () => true,
   errorName: 'error.unhandled',
+  errorAttrs: { process: 'worker' },
+  ignoreErrors: ['third-party', /^Script error/],
   onError: () => {},
 };
 const trackOpts: TrackOptions<{ source: string }, { n: number }> = {
@@ -446,6 +471,8 @@ const rec: WireRecord = { _id: 'x'.repeat(16), name: 'a', occurredAt: new Date()
 // so the declaration says so, opaquely. Reading a field off it must be a cast,
 // which is the whole point of typing it `unknown`.
 const internals: unknown = c._internal;
+const uninstall: () => void = installProcessErrorHandlers(c);
+uninstall();
 // @ts-expect-error — opaque on purpose: no member of `_internal` is contract
 void c._internal.queue;
 void internals;
@@ -816,6 +843,27 @@ const ref: EntityRef = 'user:u_1';
 const kind: TelemetryKind = 'usage';
 const log: Logger = { info() {}, warn() {}, error() {} };
 declare const generic: Telemetry;
+// the shaping the server shares with every client — values, on the root entry
+const rootFrames: ErrorFrame[] = parseFrames(new Error('x').stack);
+const rootDetail: ErrorDetail = describeError(coerceError('x'), true);
+const rootFp: string = fingerprint('E', normalizeMessage('m 12'), rootFrames[0]?.filename ?? '');
+void rootDetail, rootFp;
+const captureOpts: CaptureErrorOptions = {
+  tenantId: 'acc_9',
+  name: 'error.server',
+  service: 'api',
+  subjects: [{ type: 'user', id: 'u_1' }],
+  attrs: { source: 'middleware' },
+  handled: false,
+};
+const captured: Promise<EmitResult | null> = t.captureError(new Error('x'), captureOpts);
+void captured;
+const cfgWithCapture: CreateTelemetryConfig = {
+  registry,
+  connection: {} as any,
+  captureError: { errorName: 'error.server', errorAttrs: { process: 'api' }, redact: (s) => s },
+};
+void cfgWithCapture;
 const input: EmitInput<typeof registry, 'user.signed_up'> = {
   tenantId: 'a',
   attrs: { source: 's', plan: 'free' },
@@ -840,7 +888,7 @@ import {
   useTelemetry as useReactTelemetry,
 } from './react.js';
 
-import type { TelemetryClient as VueClient } from './vue.js';
+import type { TelemetryClient as VueClient, VueTelemetryPluginOptions } from './vue.js';
 import {
   createClient as createVueCoreClient,
   createTelemetryPlugin,
@@ -848,11 +896,13 @@ import {
   TELEMETRY_KEY,
 } from './vue.js';
 
-import type { MainTelemetryOptions, TelemetryClient as ElectronClient } from './electron.js';
+import type { MainTelemetryOptions, RendererTelemetryOptions, TelemetryClient as ElectronClient } from './electron.js';
 import {
   createClient as createElectronCoreClient,
   createMainTelemetry,
   createRendererTelemetry,
+  installProcessErrorHandlers as installElectronProcessErrorHandlers,
+  BENIGN_BROWSER_ERRORS as ELECTRON_BENIGN,
   IPC_CHANNEL,
 } from './electron.js';
 
@@ -890,10 +940,11 @@ void providerEl, boundary, hooked;
 // /vue — the injection key is a value, and the plugin installs onto an app
 const vueClient: VueClient = createVueCoreClient({ key: 'pk_x', url: '/i', transport });
 const key: 'telemetry' = TELEMETRY_KEY;
-const plugin = createTelemetryPlugin(vueClient);
+const plugin = createTelemetryPlugin(vueClient, { handled: false, attrs: { app: 'shell' } });
 plugin.install({ config: { errorHandler: () => {} }, provide: () => {} });
 const injected: VueClient = useVueTelemetry(() => vueClient);
-void key, injected;
+const pluginOpts: VueTelemetryPluginOptions = { handled: true };
+void key, injected, pluginOpts;
 
 // /electron — main owns the only real queue, the renderer rides IPC
 const channel: 'telemetry:batch' = IPC_CHANNEL;
@@ -904,10 +955,16 @@ const mainOpts: MainTelemetryOptions = {
   ipcMain: { handle: () => {} },
 };
 const main: ElectronClient = createMainTelemetry(mainOpts);
-const renderer: ElectronClient = createRendererTelemetry(
-  { invoke: async () => ({ ok: true }) },
-  { release: 'app@1.0.0' },
-);
+const rendererOpts: RendererTelemetryOptions = {
+  release: 'app@1.0.0',
+  captureGlobalErrors: true,
+  ignoreErrors: ['widget'],
+  captureBenignErrors: false,
+};
+const renderer: ElectronClient = createRendererTelemetry({ invoke: async () => ({ ok: true }) }, rendererOpts);
+const electronBenign: readonly RegExp[] = ELECTRON_BENIGN;
+const uninstallElectron: () => void = installElectronProcessErrorHandlers(main);
+void electronBenign, uninstallElectron;
 // key/url/transport are Omitted on the renderer — they never leave main
 // @ts-expect-error — the renderer must not be handed a key
 createRendererTelemetry({ invoke: async () => ({}) }, { key: 'sk_leak' });

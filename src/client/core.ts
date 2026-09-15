@@ -1,6 +1,8 @@
 import { uuidv7 } from 'uuidv7';
+import { describeError, matchesIgnore, type IgnorePattern } from './errors.js';
 
 declare const window: unknown;
+declare const process: any;
 
 /**
  * The isomorphic SDK core (instrumentation §6) — ~80% of every client by
@@ -93,6 +95,20 @@ export interface CreateClientOptions {
   /** registry name used by captureError. Convention: 'error.unhandled'. */
   errorName?: string;
   /**
+   * Attrs stamped on EVERY error record, under whatever the call site passes.
+   * This is where "which process" lives — the adapters set `process` here
+   * (`main`, `renderer`), and a worker passes its own — so no call site has to
+   * know where it is running to say so.
+   */
+  errorAttrs?: Record<string, string>;
+  /**
+   * Drop error records whose message matches. Strings match by substring,
+   * RegExp by `test`. Applied to every `captureError`, including the ones the
+   * adapters' global hooks raise, so filtering never depends on which listener
+   * registered first.
+   */
+  ignoreErrors?: readonly IgnorePattern[];
+  /**
    * Last gate before a record joins the queue — the one place every kind
    * (event, error, span, state, usage) passes through. Return the record to
    * keep it, a modified copy to redact it, or `null` to drop it silently.
@@ -130,28 +146,29 @@ const memoryStorage = (): ClientStorage => {
   return { get: (k) => m.get(k), set: (k, v) => void m.set(k, v) };
 };
 
-/** stable, cheap error grouping — server-side fingerprinting can refine later */
-const fingerprint = (type: string, message: string, frame: string): string => {
-  const s = `${type}|${message.replace(/\d+/g, 'N').slice(0, 200)}|${frame}`;
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
-  return h.toString(16);
-};
-
-const FRAME_RE = /^\s*at\s+(?:(.+?)\s+\()?(?:(.+?):(\d+):(\d+))\)?\s*$/;
-
-const parseFrames = (stack: string | undefined) =>
-  (stack ?? '')
-    .split('\n')
-    .slice(1, 21)
-    .map((line) => FRAME_RE.exec(line))
-    .filter((m): m is RegExpExecArray => !!m)
-    .map((m) => ({
-      fn: m[1],
-      filename: m[2],
-      lineno: Number(m[3]),
-      colno: Number(m[4]),
-    }));
+/**
+ * `process.on('uncaughtException' | 'unhandledRejection')` →
+ * `captureError(handled: false)`, tagged with which one fired. For any Node
+ * process that is not Electron main (a worker, a job runner) — main gets this
+ * from `createMainTelemetry`. A no-op outside Node. Returns the uninstaller.
+ *
+ * Does NOT exit the process or swallow the error for anyone else: the
+ * listeners are additive, so the host's own handler (log it, show a dialog)
+ * keeps running.
+ */
+export function installProcessErrorHandlers(client: TelemetryClient): () => void {
+  if (typeof process === 'undefined' || typeof process.on !== 'function') return () => {};
+  const onException = (err: unknown) =>
+    client.captureError(err, { handled: false, attrs: { source: 'uncaught_exception' } });
+  const onRejection = (reason: unknown) =>
+    client.captureError(reason, { handled: false, attrs: { source: 'unhandled_rejection' } });
+  process.on('uncaughtException', onException);
+  process.on('unhandledRejection', onRejection);
+  return () => {
+    process.off?.('uncaughtException', onException);
+    process.off?.('unhandledRejection', onRejection);
+  };
+}
 
 export function createClient(options: CreateClientOptions) {
   const {
@@ -166,6 +183,8 @@ export function createClient(options: CreateClientOptions) {
     storage = memoryStorage(),
     consent = () => true,
     errorName = 'error.unhandled',
+    errorAttrs,
+    ignoreErrors = [],
     beforeSend,
     onError = () => {},
   } = options;
@@ -300,23 +319,21 @@ export function createClient(options: CreateClientOptions) {
     },
 
     captureError(err: unknown, ctx: { handled?: boolean; name?: string; attrs?: Record<string, string> } = {}) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      const frames = parseFrames(e.stack);
+      const error = describeError(err, ctx.handled ?? true);
+      // Filtered HERE, before beforeSend, so a host hook never sees noise it
+      // did not ask about — and so the filter applies to app-initiated calls
+      // as much as to the global hooks.
+      if (matchesIgnore(error.message, ignoreErrors)) return;
+      const attrs = errorAttrs || ctx.attrs ? { ...errorAttrs, ...ctx.attrs } : undefined;
       const trace = activeTrace();
       enqueue({
         _id: newId(),
         name: ctx.name ?? errorName,
         occurredAt: new Date().toISOString(),
         severity: 'error',
-        ...(ctx.attrs ? { attrs: ctx.attrs } : {}),
+        ...(attrs ? { attrs } : {}),
         ...(trace ? { traceId: trace.traceId, parentId: trace.spanId } : {}),
-        error: {
-          type: e.name || 'Error',
-          message: e.message,
-          handled: ctx.handled ?? true,
-          fingerprint: fingerprint(e.name, e.message, frames[0]?.filename ?? ''),
-          frames,
-        },
+        error,
       });
     },
 
@@ -409,6 +426,9 @@ export function createClient(options: CreateClientOptions) {
 }
 
 export type TelemetryClient = ReturnType<typeof createClient>;
+
+export { parseFrames, fingerprint, normalizeMessage, describeError, coerceError } from './errors.js';
+export type { ErrorDetail, ErrorFrame, IgnorePattern } from './errors.js';
 
 // The isomorphic registry surface (instrumentation §8): the host's registry
 // file imports defineRegistry from '/core' so server AND clients can import

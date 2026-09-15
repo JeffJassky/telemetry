@@ -59,6 +59,8 @@ function createClient<R extends Registry = Registry>(options: CreateClientOption
 | `clientContext` | `ClientContextInput` | `{ platform, appVersion }` | Merged over the adapter's capture. |
 | `consent` | `() => boolean` | `() => true` | `false` ⇒ drop instead of send. |
 | `errorName` | `string` | `'error.unhandled'` | Registry name used by `captureError`. |
+| `errorAttrs` | `Record<string,string>` | — | Stamped on **every** error record, under the call site's own attrs. The adapters put `process` here (`main`, `renderer`); a worker passes its own. |
+| `ignoreErrors` | `Array<string \| RegExp>` | `[]` | Drop error records by message — strings match by substring, RegExp by `test`. Applies to every `captureError`, including the adapters' global hooks, so filtering never depends on listener order. |
 | `onError` | `(e) => void` | no-op | SDK-internal failures. **Never thrown at the app.** |
 
 ### Methods
@@ -74,11 +76,33 @@ Synchronous — it enqueues and returns.
 ```ts
 captureError(err: unknown, ctx?: { handled?, name?, attrs? }): void
 ```
-Coerces non-`Error` values, parses up to 20 stack frames
-(`fn`, `filename`, `lineno`, `colno`), computes a stable fingerprint from
-`type | message-with-digits-normalized | top frame filename`, and enqueues with
-`severity: 'error'`. Same crash, same group. Server-side fingerprinting can
-refine it later; this one is cheap and deterministic.
+Coerces non-`Error` values (a thrown *object* is described by its constructor
+— `Non-Error thrown (Object)` — and never serialised), parses up to 20 stack
+frames (`fn`, `filename`, `lineno`, `colno`), computes a stable fingerprint from
+`type | normalized message | top frame filename`, and enqueues with
+`severity: 'error'`. Normalisation flattens UUIDs, 24-hex ids and digits, so a
+`CastError` for two different ids is one group. The server's
+[`captureError()`](/reference/factory#captureerror) uses the same algorithm.
+
+```ts
+installProcessErrorHandlers(client): () => void
+```
+`process.on('uncaughtException' | 'unhandledRejection')` → `captureError` with
+`handled: false` and `attrs.source` (`uncaught_exception` /
+`unhandled_rejection`). For any Node process that is not Electron main — a
+worker, a job runner — since main gets it from `createMainTelemetry`. Additive:
+the host's own handlers keep running. A no-op outside Node. Returns the
+uninstaller.
+
+```ts
+parseFrames(stack): ErrorFrame[]
+normalizeMessage(message): string
+fingerprint(type, message, topFrameFilename): string
+coerceError(err): Error
+describeError(err, handled): ErrorDetail
+```
+The error shaping, exported so a host that builds records by hand groups them
+the same way.
 
 ```ts
 startSpan(name: string, opts?: { attrs? }): Span     // { traceId, spanId, end(extra?) }
@@ -278,10 +302,15 @@ app.use(createTelemetryPlugin(telemetry));
 const t = useTelemetry(inject);
 ```
 
-The plugin installs `app.config.errorHandler`, reporting with `handled: false`
-and `attrs.vue_info`, then **chains to any previous handler** — installing
-telemetry must not silence the app's own error reporting. It also
-`provide()`s the client under `TELEMETRY_KEY` (`'telemetry'`).
+The plugin installs `app.config.errorHandler`, reporting with `handled: false`,
+`attrs.source: 'vue'` and `attrs.vue_info`, then **chains to any previous
+handler** — installing telemetry must not silence the app's own error
+reporting. It also `provide()`s the client under `TELEMETRY_KEY`
+(`'telemetry'`).
+
+`createTelemetryPlugin(client, { handled?, attrs? })` — `handled` defaults to
+`false` because Vue's handler is the only place a component error is ever
+seen; `attrs` rides every component error alongside the two above.
 
 `useTelemetry` takes Vue's `inject` as an argument. That is deliberate: nothing
 in this entry imports `vue` at runtime, so the plugin shape stays structural and
@@ -320,13 +349,35 @@ const telemetry = createRendererTelemetry(ipcRenderer);
 
 It registers a handler on `IPC_CHANNEL` (`'telemetry:batch'`) that enqueues
 incoming wire records into the main queue after a shape check (`_id` and `name`
-must be strings). `clientContext.platform` is `'electron'`.
+must be strings). Main's own `beforeSend` runs on them again, so a redaction
+configured in main covers both processes. `clientContext.platform` is
+`'electron'`, and every error record carries `attrs.process: 'main'` under
+whatever `errorAttrs` you pass; the process hooks add `attrs.source`.
 
-`createRendererTelemetry(ipcRenderer, opts?)` takes
-`Omit<CreateClientOptions, 'key' | 'url' | 'transport'>` — those three are
-meaningless in a renderer, so they are not accepted rather than accepted and
-ignored. Its transport parses its own batch and forwards only the `records` array
-over IPC.
+`createRendererTelemetry(ipcRenderer, opts?)` is the browser-shaped client —
+context capture, `localStorage`-persisted anon id, `window.onerror` /
+`unhandledrejection` hooks, the `BENIGN_BROWSER_ERRORS` filter — with an IPC
+transport. It takes `Omit<CreateClientOptions, 'key' | 'url' | 'transport' |
+'storage'>` plus:
+
+| Option | Default | |
+|---|---|---|
+| `captureGlobalErrors` | `true` | Wire `window.onerror` and `unhandledrejection`, tagged `source: window_error` / `unhandled_rejection`. |
+| `ignoreErrors` | `[]` | Drop error records by message. **Added to** `BENIGN_BROWSER_ERRORS`. |
+| `captureBenignErrors` | `false` | Keep the benign records. |
+
+Every renderer error record carries `attrs.process: 'renderer'`. `ipcRenderer`
+is anything with `invoke(channel, records)` — electron's own, or the one method
+a sandboxed preload exposes over `contextBridge`:
+
+```js
+// preload
+contextBridge.exposeInMainWorld('telemetryIpc', {
+  invoke: (channel, records) => channel === 'telemetry:batch' ? ipcRenderer.invoke(channel, records) : Promise.reject(),
+});
+// renderer
+const telemetry = createRendererTelemetry(window.telemetryIpc, { release });
+```
 
 Electron itself is structural-typed: nothing here imports `'electron'` at
 runtime, so the module loads in a test or a preload script without it.

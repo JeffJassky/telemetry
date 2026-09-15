@@ -13,12 +13,24 @@ interface VueAppLike {
   provide(key: string, value: unknown): void;
 }
 
-export function createTelemetryPlugin(client: TelemetryClient) {
+export interface VueTelemetryPluginOptions {
+  /**
+   * Vue's errorHandler is the ONLY place a component error is seen — Vue
+   * swallows it otherwise — so `false` (the default) is honest: nothing
+   * handled it.
+   */
+  handled?: boolean;
+  /** extra attrs on every component error, alongside `vue_info` and `source` */
+  attrs?: Record<string, string>;
+}
+
+export function createTelemetryPlugin(client: TelemetryClient, options: VueTelemetryPluginOptions = {}) {
+  const { handled = false, attrs } = options;
   return {
     install(app: VueAppLike) {
       const previous = app.config.errorHandler;
       app.config.errorHandler = (err, instance, info) => {
-        client.captureError(err, { handled: false, attrs: { vue_info: String(info) } });
+        client.captureError(err, { handled, attrs: { ...attrs, source: 'vue', vue_info: String(info) } });
         previous?.(err, instance, info);
       };
       app.provide(TELEMETRY_KEY, client);

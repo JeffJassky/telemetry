@@ -240,6 +240,47 @@ tenant-scoped — that is what `scoped()` is for.
 These live outside mongoose models because neither has a schema worth enforcing:
 a reject is by definition a document that failed one.
 
+## `captureError()`
+
+```ts
+t.captureError(err: unknown, opts: CaptureErrorOptions): Promise<EmitResult | null>
+```
+
+A thrown value → an `error`-kind record through `emit()`, shaped by the same
+frame parser and fingerprint every client SDK uses, so the API server's
+`CastError` and the desktop's group the same way. Trusted caller: `tenantId`
+is required and `service`, `release`, `env`, `subjects`, `attrs`, `handled`
+(default `true`), `dedupeKey` and `occurredAt` are yours to name. `name`
+overrides the registry name — hosts usually declare a server-origin twin of
+`error.unhandled` so a publishable key cannot write it.
+
+Defaults live on `createTelemetry({ captureError })`:
+
+| | |
+|---|---|
+| `errorName` | the registry name written when a call names none (`'error.unhandled'`) |
+| `errorAttrs` | stamped under every call's attrs, e.g. `{ process: 'api' }` |
+| `redact` | `(text) => text`, applied to the message, every frame's `fn`/`filename` and every attr value before the write. **Fail-closed**: if it throws, the record is dropped and `null` returned — a half-redacted stack that still ships is worse than a missing one. |
+
+```js
+const t = createTelemetry({
+  registry, connection,
+  captureError: { errorName: 'error.server', errorAttrs: { process: 'api' }, redact: scrubText },
+});
+
+app.use((err, req, res, next) => {
+  void t.captureError(err, {
+    tenantId, subjects: req.user ? [{ type: 'user', id: req.user.id }] : [],
+    attrs: { route: req.route?.path ?? req.path, method: req.method },
+  });
+  next(err);
+});
+```
+
+`parseFrames`, `normalizeMessage`, `fingerprint`, `coerceError` and
+`describeError` are exported from the server entry too, for a host that
+builds an error record by hand.
+
 ## Also exported from the package root
 
 Everything below is a named export of `@jeffjassky/telemetry`. See

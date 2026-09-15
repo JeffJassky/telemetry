@@ -7,6 +7,49 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [0.9.0]
+
+### Added
+- **Error capture is the package's job, in every process.** Before this a
+  host that wanted errors from an Electron renderer, a worker, or its own API
+  server had to write the hooks, the scrubbing and the envelope itself — and
+  one did, three times over, with two of the copies quietly double-reporting.
+  - **core:** `errorAttrs` — attrs stamped on every error record under the
+    call site's own; `ignoreErrors` — drop by message, applied to every
+    `captureError` (lifted from `/web`, where it only covered the global hooks
+    by accident of ordering); `installProcessErrorHandlers(client)` for any
+    Node process that is not Electron main. The error shaping
+    (`parseFrames`, `normalizeMessage`, `fingerprint`, `coerceError`,
+    `describeError`) is exported from `/core` and the server entry.
+  - **electron:** `createMainTelemetry` stamps `process: 'main'`;
+    `createRendererTelemetry` is now the full browser-shaped client — context
+    capture, `localStorage` anon id, `window.onerror`/`unhandledrejection`
+    hooks, the benign filter, `ignoreErrors` — with `process: 'renderer'`.
+    Main re-runs its own `beforeSend` on forwarded renderer records, so one
+    redaction covers both processes. `installProcessErrorHandlers` and
+    `BENIGN_BROWSER_ERRORS` re-exported.
+  - **vue:** `createTelemetryPlugin(client, { handled, attrs })`; component
+    errors carry `source: 'vue'`.
+  - **server:** `t.captureError(err, { tenantId, service, subjects, attrs,
+    handled, … })` — a thrown value through `emit()` with the same fingerprint
+    the clients compute. `createTelemetry({ captureError: { errorName,
+    errorAttrs, redact } })` sets the defaults; `redact` is fail-closed.
+  - Every automatic hook tags `attrs.source` (`uncaught_exception`,
+    `unhandled_rejection`, `window_error`, `vue`), so a dashboard can say which
+    catch site an error came from. Declare `process` and `source` on your
+    error spec to keep them — lenient validation strips what a spec does not
+    declare.
+
+### Changed
+- **Fingerprints normalise UUIDs and 24-hex ids as well as digits.** A
+  `CastError` for two different ObjectIds was two issues; it is one. Existing
+  `error_issues` rollup documents keep their old key, so an issue that spans
+  the upgrade shows as two rows for its retention window.
+- A thrown non-`Error` object is described by its constructor
+  (`Non-Error thrown (Object)`) rather than `String()`-ed to
+  `[object Object]` — and never serialised, because a rejection reason can be
+  a response body or a form.
+
 ## [0.8.1]
 
 ### Fixed
