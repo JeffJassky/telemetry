@@ -106,8 +106,10 @@ const DIGITS_SEGMENT_RE = /^\d+$/;
  * An endpoint path with every identifier flattened, so one endpoint is one
  * group — the URL analogue of `normalizeMessage` above. Query strings and
  * hashes are dropped outright; a segment shaped like an identifier or token
- * (UUID, 24-hex ObjectId, bare digits, or a long opaque token) becomes
- * `<id>`. Capped at 200 chars, the `route` convention hosts already use.
+ * (UUID, 24-hex ObjectId, bare digits, a long opaque token, or anything
+ * containing `@` — an email in the path, e.g. `/users/jeff@x.com/profile`)
+ * becomes `<id>`. Capped at 200 chars, the `route` convention hosts already
+ * use.
  */
 export const scrubUrlPath = (raw: unknown): string | undefined => {
   if (typeof raw !== 'string' || !raw) return undefined;
@@ -128,6 +130,7 @@ export const scrubUrlPath = (raw: unknown): string | undefined => {
       UUID_SEGMENT_RE.test(seg) ||
       OBJECTID_SEGMENT_RE.test(seg) ||
       DIGITS_SEGMENT_RE.test(seg) ||
+      seg.indexOf('@') !== -1 ||
       seg.length >= 32
         ? '<id>'
         : seg,
