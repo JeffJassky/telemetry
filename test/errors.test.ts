@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import express from 'express';
+import request from 'supertest';
 import { createClient, installProcessErrorHandlers } from '../src/client/core.js';
 import { createMainTelemetry, createRendererTelemetry } from '../src/client/electron.js';
 import { createTelemetryPlugin } from '../src/client/vue.js';
 import { coerceError, describeError, fingerprint, normalizeMessage, parseFrames } from '../src/client/errors.js';
+import { createIngest, newId } from '../src/server/index.js';
 import { z } from 'zod';
 import { buildTelemetry, paperRegistry, startDb, stopDb } from './helpers.js';
 
@@ -88,6 +91,63 @@ describe('client error options', () => {
     expect(seen).toEqual(['ours']); // the host hook never sees the noise
   });
 
+  // Issue #395: an axios rejection resolved to vendor frames only
+  // (createError/settle/xhr), so no HTTP failure was attributable to an
+  // endpoint. The record must carry the scrubbed URL, method and status.
+  const axiosError = (url: string, method: string, status?: number) =>
+    Object.assign(new Error(`Request failed${status ? ` with status code ${status}` : ''}`), {
+      isAxiosError: true,
+      config: { url, method },
+      ...(status !== undefined ? { response: { status } } : {}),
+    });
+
+  it('an axios rejection carries its endpoint and status on the record', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createClient(opts(transport));
+    c.captureError(axiosError('https://api.example.com/pricing', 'get', 404));
+    await c.flush();
+    const [rec] = batches[0].records;
+    expect(rec.attrs.url).toBe('/pricing');
+    expect(rec.attrs.method).toBe('GET');
+    expect(rec.attrs.status).toBe('404');
+  });
+
+  it('query strings and identifier-bearing path segments never reach the record', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createClient(opts(transport));
+    c.captureError(axiosError('/users/65f3aa11bb22cc33dd44ee55/orders?page=2&token=abc', 'post', 500));
+    c.captureError(axiosError('/reports/3f2504e0-4f89-11d3-9a0c-0305e82c3301', 'get', 404));
+    c.captureError(axiosError('/accounts/12345', 'delete', 403));
+    await c.flush();
+    const [objectId, uuid, digits] = batches[0].records;
+    expect(objectId.attrs.url).toBe('/users/<id>/orders');
+    expect(uuid.attrs.url).toBe('/reports/<id>');
+    expect(digits.attrs.url).toBe('/accounts/<id>');
+    for (const rec of [objectId, uuid, digits]) {
+      expect(rec.attrs.url).not.toContain('?');
+      expect(rec.attrs.url).not.toContain('token');
+    }
+  });
+
+  it('a plain Error captures exactly as before — no url, method, or status attrs', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createClient(opts(transport, { errorAttrs: { process: 'worker' } }));
+    c.captureError(new Error('boom'));
+    await c.flush();
+    const [rec] = batches[0].records;
+    expect(rec.attrs).toEqual({ process: 'worker' });
+    expect(rec.error.message).toBe('boom');
+  });
+
+  it('call-site attrs win over the derived HTTP attrs', async () => {
+    const { batches, transport } = fakeTransport();
+    const c = createClient(opts(transport));
+    c.captureError(axiosError('/pricing', 'get', 404), { attrs: { url: '/override' } });
+    await c.flush();
+    expect(batches[0].records[0].attrs.url).toBe('/override');
+    expect(batches[0].records[0].attrs.status).toBe('404');
+  });
+
   it('installProcessErrorHandlers reports both hooks with a source, and uninstalls', async () => {
     const { batches, transport } = fakeTransport();
     const c = createClient(opts(transport));
@@ -106,6 +166,65 @@ describe('client error options', () => {
     expect(a.error.handled).toBe(false);
     expect(a.attrs).toEqual({ source: 'uncaught_exception' });
     expect(b.attrs).toEqual({ source: 'unhandled_rejection' });
+  });
+});
+
+describe('http attrs survive ingest when the host registry declares them', () => {
+  beforeAll(startDb);
+  afterAll(stopDb);
+
+  it('a record carrying url/method/status is accepted, not quarantined', async () => {
+    // The registry is host-owned: the package stamps the attrs, the host
+    // declares them. Lenient validation strips what a spec does not declare,
+    // so without these lines the endpoint attribution dies at the wire.
+    const base = paperRegistry() as any;
+    const registry = {
+      ...base,
+      'error.unhandled': {
+        ...base['error.unhandled'],
+        attrs: z.object({
+          route: z.string().max(200).optional(),
+          url: z.string().max(200).optional(),
+          method: z.string().max(16).optional(),
+          status: z.string().max(8).optional(),
+        }),
+      },
+    };
+    const t = buildTelemetry({ registry });
+    await t.syncIndexes();
+    const { key } = await t.createKey({
+      kind: 'publishable', tenantMode: 'fixed', tenantId: 'tn',
+      service: 'webapp', env: 'prod',
+    } as any);
+    const app = express();
+    app.use('/ingest', createIngest({ telemetry: t }));
+
+    const c = createClient({
+      key,
+      url: 'https://x/ingest',
+      release: 'app@1.0.0',
+      flushIntervalMs: 0,
+      transport: async (_url: string, body: string, headers: Record<string, string>) => {
+        const res = await request(app).post('/ingest').set(headers).send(JSON.parse(body));
+        return { ok: res.status < 300, status: res.status };
+      },
+    });
+    c.captureError(
+      Object.assign(new Error('Request failed with status code 404'), {
+        isAxiosError: true,
+        config: { url: '/pricing', method: 'get' },
+        response: { status: 404 },
+      }),
+    );
+    await c.flush();
+
+    const row = (await t.models.telemetry.findOne({ name: 'error.unhandled' }).lean()) as any;
+    expect(row).toBeTruthy();
+    expect(row.attrs.url).toBe('/pricing');
+    expect(row.attrs.method).toBe('GET');
+    expect(row.attrs.status).toBe('404');
+    await t.flush(); // the quarantine write is fire-and-forget behind the 202
+    expect(await t.collections.rejects().countDocuments({})).toBe(0);
   });
 });
 

@@ -1,5 +1,5 @@
 import { uuidv7 } from 'uuidv7';
-import { describeError, matchesIgnore, type IgnorePattern } from './errors.js';
+import { describeError, extractHttpAttrs, matchesIgnore, type IgnorePattern } from './errors.js';
 
 declare const window: unknown;
 declare const process: any;
@@ -324,7 +324,17 @@ export function createClient(options: CreateClientOptions) {
       // did not ask about — and so the filter applies to app-initiated calls
       // as much as to the global hooks.
       if (matchesIgnore(error.message, ignoreErrors)) return;
-      const attrs = errorAttrs || ctx.attrs ? { ...errorAttrs, ...ctx.attrs } : undefined;
+      // Issue #395: axios builds its error inside the XHR callback, so the
+      // stack is vendor frames only and the endpoint is lost. The HTTP attrs
+      // are the attribution — stamped UNDER the call site's own attrs, so an
+      // explicit url/method/status always wins. Hosts must declare the three
+      // keys on their error spec; lenient validation strips what a spec does
+      // not declare, and the attribution would die at the wire.
+      const http = extractHttpAttrs(err);
+      const attrs =
+        http.url !== undefined || http.method !== undefined || http.status !== undefined || errorAttrs || ctx.attrs
+          ? { ...http, ...errorAttrs, ...ctx.attrs }
+          : undefined;
       const trace = activeTrace();
       enqueue({
         _id: newId(),

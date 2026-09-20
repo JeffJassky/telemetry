@@ -84,6 +84,19 @@ frames (`fn`, `filename`, `lineno`, `colno`), computes a stable fingerprint from
 `CastError` for two different ids is one group. The server's
 [`captureError()`](/reference/factory#captureerror) uses the same algorithm.
 
+An axios-shaped rejection (`isAxiosError`, or a `config` like its) also stamps
+`attrs.url`, `attrs.method` and `attrs.status`: axios builds its error inside
+the XHR callback, so the stack is vendor frames only and the endpoint would
+otherwise be lost. Only the scrubbed path is recorded — query strings and
+hashes are dropped, identifier-shaped segments (UUIDs, 24-hex ids, bare
+digits, long tokens) become `<id>`, and the origin is dropped with them — and
+an explicit `url`/`method`/`status` in `ctx.attrs` always wins over the
+derived one. **Declare the three keys on your error spec** (`url` ≤ 200 chars,
+`method` ≤ 16, `status` ≤ 8); lenient validation strips whatever a spec does
+not declare, and the attribution would die at the wire. `fetch` rejections
+carry no such shape — a failed fetch rejects with a bare `TypeError` — so
+pass `attrs` explicitly when you capture one.
+
 ```ts
 installProcessErrorHandlers(client): () => void
 ```

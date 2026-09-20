@@ -7,6 +7,17 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [Unreleased]
+
+### Added
+- `captureError` stamps `attrs.url`, `attrs.method` and `attrs.status` on
+  axios-shaped rejections. Axios builds its error inside the XHR callback, so
+  the stack is vendor frames only and no HTTP failure was attributable to an
+  endpoint. Only the scrubbed path is recorded — no query strings, no hashes,
+  no origin, and identifier-shaped segments become `<id>`. **Host action
+  required:** declare `url` (≤ 200 chars), `method` (≤ 16) and `status` (≤ 8)
+  on your error spec, or lenient validation strips the attribution at ingest.
+
 ## [0.9.0]
 
 ### Added

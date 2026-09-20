@@ -86,7 +86,16 @@ export function paperRegistry() {
     // ── the error tracker ──
     'error.unhandled': {
       kind: 'error', origin: 'any', subjects: [],
-      attrs: z.object({ route: z.string().max(200).optional() }),
+      // url/method/status are stamped by captureError on axios-shaped
+      // rejections (issue #395) — declared here so ingest keeps them. A host
+      // registry must declare them the same way or lenient validation strips
+      // the attribution at the wire.
+      attrs: z.object({
+        route: z.string().max(200).optional(),
+        url: z.string().max(200).optional(),
+        method: z.string().max(16).optional(),
+        status: z.string().max(8).optional(),
+      }),
       burst: { key: 'field:error.fingerprint', maxPerMinute: 60 },
       rollups: [{
         as: 'issue',

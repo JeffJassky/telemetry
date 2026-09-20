@@ -54,7 +54,12 @@ const REGISTRY = defineRegistry({
   },
   'error.unhandled': {
     kind: 'error', origin: 'any', subjects: [],
-    attrs: z.object({ route: z.string().max(200).optional() }),
+    attrs: z.object({
+      route: z.string().max(200).optional(),
+      url: z.string().max(200).optional(),
+      method: z.string().max(16).optional(),
+      status: z.string().max(8).optional(),
+    }),
     burst: { key: 'field:error.fingerprint', maxPerMinute: 60 },
     rollups: [{
       as: 'issue', by: ['field:error.fingerprint'],
