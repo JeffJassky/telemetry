@@ -107,9 +107,16 @@ const DIGITS_SEGMENT_RE = /^\d+$/;
  * group — the URL analogue of `normalizeMessage` above. Query strings and
  * hashes are dropped outright; a segment shaped like an identifier or token
  * (UUID, 24-hex ObjectId, bare digits, a long opaque token, or anything
- * containing `@` — an email in the path, e.g. `/users/jeff@x.com/profile`)
+ * containing `@` — an email in the path, e.g. `/users/jeff@x.com/profile`,
+ * percent-decoded first so a correctly-encoded `jeff%40x.com` matches too)
  * becomes `<id>`. Capped at 200 chars, the `route` convention hosts already
  * use.
+ *
+ * Deliberately NOT promised: human-chosen slugs flatten too. A board title
+ * (`/storyboards/my-secret-board-title/share`) or a coupon code
+ * (`/api/coupon/EDUCATOR2026`) still splits one endpoint into many groups.
+ * Neither is PII, and flattening them would need route-shape knowledge the
+ * client does not have — the server owns that grouping, if it wants it.
  */
 export const scrubUrlPath = (raw: unknown): string | undefined => {
   if (typeof raw !== 'string' || !raw) return undefined;
@@ -126,15 +133,27 @@ export const scrubUrlPath = (raw: unknown): string | undefined => {
   if (!path.startsWith('/')) path = `/${path}`;
   return path
     .split('/')
-    .map((seg) =>
-      UUID_SEGMENT_RE.test(seg) ||
-      OBJECTID_SEGMENT_RE.test(seg) ||
-      DIGITS_SEGMENT_RE.test(seg) ||
-      seg.indexOf('@') !== -1 ||
-      seg.length >= 32
+    .map((seg) => {
+      // Percent-decode before testing: a correctly-encoded path parameter
+      // arrives as `jeff%40x.com` — no `@`, 21 chars, under the opaque
+      // threshold — and would pass every predicate below. A malformed `%`
+      // throws URIError; fall back to the raw segment so one bad hop never
+      // takes out the whole capture path. The raw segment is what ships
+      // when it is not flattened.
+      let probe = seg;
+      try {
+        probe = decodeURIComponent(seg);
+      } catch {
+        probe = seg;
+      }
+      return UUID_SEGMENT_RE.test(probe) ||
+        OBJECTID_SEGMENT_RE.test(probe) ||
+        DIGITS_SEGMENT_RE.test(probe) ||
+        probe.indexOf('@') !== -1 ||
+        probe.length >= 32
         ? '<id>'
-        : seg,
-    )
+        : seg;
+    })
     .join('/')
     .slice(0, 200);
 };

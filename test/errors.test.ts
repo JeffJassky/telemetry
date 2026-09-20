@@ -119,17 +119,22 @@ describe('client error options', () => {
     c.captureError(axiosError('/reports/3f2504e0-4f89-11d3-9a0c-0305e82c3301', 'get', 404));
     c.captureError(axiosError('/accounts/12345', 'delete', 403));
     c.captureError(axiosError('/users/jeff@jeffjassky.com/profile', 'get', 404));
+    c.captureError(axiosError('/users/jeff%40jeffjassky.com/profile', 'get', 404));
+    c.captureError(axiosError('/users/jeff%zz/profile', 'get', 404));
     await c.flush();
-    const [objectId, uuid, digits, email] = batches[0].records;
+    const [objectId, uuid, digits, email, encoded, malformed] = batches[0].records;
     expect(objectId.attrs.url).toBe('/users/<id>/orders');
     expect(uuid.attrs.url).toBe('/reports/<id>');
     expect(digits.attrs.url).toBe('/accounts/<id>');
     expect(email.attrs.url).toBe('/users/<id>/profile');
-    for (const rec of [objectId, uuid, digits, email]) {
+    expect(encoded.attrs.url).toBe('/users/<id>/profile');
+    expect(malformed.attrs.url).toBe('/users/jeff%zz/profile');
+    for (const rec of [objectId, uuid, digits, email, encoded, malformed]) {
       expect(rec.attrs.url).not.toContain('?');
       expect(rec.attrs.url).not.toContain('token');
     }
     expect(email.attrs.url).not.toContain('@');
+    expect(encoded.attrs.url).not.toContain('%40');
   });
 
   it('a plain Error captures exactly as before — no url, method, or status attrs', async () => {
