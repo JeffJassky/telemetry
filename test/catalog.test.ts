@@ -226,7 +226,10 @@ describe('the paper registry', () => {
       .toEqual(['field:state.key', 'field:state.to']);
 
     const err = catalog.events['error.unhandled']!;
-    expect(err.dims.map((d) => d.key)).toEqual(['attr:route', 'field:error.type', 'field:error.handled']);
+    expect(err.dims.map((d) => d.key)).toEqual([
+      'attr:route', 'attr:url', 'attr:method', 'attr:status',
+      'field:error.type', 'field:error.handled',
+    ]);
     expect(err.dims.find((d) => d.key === 'field:error.handled')!.type).toBe('boolean');
 
     // a plain event kind adds nothing
