@@ -121,8 +121,12 @@ describe('client error options', () => {
     c.captureError(axiosError('/users/jeff@jeffjassky.com/profile', 'get', 404));
     c.captureError(axiosError('/users/jeff%40jeffjassky.com/profile', 'get', 404));
     c.captureError(axiosError('/users/jeff%zz/profile', 'get', 404));
+    // 33 chars encoded, 25 decoded: the opaque-token test must read the RAW
+    // length too, or decoding un-flattens a segment that used to qualify.
+    c.captureError(axiosError('/storyboards/My%20Great%20Board%20Title%20Here/share', 'get', 404));
     await c.flush();
-    const [objectId, uuid, digits, email, encoded, malformed] = batches[0].records;
+    const [objectId, uuid, digits, email, encoded, malformed, longSlug] = batches[0].records;
+    expect(longSlug.attrs.url).toBe('/storyboards/<id>/share');
     expect(objectId.attrs.url).toBe('/users/<id>/orders');
     expect(uuid.attrs.url).toBe('/reports/<id>');
     expect(digits.attrs.url).toBe('/accounts/<id>');

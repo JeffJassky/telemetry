@@ -112,11 +112,14 @@ const DIGITS_SEGMENT_RE = /^\d+$/;
  * becomes `<id>`. Capped at 200 chars, the `route` convention hosts already
  * use.
  *
- * Deliberately NOT promised: human-chosen slugs flatten too. A board title
- * (`/storyboards/my-secret-board-title/share`) or a coupon code
+ * Deliberately NOT promised: a human-chosen slug SHORTER than the opaque
+ * threshold flattens nothing. A short board title
+ * (`/storyboards/my-board/share`) or a coupon code
  * (`/api/coupon/EDUCATOR2026`) still splits one endpoint into many groups.
  * Neither is PII, and flattening them would need route-shape knowledge the
  * client does not have — the server owns that grouping, if it wants it.
+ * A slug that reaches 32 chars in EITHER form does flatten, which is why the
+ * length test below reads both.
  */
 export const scrubUrlPath = (raw: unknown): string | undefined => {
   if (typeof raw !== 'string' || !raw) return undefined;
@@ -146,11 +149,17 @@ export const scrubUrlPath = (raw: unknown): string | undefined => {
       } catch {
         probe = seg;
       }
+      // The opaque-token length test runs on BOTH forms. Decoding only ever
+      // shrinks a segment (`%20` -> ` `), so testing the decoded length alone
+      // would un-flatten segments that used to qualify: an encoded board
+      // title is 33 raw but 25 decoded, and shipped as `<id>` before the
+      // decode was added. Either form reaching the threshold is enough.
       return UUID_SEGMENT_RE.test(probe) ||
         OBJECTID_SEGMENT_RE.test(probe) ||
         DIGITS_SEGMENT_RE.test(probe) ||
         probe.indexOf('@') !== -1 ||
-        probe.length >= 32
+        probe.length >= 32 ||
+        seg.length >= 32
         ? '<id>'
         : seg;
     })
