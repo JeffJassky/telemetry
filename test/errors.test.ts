@@ -4,7 +4,7 @@ import request from 'supertest';
 import { createClient, installProcessErrorHandlers } from '../src/client/core.js';
 import { createMainTelemetry, createRendererTelemetry } from '../src/client/electron.js';
 import { createTelemetryPlugin } from '../src/client/vue.js';
-import { coerceError, describeError, fingerprint, normalizeMessage, parseFrames } from '../src/client/errors.js';
+import { coerceError, describeError, fingerprint, normalizeFrameFile, normalizeMessage, parseFrames } from '../src/client/errors.js';
 import { createIngest, newId } from '../src/server/index.js';
 import { z } from 'zod';
 import { buildTelemetry, paperRegistry, startDb, stopDb } from './helpers.js';
@@ -33,6 +33,54 @@ describe('error shaping (client/errors.ts)', () => {
     expect(a).toBe(b);
     expect(normalizeMessage('row 3f2504e0-4f89-11d3-9a0c-0305e82c3301 at 12')).toBe('row <uuid> at N');
     expect(fingerprint('TypeError', 'x', 'x.js')).not.toBe(fingerprint('RangeError', 'x', 'x.js'));
+  });
+
+  // Real production messages (StoryFolder, 2026-09-20): one corrupt file on
+  // one drive, reported as 17 fingerprints because each ffmpeg context pointer
+  // differs. They are one bug.
+  it('flattens 0x addresses, so ffmpeg context pointers do not split a group', () => {
+    const msg = (addr: string) =>
+      `[mov,mp4,m4a,3gp,3g2,mj2 @ ${addr}] moov atom not found /Volumes/X/<file>.mp4: Invalid data found when processing input`;
+    const prints = ['0x159e19850', '0x12df13d70', '0x14500ca70', '0x156304430', '0x11cf197d0'].map((a) =>
+      fingerprint('Error', msg(a), 'node:events'),
+    );
+    expect(new Set(prints).size).toBe(1);
+    expect(normalizeMessage('ctx @ 0x7fFFab01 failed')).toBe('ctx @ <addr> failed');
+  });
+
+  // Real production frames: the same `Network Error` and the same TypeError got
+  // a new fingerprint on every release, and two on 0.4.13 (Mac and Windows
+  // builds hash differently). A bug must keep its group across builds.
+  it('strips the bundle content-hash from the top frame, so a bug keeps its group across builds', () => {
+    const vite = ['index-D78DIsVr.js', 'index-C4nAT7lX.js', 'index-BXN4_Hpx.js', 'index-Dl-OMvYA.js'].map((f) =>
+      fingerprint('AxiosError', 'Network Error', `app://-/assets/${f}`),
+    );
+    expect(new Set(vite).size).toBe(1);
+
+    const sfc = ['Div-_Cjj', 'H2nnGJFm'].map((h) =>
+      fingerprint(
+        'TypeError',
+        'editor.value?.focus is not a function',
+        `app://-/assets/SfShotCard.vue_vue_type_style_index_0_lang-${h}.js`,
+      ),
+    );
+    expect(new Set(sfc).size).toBe(1);
+
+    expect(normalizeFrameFile('https://storyfolder.com/js/chunk-vendors.f18c196e.js')).toBe(
+      'https://storyfolder.com/js/chunk-vendors.js',
+    );
+    expect(normalizeFrameFile('https://storyfolder.com/js/chunk-vendors.5fcbda8b.js')).toBe(
+      'https://storyfolder.com/js/chunk-vendors.js',
+    );
+  });
+
+  it('leaves unhashed filenames alone, so different files stay different groups', () => {
+    expect(normalizeFrameFile('/app/server/controllers/auth.js')).toBe('/app/server/controllers/auth.js');
+    expect(normalizeFrameFile('app://-/assets/my-longname.js')).toBe('app://-/assets/my-longname.js');
+    expect(normalizeFrameFile('node:internal/child_process')).toBe('node:internal/child_process');
+    expect(fingerprint('Error', 'x', 'app://-/assets/index-BXN4_Hpx.js')).not.toBe(
+      fingerprint('Error', 'x', 'app://-/assets/editor-BXN4_Hpx.js'),
+    );
   });
 
   it('parses V8 frames with and without a function name, capped at 20', () => {

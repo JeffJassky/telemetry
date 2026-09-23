@@ -437,7 +437,7 @@ export function createClient(options: CreateClientOptions) {
 
 export type TelemetryClient = ReturnType<typeof createClient>;
 
-export { parseFrames, fingerprint, normalizeMessage, describeError, coerceError } from './errors.js';
+export { parseFrames, fingerprint, normalizeMessage, normalizeFrameFile, describeError, coerceError } from './errors.js';
 export type { ErrorDetail, ErrorFrame, IgnorePattern } from './errors.js';
 
 // The isomorphic registry surface (instrumentation §8): the host's registry

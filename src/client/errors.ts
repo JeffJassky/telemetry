@@ -47,18 +47,38 @@ export const parseFrames = (stack: string | undefined): ErrorFrame[] =>
  *
  * Order matters: 24-hex ObjectIds and UUIDs are replaced BEFORE bare digits,
  * or `65f3aa…` would become `N` `f` `N` `aa` … and two ids that differ in
- * where their digits fall would fingerprint differently.
+ * where their digits fall would fingerprint differently. The same holds for
+ * `0x…` addresses: ffmpeg prefixes every line with its context pointer
+ * (`[mov,mp4 @ 0x159e19850]`), and digit-flattening alone leaves the hex
+ * letters behind — one corrupt-file error became 17 groups in production.
  */
 export const normalizeMessage = (message: string): string =>
   message
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
     .replace(/\b[0-9a-f]{24}\b/gi, '<id>')
+    .replace(/\b0x[0-9a-f]+\b/gi, '<addr>')
     .replace(/\d+/g, 'N')
     .slice(0, 200);
 
-/** stable, cheap grouping — `type | normalized message | top frame filename` */
+/**
+ * The top frame's file with its build content-hash removed, so one bug keeps
+ * one group across releases and across the per-platform builds of ONE
+ * release (Mac and Windows 0.4.13 shipped different `index-*.js` hashes).
+ *
+ * Covers the two bundlers in use: Vite's `name-HASH8.js` (base64url, may
+ * contain `-`/`_`) and webpack/vue-cli's `name.HASH8.js` (hex). The hash must
+ * contain a digit or an uppercase letter, which a real content hash almost
+ * always does and a human-chosen `-segment` of a source filename almost never
+ * does — `chunk-vendors.js` and `my-longname.js` are left alone.
+ */
+export const normalizeFrameFile = (filename: string): string =>
+  filename.replace(/([-.])([A-Za-z0-9_-]{8})(\.[cm]?js)$/, (whole, _sep, hash: string, ext: string) =>
+    /[0-9A-Z]/.test(hash) ? ext : whole,
+  );
+
+/** stable, cheap grouping — `type | normalized message | top frame file, hash stripped` */
 export const fingerprint = (type: string, message: string, frame: string): string => {
-  const s = `${type}|${normalizeMessage(message)}|${frame}`;
+  const s = `${type}|${normalizeMessage(message)}|${normalizeFrameFile(frame)}`;
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
   return h.toString(16);

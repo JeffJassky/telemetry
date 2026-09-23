@@ -31,7 +31,7 @@ export type { Checkpoint } from './checkpoint.js';
 export { SUBJECT_MAX, SUBJECT_LINK_TIMEOUT_MS } from './emit.js';
 export type { EmitInput, EmitResult, LinkSubjects, SubjectLinker } from './emit.js';
 export type { CaptureErrorOptions } from './capture-error.js';
-export { parseFrames, fingerprint, normalizeMessage, describeError, coerceError } from '../client/errors.js';
+export { parseFrames, fingerprint, normalizeMessage, normalizeFrameFile, describeError, coerceError } from '../client/errors.js';
 export type { ErrorDetail, ErrorFrame } from '../client/errors.js';
 export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
 export type { CreateKeyInput, ParsedKey } from './keys.js';
