@@ -163,9 +163,11 @@ export interface ErrorDetail {
 
 /** up to 20 `at fn (file:line:col)` frames off a stack string */
 export declare function parseFrames(stack: string | undefined): ErrorFrame[];
-/** the message with UUIDs, 24-hex ids and digits flattened, capped at 200 chars */
+/** the message with UUIDs, 24-hex ids, `0x`/ffmpeg ` @ ` pointers and digits flattened, capped at 200 chars */
 export declare function normalizeMessage(message: string): string;
-/** stable grouping key: `type | normalized message | top frame filename` */
+/** a frame filename with its 8-char Vite (`-HASH`) or webpack (`.HASH`) bundle content-hash removed */
+export declare function normalizeFrameFile(filename: string): string;
+/** stable grouping key: `type | normalized message | top frame filename, content-hash stripped` */
 export declare function fingerprint(type: string, message: string, frame: string): string;
 /** whatever was thrown, as an Error — an object is described by its constructor, never serialised */
 export declare function coerceError(err: unknown): Error;

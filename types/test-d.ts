@@ -55,6 +55,7 @@ import {
   newId,
   parseFrames,
   normalizeMessage,
+  normalizeFrameFile,
   fingerprint,
   coerceError,
   describeError,
@@ -391,6 +392,7 @@ import {
   parseFrames as coreParseFrames,
   fingerprint as coreFingerprint,
   normalizeMessage as coreNormalizeMessage,
+  normalizeFrameFile as coreNormalizeFrameFile,
   describeError as coreDescribeError,
   coerceError as coreCoerceError,
 } from './core.js';
@@ -398,7 +400,7 @@ import {
 // error shaping is a value export on /core AND the server entry — same algorithm
 const frames: CoreErrorFrame[] = coreParseFrames(new Error('x').stack);
 const detail: CoreErrorDetail = coreDescribeError(new Error('x'), false);
-const fp: string = coreFingerprint('TypeError', coreNormalizeMessage('id 65f3aa11bb22cc33dd44ee55'), frames[0]?.filename ?? '');
+const fp: string = coreFingerprint('TypeError', coreNormalizeMessage('id 65f3aa11bb22cc33dd44ee55'), coreNormalizeFrameFile(frames[0]?.filename ?? ''));
 const coerced: Error = coreCoerceError({ not: 'an error' });
 const ignore: IgnorePattern[] = ['a', /b/];
 void detail, fp, coerced, ignore;
@@ -846,7 +848,7 @@ declare const generic: Telemetry;
 // the shaping the server shares with every client — values, on the root entry
 const rootFrames: ErrorFrame[] = parseFrames(new Error('x').stack);
 const rootDetail: ErrorDetail = describeError(coerceError('x'), true);
-const rootFp: string = fingerprint('E', normalizeMessage('m 12'), rootFrames[0]?.filename ?? '');
+const rootFp: string = fingerprint('E', normalizeMessage('m 12'), normalizeFrameFile(rootFrames[0]?.filename ?? ''));
 void rootDetail, rootFp;
 const captureOpts: CaptureErrorOptions = {
   tenantId: 'acc_9',

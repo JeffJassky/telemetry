@@ -277,9 +277,9 @@ app.use((err, req, res, next) => {
 });
 ```
 
-`parseFrames`, `normalizeMessage`, `fingerprint`, `coerceError` and
-`describeError` are exported from the server entry too, for a host that
-builds an error record by hand.
+`parseFrames`, `normalizeMessage`, `normalizeFrameFile`, `fingerprint`,
+`coerceError` and `describeError` are exported from the server entry too, for
+a host that builds an error record by hand.
 
 ## Also exported from the package root
 
