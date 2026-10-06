@@ -48,6 +48,54 @@ describe('error shaping (client/errors.ts)', () => {
     expect(normalizeMessage('ctx @ 0x7fFFab01 failed')).toBe('ctx @ <addr> failed');
   });
 
+  // Real production messages (StoryFolder desktop 0.4.17, Windows, 2026-10-02
+  // and 2026-10-06): ffmpeg on Windows prints the context pointer as bare
+  // zero-padded hex. Each run's pointer differs, so one bad input file was
+  // reported under a new fingerprint every time. JeffJassky/telemetry#2.
+  it('flattens bare-hex ffmpeg context pointers (Windows), so one input keeps one group', () => {
+    const msg = (addr: string) =>
+      `[in#0 @ ${addr}] Error opening input: Invalid data found when processing input Error opening input file ~\\AppData\\Local\\Microsoft\\Windows\\INetCache\\IE\\4116P33I\\pomoz-dzieciom-przezyc-zime[1].`;
+    const prints = [
+      '000001526922c800',
+      '0000020b5a85c800',
+      '000002b49333c800',
+      '0000020c67f0c800',
+      '000001adcc9fc800',
+      '000001f99e23c800',
+      '000001473cdec800',
+      '000001962b44c800',
+    ].map((a) => fingerprint('Error', msg(a), 'node:events'));
+    expect(new Set(prints).size).toBe(1);
+
+    expect(normalizeMessage('[fc#0 @ 000001cb18edf540] Error initializing complex filters')).toBe(
+      '[fc#N @ <addr>] Error initializing complex filters',
+    );
+    expect(normalizeMessage('[in#0 @ 000001962B44C800] x')).toBe('[in#N @ <addr>] x');
+    expect(normalizeMessage('@ 000001cb18edf540 at start')).toBe('@ <addr> at start');
+  });
+
+  it('gives the Mac (0x) and Windows (bare hex) forms of one ffmpeg failure the same group', () => {
+    const err = 'Invalid data found when processing input';
+    expect(fingerprint('Error', `[mov,mp4,m4a,3gp,3g2,mj2 @ 0x159e19850] ${err}`, 'node:events')).toBe(
+      fingerprint('Error', `[mov,mp4,m4a,3gp,3g2,mj2 @ 000001cb18edf540] ${err}`, 'node:events'),
+    );
+  });
+
+  // The bare-hex rule is anchored on ` @ ` so it cannot eat hex that merely
+  // looks like a pointer: those strings keep their existing normalisation.
+  it('leaves hex runs that are not an "@ " context pointer to the general rules', () => {
+    // no `@`: digit-flattening only, exactly as before
+    expect(normalizeMessage('chunk deadbeefcafe1234 missing')).toBe('chunk deadbeefcafeN missing');
+    expect(normalizeMessage('sha 000001cb18edf540 mismatch')).toBe('sha NcbNedfN mismatch');
+    // `@` without whitespace (an email-ish token) is not a context pointer
+    expect(normalizeMessage('to x@deadbeef12.example failed')).toBe('to x@deadbeefN.example failed');
+    // fewer than 8 hex digits after `@ ` is not a pointer
+    expect(normalizeMessage('[in#0 @ abc123] x')).toBe('[in#N @ abcN] x');
+    // UUIDs and ObjectIds after `@ ` keep their own placeholders
+    expect(normalizeMessage('row @ 3f2504e0-4f89-11d3-9a0c-0305e82c3301')).toBe('row @ <uuid>');
+    expect(normalizeMessage('doc @ 65f3aa11bb22cc33dd44ee55')).toBe('doc @ <id>');
+  });
+
   // Real production frames: the same `Network Error` and the same TypeError got
   // a new fingerprint on every release, and two on 0.4.13 (Mac and Windows
   // builds hash differently). A bug must keep its group across builds.

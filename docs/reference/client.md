@@ -80,8 +80,13 @@ Coerces non-`Error` values (a thrown *object* is described by its constructor
 — `Non-Error thrown (Object)` — and never serialised), parses up to 20 stack
 frames (`fn`, `filename`, `lineno`, `colno`), computes a stable fingerprint from
 `type | normalized message | top frame filename`, and enqueues with
-`severity: 'error'`. Normalisation flattens UUIDs, 24-hex ids and digits, so a
-`CastError` for two different ids is one group. The server's
+`severity: 'error'`. Normalisation flattens UUIDs, 24-hex ids, memory
+addresses and digits, so a `CastError` for two different ids is one group.
+Addresses cover `0x…` anywhere and ffmpeg's context pointer after ` @ ` in
+either form — `[mov,mp4 @ 0x159e19850]` (macOS) and `[in#0 @ 000001962b44c800]`
+(Windows, bare hex) both become `@ <addr>`. The top frame's bundle
+content-hash (`index-BXN4_Hpx.js`, `chunk-vendors.f18c196e.js`) is stripped,
+so a bug keeps its group across builds. The server's
 [`captureError()`](/reference/factory#captureerror) uses the same algorithm.
 
 An axios-shaped rejection (`isAxiosError`, or a `config` like its) also stamps
@@ -110,6 +115,7 @@ uninstaller.
 ```ts
 parseFrames(stack): ErrorFrame[]
 normalizeMessage(message): string
+normalizeFrameFile(filename): string
 fingerprint(type, message, topFrameFilename): string
 coerceError(err): Error
 describeError(err, handled): ErrorDetail

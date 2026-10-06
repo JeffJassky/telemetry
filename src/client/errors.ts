@@ -51,11 +51,17 @@ export const parseFrames = (stack: string | undefined): ErrorFrame[] =>
  * `0x…` addresses: ffmpeg prefixes every line with its context pointer
  * (`[mov,mp4 @ 0x159e19850]`), and digit-flattening alone leaves the hex
  * letters behind — one corrupt-file error became 17 groups in production.
+ * On Windows ffmpeg prints that pointer as bare zero-padded hex with no `0x`
+ * (`[in#0 @ 000001962b44c800]`), which the `0x` rule cannot see; it is caught
+ * by its ` @ ` anchor instead, so hex runs elsewhere in a message are left to
+ * the general rules. Both forms become `@ <addr>`, so the Mac and Windows
+ * builds of one ffmpeg failure share a group too.
  */
 export const normalizeMessage = (message: string): string =>
   message
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>')
     .replace(/\b[0-9a-f]{24}\b/gi, '<id>')
+    .replace(/((?:^|\s)@\s+)(?:0x)?[0-9a-f]{8,}\b/gi, '$1<addr>')
     .replace(/\b0x[0-9a-f]+\b/gi, '<addr>')
     .replace(/\d+/g, 'N')
     .slice(0, 200);
