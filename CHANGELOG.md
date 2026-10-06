@@ -22,7 +22,10 @@ real if CI runs the matrix. See standards/traps.md #10.
     occurrence. Eight or more hex digits after ` @ ` (with or without `0x`)
     now become `<addr>`. The rule is anchored on ` @ `, so hex elsewhere in a
     message is untouched, and the Mac and Windows forms of one ffmpeg failure
-    share a group. (JeffJassky/telemetry#2)
+    share a group. Decimal digits are hex digits too, so a message with 8 or
+    more digits after ` @ ` (`Request failed @ 20261006123456 ms`) also reads
+    `@ <addr>` where it used to read `@ N`; shorter numbers stay `@ N`. No two
+    errors the old rules kept apart are merged. (JeffJassky/telemetry#2)
   - The top frame's filename carried the bundle content-hash
     (`index-BXN4_Hpx.js`, `chunk-vendors.f18c196e.js`), which changes every
     build and differs between the Mac and Windows builds of one release. The

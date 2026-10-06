@@ -81,6 +81,20 @@ describe('error shaping (client/errors.ts)', () => {
     );
   });
 
+  // Decimal digits are hex digits, so 8+ of them after ` @ ` also become
+  // `<addr>` (a one-time regroup, noted in the 0.9.2 changelog). The digit
+  // rule already flattened them to `N`, so this never merges two errors the
+  // old rule kept apart. It does split one old group by length: under 8
+  // digits stays `@ N`, 8 or more is `@ <addr>`.
+  it('treats 8+ decimal digits after "@ " as an address, without merging anything new', () => {
+    expect(normalizeMessage('Request failed @ 20261006123456 ms')).toBe('Request failed @ <addr> ms');
+    expect(normalizeMessage('Request failed @ 1234567 ms')).toBe('Request failed @ N ms');
+    const prints = ['20261006123456', '99999999', '12345678901234567890'].map((n) =>
+      fingerprint('Error', `Request failed @ ${n} ms`, 'node:events'),
+    );
+    expect(new Set(prints).size).toBe(1);
+  });
+
   // The bare-hex rule is anchored on ` @ ` so it cannot eat hex that merely
   // looks like a pointer: those strings keep their existing normalisation.
   it('leaves hex runs that are not an "@ " context pointer to the general rules', () => {
