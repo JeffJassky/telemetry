@@ -7,7 +7,37 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
-## [Unreleased]
+## [0.9.2]
+
+### Fixed
+- **One bug keeps one fingerprint.** Three things split a single error into
+  many groups, so a regression and a fix could not be told apart across
+  releases:
+  - `0x…` addresses survived normalisation. ffmpeg prefixes every line with
+    its context pointer (`[mov,mp4 @ 0x159e19850]`), and digit-flattening left
+    the hex letters behind — one corrupt file on one drive was 17 groups.
+    They now become `<addr>`.
+  - On Windows ffmpeg prints that pointer as bare hex with no `0x`
+    (`[in#0 @ 000001962b44c800]`): one bad input file got a new group on every
+    occurrence. Eight or more hex digits after ` @ ` (with or without `0x`)
+    now become `<addr>`. The rule is anchored on ` @ `, so hex elsewhere in a
+    message is untouched, and the Mac and Windows forms of one ffmpeg failure
+    share a group. (JeffJassky/telemetry#2)
+  - The top frame's filename carried the bundle content-hash
+    (`index-BXN4_Hpx.js`, `chunk-vendors.f18c196e.js`), which changes every
+    build and differs between the Mac and Windows builds of one release. The
+    new `normalizeFrameFile` strips an 8-char Vite (`-HASH`) or webpack
+    (`.HASH`) hash containing a digit or an uppercase letter, and
+    `fingerprint()` uses it. Exported from the root, `/core` and the server
+    entry, and declared in `types/`.
+
+  **One-time effect:** every group whose message or top frame matched one of
+  these rules gets a new fingerprint once hosts upgrade. Compare the release
+  that ships this with earlier ones by message, not by fingerprint. A host
+  that re-hashed messages itself to work around this (StoryFolder desktop's
+  `fingerprintMessage`) can drop that step.
+
+## [0.9.1]
 
 ### Added
 - `captureError` stamps `attrs.url`, `attrs.method` and `attrs.status` on
