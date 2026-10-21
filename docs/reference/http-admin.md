@@ -621,6 +621,63 @@ Ownership rules, in order:
 
 ---
 
+## Annotations
+
+The change log every chart is drawn against. See [Annotations](/guide/annotations).
+
+### `GET /api/annotations`
+
+| param | |
+|---|---|
+| `from`, `to` | the window, as everywhere. Default: the last 7 days. |
+| `service`, `env` | keep annotations for this value plus those with none |
+| `category`, `tags` | comma-separated, any-of |
+| `limit` | default 500, max 2000 |
+
+```json
+{ "items": [
+  { "id": "0192…", "tenantId": "tn_1", "at": "2026-10-03T14:00:00.000Z", "endAt": null,
+    "title": "Removed the Meta pixel", "body": null, "category": "tracking",
+    "service": "webapp", "env": null, "tags": [], "url": null,
+    "source": "dashboard", "authorRef": "user:u_1", "key": null,
+    "createdAt": "…", "updatedAt": "…" }
+], "truncated": false }
+```
+
+Everything overlapping the window, oldest first. A tenant viewer gets its own
+plus the global (`'*'`) ones; the platform viewer gets the global ones.
+
+`200`. `400 invalid time range`.
+
+### `POST /api/annotations`
+
+```json
+{ "at": "2026-10-03T14:00:00Z", "title": "Removed the Meta pixel",
+  "category": "tracking", "service": "webapp" }
+```
+
+Accepted fields: `at`, `endAt`, `title`, `body`, `category`, `service`, `env`,
+`tags`, `url`. Anything else is ignored: `tenantId` is the viewer's scope,
+`authorRef` is `viewerRef`, `source` is `'dashboard'`, and `key` is never set
+from here.
+
+`201` with the stored annotation. `400` with the validation message.
+
+### `PATCH /api/annotations/:id`
+
+The same accepted fields, any subset. Looked up by a **literal** scope match.
+
+`200` with the updated annotation. `404 not_found` outside the viewer's scope.
+`403 forbidden` unless it is yours (`authorRef === viewerRef`) or the viewer is
+`role: 'admin'`. `400` with the validation message.
+
+### `DELETE /api/annotations/:id`
+
+`{ "removed": 1 }`. Outside the viewer's scope: `{ "removed": 0 }`, not 404,
+like saved views. `403 forbidden` on the same rule as `PATCH`.
+
+---
+
 ## System
 
 Where "never drop silently" becomes visible. Not optional.
@@ -707,11 +764,11 @@ Revocation takes effect within the ingest router's `keyCacheMs` (60s by default)
 ## Verified against
 
 Checked against the source on **2026-09-07**: every route below is one
-`api.get` / `api.post` / `api.delete` in `src/server/dashboard.ts` (19 of them),
+`api.get` / `api.post` / `api.patch` / `api.delete` in `src/server/dashboard.ts` (23 of them),
 with parameter parsing read from `src/server/query.ts` (`RecordFilter`,
 `QueryLimits`, `breakdown`), `src/server/report.ts` (`parseReportQuery`,
 `resolveReport`), `src/server/execute.ts` (`executeReport`),
-`src/server/values.ts` (`createValues`), `src/server/views.ts`
+`src/server/values.ts` (`createValues`), `src/server/annotations.ts`, `src/server/views.ts`
 (`resolveViews`, `saveView`), `src/server/catalog.ts` (`deriveCatalog`,
 `projectRegistry`), and `src/server/suggest.ts` (`deriveSuggestions`).
 

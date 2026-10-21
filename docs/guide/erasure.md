@@ -2,12 +2,12 @@
 
 ```ts
 const result = await t.forget('tn_1', 'user:u_1');
-// { deleted, redacted, rollups, aliases, views }
+// { deleted, redacted, rollups, aliases, views, annotations }
 ```
 
 One call in your account-deletion path. It deletes what only they were party to,
 destroys the linkage on everything else, rekeys the aggregates they were counted
-in, and reaches quarantine, aliases and saved views. Every count is returned so
+in, and reaches quarantine, aliases, saved views and annotation authors. Every count is returned so
 the caller can log what actually happened.
 
 `ref` is an `EntityRef` — `type:id`. Anything else throws before touching a
@@ -69,7 +69,7 @@ Re-running `forget()` for the same ref collides on the rekeyed `_id`, which is
 treated as a no-op: it means the erasure already happened. `forget()` is
 idempotent — a second call finds nothing and changes nothing.
 
-## Quarantine, aliases, saved views
+## Quarantine, aliases, saved views, annotations
 
 **Quarantine.** `<collection>_rejects` holds raw payloads as sent, including the
 ones that failed validation. Those are inside the erasure boundary and are
@@ -84,6 +84,11 @@ matching on either side deletes the row.
 rule as rows: private views are deleted, shared views survive with `ownerRef`
 rewritten to the pseudonym. A view the tenant relies on does not vanish because
 its author left.
+
+**Annotations.** `authorRef` is a person, but an annotation is a fact about the
+product, so it is always kept and only `authorRef` is rewritten to the
+pseudonym. Global (`'*'`) annotations are reached when `globalSubjectRefs` is
+set, like platform-scoped views. See [Annotations](/guide/annotations).
 
 ## Why `data` is unstored unless declared
 

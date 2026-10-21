@@ -47,6 +47,7 @@ the server layer.
 | `list_reports` | the menu of saved / configured / derived reports, each with the source it reads |
 | `run_report` | execute a report — one from the menu, or an inline one you compose |
 | `plan_report` | what a report WOULD cost, without doing the read |
+| `list_annotations` | the change log — deploys, tracking and consent changes, campaigns, incidents — for a window; call it when a trend moves |
 | `list_tenants` | the tenant activity roster (platform operators) |
 | `telemetry_health` | drop counters, quarantine, index budget — and the registry edits the data is asking for |
 

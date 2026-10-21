@@ -500,6 +500,77 @@ export function createDashboard(opts: CreateDashboardOptions): Router {
     return { removed: 1 };
   }));
 
+  // ── annotations: the change log every chart is read against ──
+  // Any viewer can write one — noting "I removed the pixel" is the habit this
+  // exists to build, and a gate on it is a note nobody writes. Edit and delete
+  // follow saved views: your own, or any in your scope as admin. Scope is
+  // matched LITERALLY: the platform viewer writes and edits the global ('*')
+  // annotations, never a tenant's.
+  api.get('/annotations', h(async (req) => {
+    const { from, to } = parseRange(req.query);
+    const str = (k: string) => (typeof req.query[k] === 'string' && req.query[k] ? String(req.query[k]) : undefined);
+    const csv = (k: string) => str(k)?.split(',').map((s) => s.trim()).filter(Boolean);
+    return t.annotations.list(req.viewer!.tenantId, {
+      from, to,
+      service: str('service'),
+      env: str('env'),
+      category: csv('category'),
+      tags: csv('tags'),
+      limit: req.query.limit ? Number(req.query.limit) : undefined,
+    });
+  }));
+
+  // the fields a viewer may set — tenant, author, source and key are the
+  // server's to stamp, never the body's
+  const ANNOTATION_FIELDS = ['at', 'endAt', 'title', 'body', 'category', 'service', 'env', 'tags', 'url'] as const;
+  const pickAnnotation = (body: unknown) => {
+    const b = (body ?? {}) as Record<string, unknown>;
+    return Object.fromEntries(
+      ANNOTATION_FIELDS.filter((k) => Object.prototype.hasOwnProperty.call(b, k)).map((k) => [k, b[k]]),
+    );
+  };
+
+  api.post('/annotations', h(async (req, res) => {
+    const created = await t.annotations.create({
+      ...(pickAnnotation(req.body) as any),
+      tenantId: req.viewer!.tenantId,
+      source: 'dashboard',
+      authorRef: req.viewer!.viewerRef ?? null,
+    });
+    res.status(201);
+    return created;
+  }));
+
+  const mayEdit = async (req: Request & { viewer?: Viewer }, res: Response) => {
+    const doc = await t.annotations.get(req.viewer!.tenantId, String(req.params.id));
+    if (!doc) return null;
+    const mine = !!doc.authorRef && doc.authorRef === req.viewer!.viewerRef;
+    if (!mine && req.viewer!.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return false;
+    }
+    return doc;
+  };
+
+  api.patch('/annotations/:id', h(async (req, res) => {
+    const doc = await mayEdit(req, res);
+    if (doc === false) return undefined as never;
+    if (!doc) {
+      res.status(404);
+      return { error: 'not_found' };
+    }
+    return t.annotations.update(req.viewer!.tenantId, doc.id, pickAnnotation(req.body) as any);
+  }));
+
+  api.delete('/annotations/:id', h(async (req, res) => {
+    const doc = await mayEdit(req, res);
+    if (doc === false) return undefined as never;
+    // outside the caller's scope reads as removed:0, like a view — whether the
+    // id exists elsewhere is not this viewer's business
+    if (!doc) return { removed: 0 };
+    return t.annotations.remove(req.viewer!.tenantId, doc.id);
+  }));
+
   // ── System — where "never drop silently" becomes visible. Not optional. ──
   api.get('/system', h(async (req) => {
     // Quarantined rejects hold RAW payloads — subjects, attrs, the lot. An

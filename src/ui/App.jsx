@@ -1,9 +1,9 @@
 import React from 'react';
 import { createApi } from './api.js';
-import { ScopeContext } from './atoms.jsx';
+import { AnnotationContext, ScopeContext } from './atoms.jsx';
 import { Sidebar, Topbar } from './shell.jsx';
-import { Errors, Events, Explore, Journeys, Overview, System, Traces, Usage } from './pages.jsx';
-import { parseHash, reportFromRoute } from './util.js';
+import { Annotations, Errors, Events, Explore, Journeys, Overview, System, Traces, Usage } from './pages.jsx';
+import { parseHash, rangeToDates, reportFromRoute } from './util.js';
 
 /**
  * The dashboard shell (dashboards §3): sidebar (pages + view quick-select),
@@ -24,7 +24,16 @@ const PAGES = {
   explore: Explore,
   journeys: Journeys,
   usage: Usage,
+  annotations: Annotations,
   system: System,
+};
+
+const readPref = (k, fallback) => {
+  try {
+    return localStorage.getItem(k) ?? fallback;
+  } catch {
+    return fallback;
+  }
 };
 
 function useHashRoute() {
@@ -51,6 +60,29 @@ export default function App({ config }) {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('telemetry_theme', theme);
   }, [theme]);
+
+  // the change log for the route's window, drawn on every chart (atoms
+  // AnnotationContext). A failed read draws no lines rather than failing the page.
+  const [showNotes, setShowNotes] = React.useState(() => readPref('telemetry_annotations', 'on') !== 'off');
+  const [notes, setNotes] = React.useState([]);
+  const [notesNonce, setNotesNonce] = React.useState(0);
+  const range = route.params.range ?? '7d';
+  const { env, service } = route.params;
+  React.useEffect(() => {
+    let live = true;
+    api.annotations({ ...rangeToDates(range), env, service })
+      .then((r) => live && setNotes(r.items ?? []), () => live && setNotes([]));
+    return () => { live = false; };
+  }, [api, range, env, service, notesNonce]);
+  const notesCtx = React.useMemo(
+    () => ({ items: notes, visible: showNotes, range, reload: () => setNotesNonce((n) => n + 1) }),
+    [notes, showNotes, range],
+  );
+  const toggleNotes = () => {
+    const next = !showNotes;
+    setShowNotes(next);
+    try { localStorage.setItem('telemetry_annotations', next ? 'on' : 'off'); } catch { /* private mode */ }
+  };
 
   React.useEffect(() => {
     api.registry().then((r) => {
@@ -91,6 +123,7 @@ export default function App({ config }) {
   const Page = PAGES[route.page] ?? Overview;
   return (
     <ScopeContext.Provider value={scope}>
+      <AnnotationContext.Provider value={notesCtx}>
       <div className="app">
         <Sidebar route={route} views={views} title={config.title} platform={scope.platform} />
         <div className="main">
@@ -101,6 +134,8 @@ export default function App({ config }) {
             theme={theme}
             onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
             platform={scope.platform}
+            annotations={showNotes}
+            onAnnotations={toggleNotes}
           />
           <div className="content">
             <div className="content-inner">
@@ -109,6 +144,7 @@ export default function App({ config }) {
           </div>
         </div>
       </div>
+      </AnnotationContext.Provider>
     </ScopeContext.Provider>
   );
 }

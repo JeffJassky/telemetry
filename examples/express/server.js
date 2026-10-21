@@ -260,6 +260,22 @@ await t.emit('checkout.abandoned', {
   service: 'webapp', release: 'app@2.1.0',
 });
 
+// ── annotations: the change log charts are read against ──
+// A deploy hook writes the global one with a `key`, so a retry draws one line;
+// the others are what a person logs from the dashboard's Annotations page.
+await t.annotations.create({
+  tenantId: '*', at: day(5, 9), title: 'Deployed app@2.1.0', category: 'deploy',
+  source: 'ci', key: 'deploy:app@2.1.0', url: 'https://github.com/example/app/releases/tag/v2.1.0',
+});
+await t.annotations.create({
+  tenantId: TENANT, at: day(3, 15), title: 'Removed the Meta pixel from checkout', category: 'tracking',
+  service: 'webapp', authorRef: 'user:demo', body: 'Pending legal review of the CIPA exposure.',
+});
+await t.annotations.create({
+  tenantId: TENANT, at: day(2, 0), endAt: day(1, 0), title: 'Spring sale', category: 'campaign',
+  tags: ['promo'], authorRef: 'user:demo',
+});
+
 await t.flush();
 console.log(`[example] seeded — counters ${JSON.stringify(t.counters)}`);
 

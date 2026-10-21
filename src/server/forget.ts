@@ -21,6 +21,8 @@ export interface ForgetCtx {
   rejects: () => Collection;
   aliases: () => Collection;
   views: () => Collection;
+  /** annotations survive their author; only `authorRef` is rekeyed */
+  annotations: { rekeyAuthor(scope: unknown, ref: string, newRef: string): Promise<number> };
   pepper: () => string;
   /**
    * The host asserting that a subject ref names the same party in every tenant.
@@ -37,6 +39,8 @@ export interface ForgetResult {
   rollups: number;
   aliases: number;
   views: number;
+  /** annotations whose author link was rekeyed — the annotation itself is kept */
+  annotations: number;
 }
 
 export function createForget(ctx: ForgetCtx) {
@@ -179,6 +183,13 @@ export function createForget(ctx: ForgetCtx) {
         { $set: { ownerRef: newRef } },
       )).modifiedCount;
 
-    return { deleted: del.deletedCount ?? 0, redacted: red.modifiedCount ?? 0, rollups, aliases, views };
+    // 7. annotations: a note about the product outlives its author, so only the
+    //    author link is rekeyed — the shared-view rule. Global ('*') notes are
+    //    reached under the same declaration as platform-scoped views.
+    const annotations = await ctx.annotations.rekeyAuthor(viewScope, ref, newRef);
+
+    return {
+      deleted: del.deletedCount ?? 0, redacted: red.modifiedCount ?? 0, rollups, aliases, views, annotations,
+    };
   };
 }

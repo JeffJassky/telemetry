@@ -83,8 +83,8 @@ forget(tenantId: string, ref: EntityRef): Promise<ForgetResult>
 
 Erasure. Deletes rows where the subject is the sole party, redacts rows shared
 with others, rekeys rollups to a pseudonymous ref, drops aliases, and handles
-saved views. Returns counts:
-`{ deleted, redacted, rollups, aliases, views }`.
+saved views and annotation authors. Returns counts:
+`{ deleted, redacted, rollups, aliases, views, annotations }`.
 
 Tenant-scoped, and it **rejects `PLATFORM_SCOPE`** — a platform-wide erasure is N
 calls that each name their tenant, not one call that reaches everything. Reaches
@@ -200,6 +200,22 @@ Hosts should import their own registry module rather than read it off here.
 ### `logger`
 
 The configured `Logger`.
+
+### `annotations`
+
+The change log charts are read against. See [Annotations](/guide/annotations).
+
+```ts
+annotations.create(input: AnnotationInput): Promise<Annotation>
+annotations.list(scope: string, query: AnnotationQuery): Promise<{ items: Annotation[]; truncated: boolean }>
+annotations.get(tenantId: string, id: string): Promise<Annotation | null>
+annotations.update(tenantId: string, id: string, patch: AnnotationPatch): Promise<Annotation | null>
+annotations.remove(tenantId: string, id: string): Promise<{ removed: number }>
+```
+
+`create()` with a `key` upserts on `(tenantId, key)`. `tenantId: '*'` writes a
+global annotation every tenant sees. Validation errors throw with
+`status: 400`. Indexes are built by `syncIndexes()`.
 
 ### `createKey(input)`
 

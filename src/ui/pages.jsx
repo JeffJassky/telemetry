@@ -1,10 +1,12 @@
 import React from 'react';
 import {
+  AnnotationContext, ScopeContext,
   BreakdownTable, RecordDetail, RecordTable, ReportView, StatTile, StreamList,
   SuggestionList, TimeSeries, TransitionMatrix, TruncationNote, Waterfall, reportScalar,
 } from './atoms.jsx';
 import { FilterBar } from './shell.jsx';
 import {
+  ANNOTATION_CATEGORIES, ANNOTATION_COLOR, toLocalInput,
   filtersFromParams, fmtMetric, fmtNumber, fmtTime, intervalFor, navigate,
   rangeToDates, reportToQuery, resolveReport, sourceEvents, sourceFromParam, sourceParam,
 } from './util.js';
@@ -1243,6 +1245,224 @@ export function Usage({ api, route, catalog }) {
 }
 
 /* ── System — never drop silently, made visible ── */
+/**
+ * The change log (annotations.ts): log what changed and when, so the next
+ * jump on a chart has its likely cause drawn beside it. The list is the same
+ * one every chart draws — App fetches it once for the route's window — so a
+ * save here reloads the lines everywhere.
+ */
+const BLANK_NOTE = { at: '', endAt: '', title: '', category: 'change', service: '', env: '', url: '', body: '', tags: '' };
+
+export function Annotations({ api, route }) {
+  const notes = React.useContext(AnnotationContext);
+  const { platform } = React.useContext(ScopeContext);
+  const focus = route.params.focus ?? null;
+  const [draft, setDraft] = React.useState(() => ({ ...BLANK_NOTE, at: toLocalInput(new Date()) }));
+  const [editing, setEditing] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+  const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }));
+
+  const startEdit = (a) => {
+    setEditing(a.id);
+    setError(null);
+    setDraft({
+      at: toLocalInput(a.at),
+      endAt: a.endAt ? toLocalInput(a.endAt) : '',
+      title: a.title,
+      category: a.category,
+      service: a.service ?? '',
+      env: a.env ?? '',
+      url: a.url ?? '',
+      body: a.body ?? '',
+      tags: (a.tags ?? []).join(', '),
+    });
+  };
+  const reset = () => {
+    setEditing(null);
+    setError(null);
+    setDraft({ ...BLANK_NOTE, at: toLocalInput(new Date()) });
+  };
+
+  // a chart's flag links here with `focus=<id>` — open that one, ONCE per
+  // focus. The list reloads after every save, and re-opening it then would
+  // replace whatever the reader had started typing.
+  const opened = React.useRef(null);
+  React.useEffect(() => {
+    if (!focus || opened.current === focus) return;
+    const a = notes.items.find((x) => x.id === focus);
+    if (!a) return;
+    opened.current = focus;
+    if (a.tenantId !== '*' || platform) startEdit(a);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus, notes.items]);
+
+  const save = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    // the input is local wall-clock time; the server stores an instant
+    const instant = (v) => (v ? new Date(v).toISOString() : null);
+    const body = {
+      at: instant(draft.at),
+      endAt: instant(draft.endAt),
+      title: draft.title,
+      category: draft.category || 'change',
+      service: draft.service || null,
+      env: draft.env || null,
+      url: draft.url || null,
+      body: draft.body || null,
+      tags: draft.tags.split(',').map((t) => t.trim()).filter(Boolean),
+    };
+    try {
+      if (editing) await api.updateAnnotation(editing, body);
+      else await api.createAnnotation(body);
+      reset();
+      notes.reload?.();
+    } catch (err) {
+      setError(err.status === 403 ? 'Only the author or an admin can change this one.' : err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (a) => {
+    if (!window.confirm(`Delete "${a.title}"? This cannot be undone.`)) return;
+    try {
+      await api.deleteAnnotation(a.id);
+      if (editing === a.id) reset();
+      notes.reload?.();
+    } catch (err) {
+      setError(err.status === 403 ? 'Only the author or an admin can delete this one.' : err.message);
+    }
+  };
+
+  const items = [...(notes.items ?? [])].reverse(); // newest first to read; charts draw oldest first
+
+  return (
+    <>
+      <div className="card">
+        <div className="card-head">
+          <span className="card-title">{editing ? 'Edit annotation' : 'Log a change'}</span>
+          <span className="card-sub">
+            {platform
+              ? 'written here, it applies to every tenant'
+              : 'drawn on every chart whose window it falls in'}
+          </span>
+        </div>
+        <form className="card-body note-form" onSubmit={save}>
+          <label className="note-field note-wide">
+            <span>What changed</span>
+            <input className="input" value={draft.title} onChange={set('title')} maxLength={200} required
+              placeholder="Removed the Meta pixel from checkout" />
+          </label>
+          <label className="note-field">
+            <span>When</span>
+            <input className="input" type="datetime-local" value={draft.at} onChange={set('at')} required />
+          </label>
+          <label className="note-field">
+            <span>Until <em>(optional, for a span)</em></span>
+            <input className="input" type="datetime-local" value={draft.endAt} onChange={set('endAt')} min={draft.at} />
+          </label>
+          <label className="note-field">
+            <span>Category</span>
+            <input className="input" list="note-categories" value={draft.category} onChange={set('category')}
+              pattern="[a-z0-9][a-z0-9_.\-]*" title="lowercase letters, digits, _ . -" />
+            <datalist id="note-categories">
+              {ANNOTATION_CATEGORIES.map((c) => <option key={c} value={c} />)}
+            </datalist>
+          </label>
+          <label className="note-field">
+            <span>Service <em>(blank = all)</em></span>
+            <input className="input" value={draft.service} onChange={set('service')} maxLength={64} />
+          </label>
+          <label className="note-field">
+            <span>Env <em>(blank = all)</em></span>
+            <input className="input" value={draft.env} onChange={set('env')} maxLength={64} />
+          </label>
+          <label className="note-field">
+            <span>Tags <em>(comma-separated)</em></span>
+            <input className="input" value={draft.tags} onChange={set('tags')} />
+          </label>
+          <label className="note-field note-wide">
+            <span>Link <em>(PR, ticket, change request)</em></span>
+            <input className="input" type="url" value={draft.url} onChange={set('url')} placeholder="https://" />
+          </label>
+          <label className="note-field note-wide">
+            <span>Notes</span>
+            <textarea className="input note-body" value={draft.body} onChange={set('body')} maxLength={4000} rows={3} />
+          </label>
+          <div className="note-wide hstack">
+            <button className="btn btn-primary btn-sm" type="submit" disabled={busy}>
+              {editing ? 'Save changes' : 'Add annotation'}
+            </button>
+            {editing && <button className="btn btn-ghost btn-sm" type="button" onClick={reset}>Cancel</button>}
+            {error && <span className="card-sub" style={{ color: 'var(--red-fg)' }}>{error}</span>}
+          </div>
+        </form>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <span className="card-title">In this window</span>
+          <span className="card-sub">{fmtNumber(items.length)} · the range picker above sets the window</span>
+          {!notes.visible && <span className="pill amber">hidden on charts — ⚑ in the top bar shows them</span>}
+        </div>
+        {items.length === 0 ? (
+          <div className="empty">Nothing logged in this window</div>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr><th>when</th><th>category</th><th>change</th><th>applies to</th><th>source</th><th /></tr>
+            </thead>
+            <tbody>
+              {items.map((a) => (
+                <tr key={a.id} className={a.id === focus || a.id === editing ? 'selected' : ''}>
+                  <td className="mono" title={new Date(a.at).toISOString()}>
+                    {fmtTime(a.at)}{a.endAt ? ` → ${fmtTime(a.endAt)}` : ''}
+                  </td>
+                  <td>
+                    <span className="pill" style={{ color: ANNOTATION_COLOR[a.category] ?? ANNOTATION_COLOR.change }}>
+                      <span className="dot" />{a.category}
+                    </span>
+                  </td>
+                  <td>
+                    <div>
+                      {a.url ? <a href={a.url} target="_blank" rel="noopener noreferrer">{a.title}</a> : a.title}
+                    </div>
+                    {a.body && <div className="card-sub note-preview">{a.body}</div>}
+                    {a.tags?.length > 0 && (
+                      <div className="hstack" style={{ marginTop: 4, flexWrap: 'wrap' }}>
+                        {a.tags.map((t) => <span key={t} className="tag">{t}</span>)}
+                      </div>
+                    )}
+                  </td>
+                  <td className="mono">
+                    {[a.tenantId === '*' ? 'all tenants' : null, a.service, a.env].filter(Boolean).join(' · ') || 'everything'}
+                  </td>
+                  <td className="mono">{a.source}</td>
+                  <td className="num">
+                    {/* a global note is the platform's — a tenant reads it, and the
+                        server would refuse the edit anyway */}
+                    {a.tenantId === '*' && !platform ? (
+                      <span className="card-sub">platform</span>
+                    ) : (
+                      <div className="hstack" style={{ justifyContent: 'flex-end' }}>
+                        <button className="btn btn-ghost btn-sm" onClick={() => startEdit(a)}>edit</button>
+                        <button className="btn btn-danger btn-sm" onClick={() => remove(a)}>delete</button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function System({ api }) {
   const [nonce, setNonce] = React.useState(0);
   const q = useQuery(() => api.system(), [nonce]);

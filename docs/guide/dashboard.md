@@ -77,7 +77,7 @@ normal state of a checkout, not a bug.
 
 ## The pages
 
-Eight, and none of them names a metric, an attr or a family — each reads the
+Nine, and none of them names a metric, an attr or a family — each reads the
 [catalog](/guide/reports#the-catalog) and hands a Report to the resolver.
 
 | Page | What it shows |
@@ -89,6 +89,7 @@ Eight, and none of them names a metric, an attr or a family — each reads the
 | **Traces** | recent traces → waterfall |
 | **Journeys** | the rollup explorer over any family, the cohort funnel with its [stage picker](/guide/reports#the-funnel-picker), and subject lookup → journey view |
 | **Usage** | one series per observed `usage.meter`, with the first `*_usd` measure the catalog reports — never a literal key |
+| **Annotations** | the change log for the window, and the form to add to it. Every time-series chart on every page draws these as lines and bands; ⚑ in the top bar hides them. See [Annotations](/guide/annotations) |
 | **System** | counters, suggestions, quarantine, index budget, keys |
 
 ## Views: one shape, three producers

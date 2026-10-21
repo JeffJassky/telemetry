@@ -1,8 +1,9 @@
 import React from 'react';
 import {
+  ANNOTATION_COLOR,
   KIND_COLOR, KIND_PILL, SEVERITY_PILL,
   fmtClock, fmtDays, fmtMeasure, fmtMetric, fmtMs, fmtNumber, fmtPct, fmtTime,
-  metricOf, rangeOf,
+  metricOf, rangeOf, toHash,
 } from './util.js';
 
 /**
@@ -19,6 +20,17 @@ import {
  * `tenantId` is an envelope field like every other column they render.
  */
 export const ScopeContext = React.createContext({ platform: false, scope: null });
+
+/**
+ * The change log, by context for the same reason as the scope: every time
+ * series on every page draws it, and threading it through each caller is how
+ * the fourth chart ends up without it. App fetches the route's window once;
+ * each chart keeps what falls inside its own domain.
+ */
+export const AnnotationContext = React.createContext({ items: [], visible: false, range: '7d' });
+
+/** more lines than this is a barcode, not a chart */
+const ANNOTATION_DRAW_MAX = 60;
 
 /* 1 ── StatTile */
 export function StatTile({ label, value, delta, meta, deltaFormat = fmtNumber }) {
@@ -134,6 +146,7 @@ export function TimeSeries({ buckets, series, height = 160, color = 'var(--accen
             </g>
           );
         })}
+        <AnnotationLayer domain={domain} x={x} top={pad.t} bottom={H - pad.b} />
         <g className="chart-axis">
           {ticks.map((i) => (
             <text key={i} x={x(i)} y={H - 6} textAnchor="middle">
@@ -144,6 +157,68 @@ export function TimeSeries({ buckets, series, height = 160, color = 'var(--accen
         </g>
       </svg>
     </>
+  );
+}
+
+/**
+ * Annotations over a time series: a dashed line per change, a band per span,
+ * each a link to the Annotations page with the note in its tooltip.
+ *
+ * The x axis is bucket INDEX, not time (see TimeSeries), so a time maps to a
+ * fractional index between the two bucket starts around it. A bucket starting
+ * at `at` covers [at, at + step), so the last bucket extends one step past the
+ * last point — a change inside it is still inside the chart.
+ */
+function AnnotationLayer({ domain, x, top, bottom }) {
+  const { items, visible, range } = React.useContext(AnnotationContext);
+  if (!visible || !items?.length || !domain.length) return null;
+  const last = domain.length - 1;
+  // the bucket width is the SMALLEST gap: a series with empty buckets has
+  // wider ones, and reading the width off one of those would stretch the last
+  // bucket over days that are not on the chart
+  let step = 0;
+  for (let i = 1; i <= last; i++) {
+    const gap = domain[i] - domain[i - 1];
+    if (gap > 0 && (!step || gap < step)) step = gap;
+  }
+  const start = domain[0];
+  const end = domain[last] + step;
+  const indexAt = (t) => {
+    if (t <= start) return 0;
+    if (t >= domain[last]) return last; // inside the last bucket: draw on its point
+    let i = 0;
+    while (i < last && domain[i + 1] <= t) i++;
+    const next = domain[i + 1] ?? domain[i] + step;
+    return Math.min(last, i + (next > domain[i] ? (t - domain[i]) / (next - domain[i]) : 0));
+  };
+  const shown = items
+    .map((a) => ({ a, from: new Date(a.at).getTime(), to: a.endAt ? new Date(a.endAt).getTime() : null }))
+    .filter(({ from, to }) => from < Math.max(end, start + 1) && (to ?? from) >= start)
+    .slice(0, ANNOTATION_DRAW_MAX);
+  if (!shown.length) return null;
+  return (
+    <g className="chart-annotations">
+      {shown.map(({ a, from, to }) => {
+        const color = ANNOTATION_COLOR[a.category] ?? ANNOTATION_COLOR.change;
+        const x1 = x(indexAt(from));
+        const x2 = to != null ? x(indexAt(to)) : null;
+        const when = `${new Date(a.at).toLocaleString()}${a.endAt ? ` → ${new Date(a.endAt).toLocaleString()}` : ''}`;
+        const scope = [a.service, a.env].filter(Boolean).join(' · ');
+        const tip = `${a.category} · ${a.title}\n${when}${scope ? `\n${scope}` : ''}${a.tenantId === '*' ? '\nall tenants' : ''}`;
+        return (
+          <a key={a.id} href={toHash('annotations', { range, focus: a.id })}>
+            <title>{tip}</title>
+            {x2 != null && x2 > x1 && (
+              <rect x={x1} y={top} width={x2 - x1} height={bottom - top} fill={color} opacity="0.08" />
+            )}
+            <line x1={x1} x2={x1} y1={top} y2={bottom} stroke={color} strokeWidth="1.25" strokeDasharray="3 3" />
+            {/* the wide invisible stroke is the hover target — a 1px line is not one */}
+            <line x1={x1} x2={x1} y1={top} y2={bottom} stroke="transparent" strokeWidth="10" />
+            <path d={`M${x1},${top - 1}l6,3.5l-6,3.5z`} fill={color} />
+          </a>
+        );
+      })}
+    </g>
   );
 }
 

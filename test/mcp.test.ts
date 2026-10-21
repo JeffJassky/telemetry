@@ -68,7 +68,7 @@ describe('mcp tools', () => {
       [
         'active_users', 'describe_telemetry', 'dimension_values', 'event_breakdown',
         'event_trends', 'funnel_analysis', 'inspect_trace', 'list_errors',
-        'list_reports', 'list_tenants', 'metric_distribution', 'plan_report',
+        'list_annotations', 'list_reports', 'list_tenants', 'metric_distribution', 'plan_report',
         'rollup_breakdown', 'run_report', 'search_events', 'telemetry_health',
         'user_journey',
       ].sort(),

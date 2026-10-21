@@ -89,6 +89,28 @@ export function fmtTime(iso) {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+/** one colour per suggested annotation category; anything else reads as a change */
+export const ANNOTATION_COLOR = {
+  change: 'var(--amber)',
+  deploy: 'var(--blue)',
+  tracking: 'var(--violet)',
+  consent: 'var(--green)',
+  content: 'var(--accent)',
+  campaign: 'var(--accent)',
+  incident: 'var(--red)',
+  note: 'var(--fg-subtle)',
+};
+
+/** the suggested vocabulary — mirrors ANNOTATION_CATEGORIES on the server */
+export const ANNOTATION_CATEGORIES = Object.keys(ANNOTATION_COLOR);
+
+/** a Date → the value a `datetime-local` input takes, in the viewer's zone */
+export function toLocalInput(d) {
+  const t = new Date(d);
+  if (Number.isNaN(t.getTime())) return '';
+  return new Date(t.getTime() - t.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+}
+
 export function fmtClock(iso) {
   return new Date(iso).toISOString().replace('T', ' ').slice(0, 19);
 }

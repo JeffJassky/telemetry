@@ -21,6 +21,7 @@ const PAGES = [
   ['explore', 'Explore', '◈'],
   ['journeys', 'Journeys', '➾'],
   ['usage', 'Usage', '¤'],
+  ['annotations', 'Annotations', '⚑'],
   ['system', 'System', '⚙'],
 ];
 
@@ -107,7 +108,7 @@ export function Sidebar({ route, views, title, platform }) {
   );
 }
 
-export function Topbar({ route, catalog, onSaveView, theme, onTheme, platform }) {
+export function Topbar({ route, catalog, onSaveView, theme, onTheme, platform, annotations, onAnnotations }) {
   const p = route.params;
   const set = (patch) => navigate(route.page, { ...p, ...patch }, route.arg);
   // grouped by namespace, because `library.*` is one page's worth of names and a
@@ -150,6 +151,14 @@ export function Topbar({ route, catalog, onSaveView, theme, onTheme, platform })
         ))}
       </select>
 
+      <button
+        className={`icon-btn ${annotations ? 'active' : ''}`}
+        onClick={onAnnotations}
+        title={annotations ? 'Hide annotations on charts' : 'Show annotations on charts'}
+        aria-pressed={!!annotations}
+      >
+        ⚑
+      </button>
       <button className="btn btn-sm" onClick={onSaveView} title="Save the current URL state as a view">save view</button>
       <button className="icon-btn" onClick={onTheme} title="theme">{theme === 'dark' ? '☾' : '☀'}</button>
     </header>

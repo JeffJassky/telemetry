@@ -10,6 +10,7 @@ import { createRelink } from './relink.js';
 import { createSyncIndexes } from './indexes.js';
 import { createCaptureError } from './capture-error.js';
 import { createSourcemaps } from './sourcemaps.js';
+import { createAnnotations } from './annotations.js';
 import { buildKeyModel, createKey, type CreateKeyInput } from './keys.js';
 
 export { defineRegistry, boundedMeta, validateRegistry } from './registry.js';
@@ -31,6 +32,13 @@ export type { Checkpoint } from './checkpoint.js';
 export { SUBJECT_MAX, SUBJECT_LINK_TIMEOUT_MS } from './emit.js';
 export type { EmitInput, EmitResult, LinkSubjects, SubjectLinker } from './emit.js';
 export type { CaptureErrorOptions } from './capture-error.js';
+export {
+  ANNOTATION_BODY_MAX, ANNOTATION_CATEGORIES, ANNOTATION_LIST_DEFAULT, ANNOTATION_LIST_MAX,
+  ANNOTATION_TAGS_MAX, ANNOTATION_TITLE_MAX,
+} from './annotations.js';
+export type {
+  Annotation, AnnotationInput, AnnotationList, AnnotationPatch, AnnotationQuery, Annotations,
+} from './annotations.js';
 export { parseFrames, fingerprint, normalizeMessage, normalizeFrameFile, describeError, coerceError } from '../client/errors.js';
 export type { ErrorDetail, ErrorFrame } from '../client/errors.js';
 export { KeyKind, TenantMode, parseKeyString, hashSecret, verifySecret, createKey } from './keys.js';
@@ -74,8 +82,8 @@ export interface CreateTelemetryConfig {
   registry: Registry;
   /** a mongoose Connection, or the mongoose module itself (its default connection is used) */
   connection: Connection | { connection: Connection };
-  /** base collection name; six siblings derive from it: `<collection>_rollups`,
-   *  `_rejects`, `_aliases`, `_checkpoints`, `_keys`, `_views` */
+  /** base collection name; eight siblings derive from it: `<collection>_rollups`,
+   *  `_rejects`, `_aliases`, `_checkpoints`, `_keys`, `_views`, `_sourcemaps`, `_annotations` */
   collection?: string;
   /**
    * Mongoose model name. Set it when two instances share one connection —
@@ -219,12 +227,15 @@ export function createTelemetry(config: CreateTelemetryConfig) {
     registry, byKind, RollupModel, rejects, counters, logger, track, linkSubjects,
   });
 
+  const annotations = createAnnotations({ connection: conn, collection: `${collection}_annotations`, logger });
+
   const forget = createForget({
     TelemetryModel,
     RollupModel,
     rejects: rejects as () => Collection,
     aliases: aliases as () => Collection,
     views: views as () => Collection,
+    annotations,
     pepper: () => {
       const p = config.pepper ?? process.env.TELEMETRY_PEPPER;
       if (!p) {
@@ -265,6 +276,7 @@ export function createTelemetry(config: CreateTelemetryConfig) {
   const syncIndexes: typeof syncModelIndexes = async (...args) => {
     const result = await syncModelIndexes(...args);
     await sourcemaps.ensureIndexes();
+    await annotations.ensureIndexes();
     return result;
   };
 
@@ -357,6 +369,12 @@ export function createTelemetry(config: CreateTelemetryConfig) {
      * maps were registered are translated too. See sourcemaps.ts.
      */
     sourcemaps,
+    /**
+     * The change log charts are read against: deploys, tracking changes,
+     * campaigns, incidents. `create()` is an upsert when given a `key`, so a
+     * retried deploy hook draws one line. See annotations.ts.
+     */
+    annotations,
     /** mint an ingest key; the full key string is returned once, never again */
     createKey: (input: CreateKeyInput) => createKey(KeyModel, input),
     /** the models, exposed for hosts and the router factories */

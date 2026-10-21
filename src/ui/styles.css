@@ -179,6 +179,7 @@ a { color: inherit; text-decoration: none; }
 .topbar-spacer { flex: 1; }
 .icon-btn { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid var(--border); background: var(--bg); border-radius: var(--r-md); color: var(--fg-muted); }
 .icon-btn:hover { background: var(--bg-hover); color: var(--fg); }
+.icon-btn.active { background: var(--amber-soft); color: var(--amber-fg); border-color: transparent; }
 
 /* ===== Buttons ===== */
 .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: var(--r-md); border: 1px solid var(--border-strong); background: var(--bg-elev); color: var(--fg); font-size: 13px; font-weight: 500; white-space: nowrap; transition: background 0.1s ease; }
@@ -346,3 +347,14 @@ pre.code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-
 .frame.in-app { border-left-color: var(--red); color: var(--fg); }
 .frame .fn { color: var(--violet-fg); }
 .frame .loc { color: var(--fg-muted); }
+
+/* annotations — the change log form */
+.note-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 14px; }
+.note-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--fg-muted); font-weight: 500; }
+.note-field em { font-style: normal; color: var(--fg-subtle); font-weight: 400; }
+.note-wide { grid-column: 1 / -1; }
+.note-body { height: auto; padding: 8px 10px; resize: vertical; font-family: inherit; }
+.note-preview { white-space: pre-wrap; max-width: 60ch; }
+.chart-annotations a { cursor: pointer; }
+@media (max-width: 760px) { .note-form { grid-template-columns: 1fr; } }
+.table tr.selected td { background: var(--accent-soft); }

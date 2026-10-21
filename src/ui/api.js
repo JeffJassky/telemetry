@@ -29,6 +29,23 @@ export function createApi(config) {
     return res.json();
   }
 
+  /** a write that surfaces the server's message — a refused annotation says why */
+  async function send(method, path, body) {
+    const res = await fetch(`${base}${path}`, {
+      method,
+      headers: { accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+      credentials: 'same-origin',
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(json.error ?? `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return json;
+  }
+
   return {
     call,
     /** the boot call — the projected registry AND the catalog every control reads */
@@ -63,6 +80,11 @@ export function createApi(config) {
     deleteView: (id) =>
       fetch(`${base}/views/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' })
         .then((r) => r.json()),
+    /** the change log every chart is read against — `{ from, to, service?, env?, category? }` */
+    annotations: (p) => call('/annotations', p),
+    createAnnotation: (body) => send('POST', '/annotations', body),
+    updateAnnotation: (id, body) => send('PATCH', `/annotations/${encodeURIComponent(id)}`, body),
+    deleteAnnotation: (id) => send('DELETE', `/annotations/${encodeURIComponent(id)}`),
     system: () => call('/system'),
     revokeKey: (id) =>
       fetch(`${base}/system/keys/${encodeURIComponent(id)}/revoke`, { method: 'POST', credentials: 'same-origin' })

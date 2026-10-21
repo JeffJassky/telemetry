@@ -723,6 +723,8 @@ export interface ForgetResult {
   rollups: number;
   aliases: number;
   views: number;
+  /** annotations whose author link was rekeyed — the annotation itself is kept */
+  annotations: number;
 }
 
 export interface RelinkOptions {
@@ -790,8 +792,8 @@ export interface CreateTelemetryConfig<R extends Registry = Registry> {
   registry: R;
   /** a mongoose Connection, or the mongoose module itself */
   connection: Connection | Mongoose;
-  /** base collection; six siblings derive: `<collection>_rollups`, `_rejects`,
-   *  `_aliases`, `_checkpoints`, `_keys`, `_views` */
+  /** base collection; eight siblings derive: `<collection>_rollups`, `_rejects`,
+   *  `_aliases`, `_checkpoints`, `_keys`, `_views`, `_sourcemaps`, `_annotations` */
   collection?: string;
   /** set when two instances share one connection — traps #2 */
   modelName?: string;
@@ -974,6 +976,13 @@ export interface Telemetry<R extends Registry = Registry> {
    * map registered for the record's (tenantId, service, release, file).
    */
   sourcemaps: Sourcemaps;
+  /**
+   * The change log charts are read against: deploys, tracking changes,
+   * campaigns, incidents. Drawn on every dashboard time series and listed by
+   * the `list_annotations` MCP tool. `create()` with a `key` is an upsert, so
+   * a retried deploy hook draws one line.
+   */
+  annotations: Annotations;
   /** mint an ingest key against this instance's key collection */
   createKey(input: CreateKeyInput): Promise<{ key: string; id: string }>;
   models: {
@@ -1026,6 +1035,109 @@ export interface Sourcemaps {
   ): Promise<OriginalPosition | null>;
   /** a copy of an error record with `original` on each translatable frame; never throws */
   symbolicate<T extends Record<string, any>>(record: T): Promise<T>;
+}
+
+// ── annotations ─────────────────────────────────────────────────────────────
+
+export declare const ANNOTATION_TITLE_MAX: 200;
+export declare const ANNOTATION_BODY_MAX: 4000;
+export declare const ANNOTATION_TAGS_MAX: 20;
+/** what list() returns by default */
+export declare const ANNOTATION_LIST_DEFAULT: 500;
+/** the most list() will ever return */
+export declare const ANNOTATION_LIST_MAX: 2000;
+/** the suggested category vocabulary — pickers offer it; any lowercase slug is accepted */
+export declare const ANNOTATION_CATEGORIES: readonly [
+  'change', 'deploy', 'tracking', 'consent', 'content', 'campaign', 'incident', 'note',
+];
+
+export interface AnnotationInput {
+  /** a tenant, or PLATFORM_SCOPE ('*') for a change that touched every tenant */
+  tenantId: string;
+  /** when the change happened (or began) */
+  at: Date | string;
+  /** set for a span — a sale, an outage, an experiment. Must not precede `at`. */
+  endAt?: Date | string | null;
+  /** up to ANNOTATION_TITLE_MAX characters */
+  title: string;
+  /** up to ANNOTATION_BODY_MAX characters */
+  body?: string | null;
+  /** lowercase slug ([a-z0-9_.-]). Default 'change'. */
+  category?: string;
+  /** narrow to one service; absent = every service */
+  service?: string | null;
+  /** narrow to one env; absent = every env */
+  env?: string | null;
+  tags?: string[];
+  /** link to the PR, ticket or change request — http(s) only */
+  url?: string | null;
+  /** who wrote it: 'dashboard', 'deploy', … Default 'api'. */
+  source?: string;
+  /** the person, e.g. 'user:u_1' — rekeyed by forget() */
+  authorRef?: string | null;
+  /** idempotency: a second create() with the same (tenantId, key) updates the first */
+  key?: string | null;
+}
+
+export type AnnotationPatch = Partial<
+  Pick<AnnotationInput, 'at' | 'endAt' | 'title' | 'body' | 'category' | 'service' | 'env' | 'tags' | 'url'>
+>;
+
+export interface Annotation {
+  id: string;
+  tenantId: string;
+  at: Date;
+  endAt: Date | null;
+  title: string;
+  body: string | null;
+  category: string;
+  service: string | null;
+  env: string | null;
+  tags: string[];
+  url: string | null;
+  source: string;
+  authorRef: string | null;
+  key: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface AnnotationQuery {
+  from: Date;
+  to: Date;
+  /** keep annotations for this service, plus those for every service */
+  service?: string;
+  /** keep annotations for this env, plus those for every env */
+  env?: string;
+  category?: string | string[];
+  /** any-of */
+  tags?: string[];
+  /** default ANNOTATION_LIST_DEFAULT, capped at ANNOTATION_LIST_MAX */
+  limit?: number;
+}
+
+export interface AnnotationList {
+  /** oldest first */
+  items: Annotation[];
+  /** more annotations overlapped the window than `limit` allowed */
+  truncated: boolean;
+}
+
+export interface Annotations {
+  ensureIndexes(): Promise<void>;
+  /** validates and writes; throws an Error with `status: 400` on bad input */
+  create(input: AnnotationInput): Promise<Annotation>;
+  /** literal scope match — `'*'` edits only global annotations. null when absent. */
+  update(tenantId: string, id: string, patch: AnnotationPatch): Promise<Annotation | null>;
+  remove(tenantId: string, id: string): Promise<{ removed: number }>;
+  get(tenantId: string, id: string): Promise<Annotation | null>;
+  /**
+   * Annotations overlapping [from, to), oldest first. A tenant scope reads its
+   * own plus the global ones; PLATFORM_SCOPE reads the global ones only.
+   */
+  list(scope: string, query: AnnotationQuery): Promise<AnnotationList>;
+  /** forget()'s hook: rekey `authorRef` in place. Returns rows changed. */
+  rekeyAuthor(scope: unknown, ref: string, newRef: string): Promise<number>;
 }
 
 export declare function createTelemetry<const R extends Registry>(

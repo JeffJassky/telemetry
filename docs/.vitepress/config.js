@@ -58,6 +58,7 @@ export default defineConfig({
             { text: 'Queries & funnels', link: '/guide/queries' },
             { text: 'The dashboard', link: '/guide/dashboard' },
             { text: 'Reports', link: '/guide/reports' },
+            { text: 'Annotations', link: '/guide/annotations' },
             { text: 'MCP tools', link: '/guide/mcp' },
           ],
         },

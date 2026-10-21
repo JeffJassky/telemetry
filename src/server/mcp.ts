@@ -405,7 +405,7 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
       name: 'event_trends',
       title: 'Event trends over time',
       description:
-        'A time series of a measure, bucketed by interval — counts by default, or sum:/avg: of a declared metric (e.g. "avg:durationMs"). Use for "is this rising?" questions.',
+        'A time series of a measure, bucketed by interval — counts by default, or sum:/avg: of a declared metric (e.g. "avg:durationMs"). Use for "is this rising?" questions. When the line moves, call list_annotations over the same window to see what changed then.',
       inputSchema: z.object({
         ...filterArg,
         ...rangeArg,
@@ -719,6 +719,36 @@ export function createTelemetryMcp(opts: CreateTelemetryMcpOptions): ToolDescrip
         return picked.name
           ? { name: picked.name, ...planShaped(picked.report) }
           : planShaped(picked.report);
+      },
+    }),
+
+    // ── annotations ─────────────────────────────────────────────────────────
+    tool({
+      name: 'list_annotations',
+      title: 'List annotations (change log)',
+      description:
+        'The change log the charts are read against: deploys, tracking/tag changes, consent changes, content and campaign launches, incidents — each with a time (and an end time for a span), title, category, optional service/env, tags, and a link. CALL THIS whenever a trend, breakdown or error rate shifts, with the same window, before explaining the shift: a change logged near a jump is the first candidate cause. It shows what happened when, not what caused what — say so when you cite one. Returns the tenant\'s own annotations plus global ones, oldest first.',
+      inputSchema: z.object({
+        ...rangeArg,
+        ...tenantArg,
+        service: z.string().optional().describe('keep annotations for this service, plus those for every service'),
+        env: z.string().optional().describe('keep annotations for this env, plus those for every env'),
+        category: z
+          .array(z.string())
+          .optional()
+          .describe('any of, e.g. ["deploy","tracking"]. Common: change, deploy, tracking, consent, content, campaign, incident, note'),
+        tags: z.array(z.string()).optional().describe('any of'),
+        limit: z.number().int().positive().optional(),
+      }),
+      async handler(a: any, ctx) {
+        const viewer = await resolve(ctx);
+        const scope = pickScope(viewer, a.tenant);
+        const { from, to } = parseRange(a.from, a.to);
+        const res = await t.annotations.list(scope, {
+          from, to, service: a.service, env: a.env, category: a.category, tags: a.tags, limit: a.limit,
+        });
+        // the author is a person — an agent needs what changed, not who typed it
+        return { ...res, items: res.items.map(({ authorRef: _authorRef, ...rest }) => rest) };
       },
     }),
 

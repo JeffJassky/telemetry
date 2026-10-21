@@ -7,6 +7,35 @@ A **peer range widening** is a minor. A peer range *narrowing* is a major — it
 breaks installs for people who were relying on the claim, and the claim is only
 real if CI runs the matrix. See standards/traps.md #10.
 
+## [Unreleased]
+
+### Added
+- **Annotations: a change log the charts are read against.** Log a deploy, a
+  tracking tag removed, a consent banner switched on, a campaign, an outage,
+  and it is drawn on every dashboard time series whose window it falls in, as
+  a dashed line (a point) or a shaded band (a span with `endAt`). Hover for
+  the note; click to open it. ⚑ in the top bar hides them, per browser. It
+  shows what happened when, not what caused what.
+  - `t.annotations.create / list / get / update / remove`, stored in
+    `<collection>_annotations` with no retention. `create()` with a `key`
+    upserts on `(tenantId, key)`, so a retried deploy hook draws one line.
+    `tenantId: '*'` writes a global annotation every tenant sees.
+  - A new **Annotations** dashboard page lists the window's annotations and
+    has a form to add, edit and delete them. Any viewer can add one; editing
+    and deleting are the author's or an admin's, like saved views. Routes:
+    `GET/POST /api/annotations`, `PATCH/DELETE /api/annotations/:id`.
+  - MCP: `list_annotations`, and `event_trends` now tells the agent to call it
+    when a line moves. The suite stays read-only.
+  - `forget()` keeps annotations and rekeys their `authorRef`;
+    `ForgetResult` gains `annotations`.
+  - Exported: `ANNOTATION_CATEGORIES`, `ANNOTATION_TITLE_MAX`,
+    `ANNOTATION_BODY_MAX`, `ANNOTATION_TAGS_MAX`, `ANNOTATION_LIST_DEFAULT`,
+    `ANNOTATION_LIST_MAX`, and the `Annotation*` types.
+
+  **Host action:** none required. `syncIndexes()` builds the new collection's
+  indexes. Without them, two concurrent first deliveries of the same `key` can
+  both land; retries in sequence are still deduplicated.
+
 ## [0.9.2]
 
 ### Fixed

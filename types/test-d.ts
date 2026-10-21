@@ -19,6 +19,12 @@
  */
 import { z } from 'zod';
 import type {
+  Annotation,
+  AnnotationInput,
+  AnnotationList,
+  AnnotationPatch,
+  AnnotationQuery,
+  Annotations,
   AttrsOf,
   CaptureErrorOptions,
   Checkpoint,
@@ -49,6 +55,12 @@ import type {
 // VALUE imports — the vocabulary ships as `const` objects, so importing these
 // with `import type` would have hidden the very drift this file exists to catch
 import {
+  ANNOTATION_BODY_MAX,
+  ANNOTATION_CATEGORIES,
+  ANNOTATION_LIST_DEFAULT,
+  ANNOTATION_LIST_MAX,
+  ANNOTATION_TAGS_MAX,
+  ANNOTATION_TITLE_MAX,
   boundedMeta,
   createTelemetry,
   defineRegistry,
@@ -835,6 +847,32 @@ async function forgetViews() {
   const gone = await t.forget('acc_9', 'user:u_1');
   const v: number = gone.views;
 }
+
+// annotations — the change log charts are read against
+async function annotate() {
+  const input: AnnotationInput = {
+    tenantId: PLATFORM_SCOPE,
+    at: new Date(),
+    title: 'Deploy 1.4.0',
+    category: ANNOTATION_CATEGORIES[1],
+    service: 'api',
+    key: 'deploy:1.4.0',
+    source: 'ci',
+  };
+  const store: Annotations = t.annotations;
+  const made: Annotation = await store.create(input);
+  const patch: AnnotationPatch = { endAt: null, tags: ['release'] };
+  const changed: Annotation | null = await store.update(made.tenantId, made.id, patch);
+  const query: AnnotationQuery = { from: new Date(0), to: new Date(), category: ['deploy'], limit: ANNOTATION_LIST_MAX };
+  const page: AnnotationList = await store.list('acc_9', query);
+  const { removed }: { removed: number } = await store.remove('acc_9', made.id);
+  const caps: number = ANNOTATION_TITLE_MAX + ANNOTATION_BODY_MAX + ANNOTATION_TAGS_MAX + ANNOTATION_LIST_DEFAULT;
+  const rekeyed: number = (await t.forget('acc_9', 'user:u_1')).annotations;
+  void changed, page.truncated, removed, caps, rekeyed;
+  // @ts-expect-error — `title` is required
+  void store.create({ tenantId: 'acc_9', at: new Date() });
+}
+void annotate;
 
 // ── shapes are exported and usable standalone ──
 const dim: DimSource = 'attr:source';
