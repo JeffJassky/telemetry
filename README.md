@@ -1,6 +1,8 @@
 # @jeffjassky/telemetry
 
 Unified telemetry — product events, errors, traces, state transitions, and
+
+[![Telemetry on StartupScores](https://startupscores.com/badge/telemetry.svg?style=shield&v=combo&theme=dark)](https://startupscores.com/open-source/telemetry)
 billable usage in **one Mongo envelope**, with typed SDKs and a mountable
 dashboard.
 
